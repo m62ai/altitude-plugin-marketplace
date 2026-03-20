@@ -6,7 +6,7 @@ Claude Code plugin for the Altitude Wealth Management Platform.
 
 ```bash
 /plugin marketplace add m62ai/altitude-plugin-marketplace
-/plugin install m62-altitude-onboarding@altitude-tools
+/plugin install m62-altitude-onboarding@altitude-plugin-marketplace
 ```
 
 ## m62-altitude-onboarding
@@ -22,7 +22,7 @@ Add to your project's `.claude/settings.json`:
 ```json
 {
   "extraKnownMarketplaces": {
-    "altitude-tools": {
+    "altitude-plugin-marketplace": {
       "source": {
         "source": "github",
         "repo": "m62ai/altitude-plugin-marketplace"
@@ -30,7 +30,7 @@ Add to your project's `.claude/settings.json`:
     }
   },
   "enabledPlugins": {
-    "m62-altitude-onboarding@altitude-tools": true
+    "m62-altitude-onboarding@altitude-plugin-marketplace": true
   }
 }
 ```
