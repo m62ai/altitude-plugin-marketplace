@@ -1,0 +1,10 @@
+{
+  "name": "m62-plan",
+  "description": "Altitude-specific implementation planner with domain-aware analysis",
+  "version": "1.0.0",
+  "author": {
+    "name": "M62 AI"
+  },
+  "repository": "https://github.com/m62ai/altitude-plugin-marketplace",
+  "license": "UNLICENSED"
+}

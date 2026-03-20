@@ -1,0 +1,10 @@
+{
+  "name": "m62-altitude-onboarding",
+  "description": "Extract entity data from household document folders and onboard to Altitude wealth management platform",
+  "version": "2.0.0",
+  "author": {
+    "name": "M62 AI"
+  },
+  "repository": "https://github.com/m62ai/altitude-plugin-marketplace",
+  "license": "UNLICENSED"
+}

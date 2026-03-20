@@ -1,0 +1,34 @@
+{
+  "name": "altitude-tools",
+  "description": "Altitude Wealth Management Platform — plugins for client onboarding, code development, integration analysis, and implementation planning",
+  "owner": {
+    "name": "M62 AI",
+    "email": "dev@m62.ai"
+  },
+  "plugins": [
+    {
+      "name": "m62-altitude-onboarding",
+      "source": "./plugins/m62-altitude-onboarding",
+      "description": "Extract entity data from household document folders and onboard to the Altitude wealth management platform. Reads PDFs, images, spreadsheets — extracts individuals, trusts, accounts, insurance, tangible assets, liabilities, and relationships.",
+      "version": "2.0.0"
+    },
+    {
+      "name": "m62-code-primer",
+      "source": "./plugins/m62-code-primer",
+      "description": "Generate focused codebase briefings for the Altitude platform. Primes agents or developers on architecture, domain context, patterns, key files, and gotchas for a specific domain area.",
+      "version": "1.0.0"
+    },
+    {
+      "name": "m62-integration-analysis",
+      "source": "./plugins/m62-integration-analysis",
+      "description": "Analyze an external API and map its entities/fields to the Altitude domain model. Produces field-level mapping tables and structured analysis docs.",
+      "version": "1.0.0"
+    },
+    {
+      "name": "m62-plan",
+      "source": "./plugins/m62-plan",
+      "description": "Altitude-specific implementation planner. Analyzes domain impact, discovers codebase patterns, writes reviewable plans, and waits for approval before implementation.",
+      "version": "1.0.0"
+    }
+  ]
+}
