@@ -76,8 +76,8 @@ Emails often contain account confirmations, policy updates, advisor corresponden
 
 ### PDF and Document Files
 - **PDFs**: Use Claude's Read tool to read PDF files directly. Claude can read both text and scanned PDFs natively.
-- **Word docs (.docx)**: Use macOS built-in `textutil -convert txt file.docx -output file.txt` or `pandoc file.docx -t plain` if installed. Then read the text output with Claude's Read tool.
-- **Spreadsheets (.xlsx)**: Use inline Python: `python3 -c "import openpyxl; wb=openpyxl.load_workbook('file.xlsx'); ..."` or read with pandas.
+- **Word docs (.docx)**: Use the platform's `DOCX_CMD` from the Cross-Platform Setup in SKILL.md. Fallback chain: `textutil -convert txt file.docx` (macOS) → `pandoc file.docx -t plain` (cross-platform) → `python -c "from docx import Document; [print(p.text) for p in Document('file.docx').paragraphs]"` (Python fallback, install via `pip install python-docx`). Then read the text output with Claude's Read tool.
+- **Spreadsheets (.xlsx)**: Use inline Python: `python -c "import openpyxl; wb=openpyxl.load_workbook('file.xlsx'); ..."` or read with pandas. Use `python` (not `python3`) for Windows compatibility.
 
 ## Extraction Priority
 

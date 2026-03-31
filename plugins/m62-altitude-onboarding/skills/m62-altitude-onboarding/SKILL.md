@@ -17,19 +17,90 @@ entities. Every change is reviewed before pushing.
 
 ## Prerequisites
 
-Before running, you need:
+### Step 0: Load Saved Configuration
 
-- **Altitude API base URL**:
-  - **Production**: `https://api.m62.live`
-  - **Development**: `http://localhost:8080`
+**Do this FIRST before anything else.**
 
-- **Authentication** (choose one):
-  - **API Key (recommended)**: Add header `X-API-Key: ak_live_xxxxxxxx` to all requests
-  - **JWT Token**: POST to `/api/v1/authenticate` with credentials, get `id_token`, use `Authorization: Bearer {token}`
+Determine the home directory:
+- **macOS/Linux**: `HOME` environment variable
+- **Windows**: `USERPROFILE` environment variable
 
-- **firmId** (UUID) for the target firm
+Use the **Read** tool to check for `{HOME_DIR}/.altitude/config.json`:
 
-Ask the user for these if not already configured. Store them as session variables.
+If the file exists and contains valid JSON, use its values:
+```json
+{
+  "apiKey": "ak_live_xxxxxxxx",
+  "baseUrl": "https://api.m62.live",
+  "firmName": "Wellington Advisors"
+}
+```
+
+- Use `apiKey` for all API requests via the `X-API-Key` header
+- Use `baseUrl` as the API base URL
+- Use `firmName` as context
+
+**If the config file exists and is valid, skip credential prompts — proceed directly with these values.**
+
+### If No Config File Exists
+
+If the Read tool returns an error (file not found), ask the user for:
+
+- **API Key** (recommended): `X-API-Key: ak_live_xxxxxxxx`
+  - Or **JWT**: POST to `/api/v1/authenticate` with credentials
+- **Environment**: Production (`https://api.m62.live`) or Development (`http://localhost:8080`)
+- **Firm name** (optional, for display)
+
+Then save using the **Write** tool to `{HOME_DIR}/.altitude/config.json`:
+
+```json
+{
+  "apiKey": "<their-api-key>",
+  "baseUrl": "<their-chosen-url>",
+  "firmName": "<their-firm-name>"
+}
+```
+
+Tell the user: "Saved your configuration to `~/.altitude/config.json`. Future runs will use it automatically."
+
+### Cross-Platform Setup
+
+Detect the operating system and set platform-appropriate defaults. Do this ONCE at the start
+and reuse throughout:
+
+```python
+import platform, shutil, os, tempfile
+
+OS = platform.system()  # "Windows", "Darwin", "Linux"
+
+# Python command
+PYTHON = "python" if OS == "Windows" else "python3"
+
+# Temp directory (NEVER hardcode /tmp/)
+TMPDIR = tempfile.gettempdir()  # e.g., C:\Users\X\AppData\Local\Temp on Windows, /tmp on Unix
+
+# Word doc converter
+if shutil.which("textutil"):
+    DOCX_CMD = "textutil -convert txt"          # macOS
+elif shutil.which("pandoc"):
+    DOCX_CMD = "pandoc -t plain -o"             # Cross-platform
+else:
+    DOCX_CMD = None  # Fall back to python-docx (see below)
+
+# PDF decryptor
+QPDF = shutil.which("qpdf")
+# Install if missing:
+#   macOS:   brew install qpdf
+#   Windows: choco install qpdf  OR  winget install qpdf  OR  scoop install qpdf
+#   Linux:   apt install qpdf    OR  dnf install qpdf
+```
+
+Save these values and use them for all subsequent commands. When this skill says `python3`,
+use `PYTHON`. When it says `/tmp/`, use `TMPDIR`. When it says `textutil`, use `DOCX_CMD`.
+
+### Additional Requirements
+
+- **firmId** (UUID) for the target firm — typically discovered during Phase 1 when querying Altitude
 
 ---
 
@@ -300,16 +371,23 @@ will miss K-1 summaries, W-2s, 1099s, Schedule H, and passthrough entity details
 in the document. Use this two-pass strategy:
 
 **Pass 1 — Page Index Scan** (fast, text-only):
+
+Use `PYTHON` from the Cross-Platform Setup section for all Python invocations.
+On Windows, write multi-line scripts to a temp `.py` file instead of using `-c` to
+avoid shell quoting issues.
+
 ```python
-python3 -c "
+# page_scan.py — write this to a temp file, then run: python page_scan.py
+import sys
 from pypdf import PdfReader
-reader = PdfReader('file.pdf')
+reader = PdfReader(sys.argv[1])
 print(f'Total pages: {len(reader.pages)}')
 for i, page in enumerate(reader.pages):
     text = (page.extract_text() or '')[:150].replace('\n', ' | ')
     print(f'  Page {i+1}: {text}')
-"
 ```
+
+Run: `python page_scan.py "file.pdf"` (or `python3` on macOS/Linux if `python` is unavailable).
 
 This produces a one-line summary per page. Scan the output for keywords that signal data-rich
 pages:
@@ -346,9 +424,15 @@ Read ONLY the flagged pages using Claude's Read tool with specific page ranges. 
 Tax returns are often password-protected. The password is frequently in the filename
 (e.g., "pass 701431"). Decrypt before reading:
 ```bash
-qpdf --password=PASSWORD --decrypt input.pdf /tmp/decrypted.pdf
+qpdf --password=PASSWORD --decrypt input.pdf decrypted.pdf
 ```
-If `qpdf` is not installed: `brew install qpdf` (macOS).
+Write the decrypted file to the same directory as the input, or to a temp directory
+(use Python `tempfile.mkdtemp()` if needed — do NOT hardcode `/tmp/`).
+
+If `qpdf` is not installed:
+- **macOS**: `brew install qpdf`
+- **Windows**: `choco install qpdf` or `winget install qpdf` or `scoop install qpdf`
+- **Linux**: `apt install qpdf` or `dnf install qpdf`
 
 ### ⛔ CRITICAL: Zero-Skip Rule — THE #1 CAUSE OF EXTRACTION FAILURE
 
@@ -375,8 +459,10 @@ For each file, at minimum:
   Large PDF Strategy above to find all data-rich pages.
 - **Images (.jpg, .png)**: Read with Claude's vision. Even a property photo confirms a real
   asset exists.
-- **Word docs (.docx)**: Convert with `textutil -convert txt` and read. If conversion fails,
-  try `pandoc`. If both fail, flag for user — don't silently skip.
+- **Word docs (.docx)**: Convert using the platform's `DOCX_CMD` (see Cross-Platform Setup).
+  Fallback chain: `textutil` (macOS) → `pandoc` (cross-platform) → `python-docx` library
+  (`python -c "from docx import Document; [print(p.text) for p in Document('file.docx').paragraphs]"`).
+  If all fail, flag for user — don't silently skip.
 - **Emails (.eml)**: Parse headers + body. Extract attachments and process them too.
 
 **Enforce with a tracking file**: After Phase 2 classification, write a file checklist to
@@ -427,12 +513,13 @@ Each line captures everything extracted from a single file:
 - For files with no extractable data, still append a line with empty entities and a note explaining why
 - The cache is the source of truth for Phase 4 matching — read it instead of relying on context memory
 
-**On resume**, check for existing cache:
+**On resume**, check for existing cache (use `os.path.join` for cross-platform paths):
 ```python
-import json
+import json, os
+cache_path = os.path.join('altitude_review', 'extraction_cache.jsonl')
 existing = []
 try:
-    with open('altitude_review/extraction_cache.jsonl') as f:
+    with open(cache_path) as f:
         existing = [json.loads(line) for line in f if line.strip()]
     last_file = max(e['fileNumber'] for e in existing)
     print(f"Resuming from file {last_file + 1} ({len(existing)} files already cached)")
@@ -445,16 +532,20 @@ except FileNotFoundError:
 For each Tier 1 and Tier 2 document, extract structured data. Use Claude's native tools:
 
 - **PDFs**: Use Claude Read tool natively (supports text and scanned PDFs with vision)
-- **Word docs (.docx)**: Extract with `textutil -convert txt file.docx` (macOS) or
-  `pandoc file.docx -t plain`; then read the output
+- **Word docs (.docx)**: Use the platform's `DOCX_CMD` (see Cross-Platform Setup):
+  - macOS: `textutil -convert txt file.docx` then read the `.txt`
+  - Cross-platform: `pandoc file.docx -t plain` (pipe or redirect output)
+  - Python fallback (works everywhere): `python -c "from docx import Document; [print(p.text) for p in Document('file.docx').paragraphs]"`
+  Install `python-docx` if needed: `pip install python-docx`
 - **Images (.jpg, .png)**: Use Claude Read tool — Claude can see images natively (multimodal)
-- **Spreadsheets (.xlsx)**: Use inline Python:
+- **Spreadsheets (.xlsx)**: Use inline Python (use `PYTHON` from Cross-Platform Setup):
   ```
-  python3 -c "import openpyxl; wb=openpyxl.load_workbook('file.xlsx'); print([sheet.title for sheet in wb.sheetnames])"
+  python -c "import openpyxl; wb=openpyxl.load_workbook('file.xlsx'); print([sheet.title for sheet in wb.sheetnames])"
   ```
-- **Emails (.eml)**: Parse with Python's `email` module:
+  Install if needed: `pip install openpyxl`
+- **Emails (.eml)**: Parse with Python's `email` module (uses `PYTHON` from Cross-Platform Setup):
   ```
-  python3 -c "
+  python -c "
   import email, sys
   with open('file.eml', 'rb') as f:
       msg = email.message_from_binary_file(f)
@@ -471,14 +562,16 @@ For each Tier 1 and Tier 2 document, extract structured data. Use Claude's nativ
   advisor correspondence). Save any attachments to a temp directory and process them
   separately as their native file type (PDF, DOCX, etc.):
   ```
-  python3 -c "
-  import email, os
+  python -c "
+  import email, os, tempfile
   with open('file.eml', 'rb') as f:
       msg = email.message_from_binary_file(f)
+  att_dir = os.path.join(tempfile.gettempdir(), 'eml_attachments')
+  os.makedirs(att_dir, exist_ok=True)
   for part in msg.walk():
       fn = part.get_filename()
       if fn:
-          with open(os.path.join('/tmp/eml_attachments', fn), 'wb') as out:
+          with open(os.path.join(att_dir, fn), 'wb') as out:
               out.write(part.get_payload(decode=True))
           print(f'Saved attachment: {fn}')
   "
@@ -1846,8 +1939,8 @@ POST /api/v1/document/{trustAgreementDocId}/associations?entityType=INDIVIDUAL&e
 
 39. **Files with special characters in filenames break curl.** Filenames containing commas,
     parentheses with periods (e.g., `(Podolsky, B.).pdf`), or dollar signs cause curl error 26.
-    Copy these files to `/tmp` with clean names before uploading, then delete the temp copies
-    after upload completes.
+    Copy these files to the system temp directory (use Python `tempfile.gettempdir()`) with
+    clean names before uploading, then delete the temp copies after upload completes.
 
 ---
 
@@ -1908,9 +2001,13 @@ Write file tracker to: {folder}/altitude_review/file_tracker_batch_{N}.md
 ## How to Read Files
 - PDFs: Use Read tool. For 20+ page PDFs, use page index scan first (pypdf), then
   targeted deep read of data-rich pages.
-- Word docs: `textutil -convert txt file.docx`, then Read the .txt
+- Word docs (cross-platform fallback chain):
+  1. `textutil -convert txt file.docx` (macOS only)
+  2. `pandoc file.docx -t plain` (cross-platform)
+  3. `python -c "from docx import Document; [print(p.text) for p in Document('file.docx').paragraphs]"` (Python fallback)
 - Images: Read tool (Claude has vision)
 - Emails: Parse with Python email module
+- Use `python` (not `python3`) for Windows compatibility. Detect with `platform.system()`.
 
 ## What to Extract (per file)
 For EACH file, append one JSONL line to your cache with:
