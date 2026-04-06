@@ -3,11 +3,15 @@
 ## Overview
 This document contains comprehensive details for key Altitude API endpoints including authentication, search, relationships, document uploads, and PATCH operations.
 
-**Generated:** 2026-03-19
+**Updated:** 2026-04-06
 **API Version:** 0.0.1
 **API Title:** Altcore API
 **Production URL:** https://api.m62.live
 **Local Dev:** http://localhost:8080
+
+> **Full OpenAPI spec:** For endpoints not covered here, search the full spec at
+> `api-docs/api.json` (relative to this skill's directory). Use Glob to find it:
+> `Glob pattern "**/m62-altitude-onboarding/**/api.json"`
 
 ---
 

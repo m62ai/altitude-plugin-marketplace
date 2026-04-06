@@ -98,6 +98,13 @@ QPDF = shutil.which("qpdf")
 Save these values and use them for all subsequent commands. When this skill says `python3`,
 use `PYTHON`. When it says `/tmp/`, use `TMPDIR`. When it says `textutil`, use `DOCX_CMD`.
 
+### Full OpenAPI Spec
+
+The full Altitude OpenAPI specification is available at `api-docs/api.json` relative to this
+skill's directory. If you encounter an endpoint or schema not covered in the reference files,
+search the full spec: `Glob pattern "**/m62-altitude-onboarding/**/api.json"` then use Grep
+to find specific endpoints or schema definitions.
+
 ### Additional Requirements
 
 - **firmId** (UUID) for the target firm — typically discovered during Phase 1 when querying Altitude
