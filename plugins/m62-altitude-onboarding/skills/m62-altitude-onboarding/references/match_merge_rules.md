@@ -451,44 +451,88 @@ Before calling `POST /api/v1/entity-relationship`, validate:
 
 ## Field Merge Rules
 
-### Cross-Document Merge (Phase 4.1)
+### Document As-Of Date Resolution (determines "newness")
 
-When the same entity appears in multiple source documents, merge fields:
+**Every document gets a single `asOfDate`** (ISO YYYY-MM-DD). Use this priority order,
+first match wins:
 
-**General rules:**
-- First non-null value wins, unless a later document has a more complete value
-- For string fields: prefer the longer/more complete version
-- For dates: values should be identical (flag if they differ)
-- For identifiers (SSN, EIN): must be identical (flag if they differ — likely misidentification)
+1. Explicit "As of" date printed on the document (e.g., "As of 3/31/2026")
+2. Document execution / signing / effective date (restated trust date, policy effective date,
+   operating agreement date, signature date)
+3. Filing or issue date (1099 tax year = Dec 31 of that year; deed recording date)
+4. Statement period end date ("November 2025 statement" → 2025-11-30)
+5. Filename-embedded date patterns: `YYYY.MM.DD`, `YYYY-MM-DD`, `MM.DD.YY`, `YYYY_MM`
+   - Example: `Certificate of IconTrust 2025.05.15.pdf` → 2025-05-15
+   - Example: `Glickman_David_portfolio_07-08-2025.xlsx` → 2025-07-08
+   - Example: `2026.03.09 - meeting with David/` → 2026-03-09 (folder-level date)
+6. File `mtime` (filesystem modification time) — **last resort only**, OneDrive/Dropbox
+   sync often rewrites mtime, so this is unreliable
 
-**Field-specific rules:**
+**Persist `asOfDate` on every extraction cache line** — the cache MUST carry this field so
+Phase 4 can resolve conflicts deterministically.
+
+### Cross-Document Merge (Phase 4.1) — Latest-Date-Wins
+
+When the same entity field appears in multiple source documents with different values,
+**the value from the document with the latest `asOfDate` wins**. This is the primary merge
+rule — it supersedes "most complete value" when values actually differ.
+
+**Decision table:**
+
+| Situation | Action |
+|---|---|
+| One doc has value, another has null | Take the non-null value (no date needed) |
+| Same value in both | MATCH — no action |
+| Different values, both have asOfDate | **Latest asOfDate wins**. Record loser + reason. |
+| Different values, neither has asOfDate | Prefer longer/more specific value; flag if ambiguous |
+| Different values on an **immutable** field (SSN, DOB, EIN, formationDate, taxId) | HARD CONFLICT — flag for user, never auto-resolve |
+| Amendment/Restatement document vs original | Amendment always wins; set `effectiveTo` on superseded relationships |
+| Statement dated 2025-11 vs 2025-07 for same account | November wins (later) |
+| Deed/filing docs with same address at different precisions | Prefer longer address **only if** its asOfDate is ≥ shorter version's |
+
+**Field-category behavior:**
 
 | Field Category | Merge Strategy |
 |---|---|
-| **Immutable** (SSN, DOB, EIN, formation date) | Must agree. Any discrepancy = flag as conflict |
-| **Semi-stable** (name, gender, citizenship) | Prefer most recent document. Flag if different |
-| **Mutable** (address, phone, email, employer) | Prefer most recent document |
-| **Cumulative** (tags, roles, relationships) | Union of all values |
-| **Descriptive** (biography, notes, descriptions) | Concatenate or prefer most comprehensive |
+| **Immutable** (SSN, DOB, EIN, formation date, taxId) | Must agree. Discrepancy = hard conflict |
+| **Historical** (originalBalance, originationDate, purchasePrice, purchaseDate) | First confirmed value wins; don't overwrite |
+| **Semi-stable** (legal name, gender, citizenship) | Latest-date-wins on real differences |
+| **Mutable** (address, phone, email, employer, marital status, occupation) | Latest-date-wins always |
+| **Balance / valuation** (currentBalance, currentValue, cashValue) | Latest-date-wins always |
+| **Trustees / beneficiaries / managers** | Latest restatement/amendment wins; older ones become historical |
+| **Cumulative** (tags, roles, multi-value relationships) | Union of all values |
+| **Descriptive** (biography, notes, descriptions) | Prefer newest comprehensive version; concatenate if complementary |
 
-### Altitude Diff (Phase 4.3)
+**Tracking**: Every merged field carries `{value, winningSource, winningAsOfDate,
+supersededValues: [{value, source, asOfDate}...]}` in the cache. This is what Phase 5
+uses to render the review table.
 
-When comparing extracted data against existing Altitude entity:
+### Altitude Diff (Phase 4.3) — Also Latest-Date-Wins
 
-**Three-way classification for each field:**
+When comparing extracted data against existing Altitude entity, treat the Altitude record's
+`updatedAt` as that value's asOfDate. Altitude may have been updated by another source
+(direct UI edit, another ingestion) since the documents were produced.
+
+**Five-way classification for each field:**
 
 ```
-FILL    = Altitude is null/empty, extracted has value
-          → Safe to auto-update. Include in PATCH payload.
+FILL         = Altitude is null/empty, extracted has value
+               → Safe to auto-update. Include in PATCH payload.
 
-MATCH   = Both have the same value (after normalization)
-          → No action needed.
+MATCH        = Both have the same value (after normalization)
+               → No action needed.
 
-CONFLICT = Both have values, but they differ
-          → Flag for user decision. Present both values.
+SUPERSEDE    = Both have values, they differ, and extracted.asOfDate > altitude.updatedAt
+               → Queue for PATCH. Show both values in the review table so the user can audit.
 
-KEEP    = Altitude has value, extracted is null
-          → Leave Altitude value unchanged.
+STALE        = Both have values, they differ, but altitude.updatedAt >= extracted.asOfDate
+               → KEEP Altitude. Show both values in review as FYI (user may still override).
+
+HARD_CONFLICT = Both have values on an immutable field (SSN, DOB, EIN, formationDate, taxId)
+               → BLOCK. Flag for explicit user decision. Never auto-resolve.
+
+KEEP         = Altitude has value, extracted is null
+               → Leave Altitude value unchanged.
 ```
 
 **Normalization before comparison:**

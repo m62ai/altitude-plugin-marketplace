@@ -1,1 +1,29 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editors
 .idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local config / secrets
+.altitude/
+*.local.json
+
+# Build artifacts
+build/
+dist/
+node_modules/
+__pycache__/
+*.pyc

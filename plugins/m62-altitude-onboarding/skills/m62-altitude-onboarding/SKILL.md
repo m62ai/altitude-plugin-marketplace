@@ -17,51 +17,509 @@ entities. Every change is reviewed before pushing.
 
 ## Prerequisites
 
-### Step 0: Load Saved Configuration
+### Required Tools
+
+This skill runs cross-platform (macOS, Linux, Windows). The following tools must be installed
+and on the user's `PATH` **before** running. Verify each at the start of Step 0 with
+`shutil.which(...)` and fail fast with a clear message if anything is missing — do NOT
+attempt to install tooling automatically.
+
+| Tool | Why | macOS | Linux | Windows |
+|---|---|---|---|---|
+| **Python 3.9+** | Script runtime for .docx/.xlsx/.eml/large PDFs | `brew install python` | `apt install python3` | `winget install Python.Python.3.12` (avoid the Microsoft Store stub — it silently redirects to a non-functional alias) |
+| **pip packages** | Document parsing | `pip install pypdf python-docx openpyxl requests` | same | same |
+| **qpdf** | Decrypt password-protected PDFs | `brew install qpdf` | `apt install qpdf` or `dnf install qpdf` | `winget install qpdf.qpdf` or `choco install qpdf` or `scoop install qpdf` |
+| **poppler** (pdftotext) | **Text-first PDF extraction (REQUIRED, not optional)** — the default PDF read strategy uses `pdftotext -layout` before falling back to Claude's Read tool. Avoids the 2000px image-dimension limit that scanned-PDF pages can hit. | `brew install poppler` | `apt install poppler-utils` | `winget install oschwartz10612.Poppler` or `choco install poppler` |
+| **tesseract** (OCR) | Fallback for scanned PDFs where `pdftotext` returns empty (i.e., pure image PDFs — trust documents, deeds, handwritten notes). Pipe `pdftoppm -r 150` → `tesseract` to get text. | `brew install tesseract` | `apt install tesseract-ocr` | `winget install UB-Mannheim.TesseractOCR` or `choco install tesseract` |
+| **pandoc** (optional) | Cross-platform .docx → text | `brew install pandoc` | `apt install pandoc` | `winget install JohnMacFarlane.Pandoc` |
+| **curl** | Occasional API examples (all scripted work uses `requests`) | built-in | built-in | built-in on Windows 10 1803+ (`C:\Windows\System32\curl.exe`) |
+
+**Verify with this snippet** (use `PYTHON` from Cross-Platform Setup below):
+
+```python
+# check_prereqs.py
+import shutil, socket, sys
+missing = []
+# Required tools
+for tool in ("qpdf", "pdftotext"):        # pandoc + tesseract are optional-but-recommended
+    if not shutil.which(tool):
+        missing.append(tool)
+# Python packages
+try:
+    import pypdf, docx, openpyxl, requests  # noqa: F401
+except ImportError as e:
+    missing.append(f"python package: {e.name}")
+# DNS reachability check (fail fast if the user is on a restricted network)
+try:
+    socket.gethostbyname("api.m62.live")
+except socket.gaierror:
+    missing.append("DNS: cannot resolve api.m62.live (check network or set up hosts override — see Step 0.c)")
+if missing:
+    sys.exit(f"Missing prerequisites: {', '.join(missing)}")
+print("All prerequisites OK")
+```
+
+### Windows-Specific Notes
+
+1. **Python alias trap**: Windows 10+ ships a `python.exe` stub that opens the Microsoft
+   Store instead of running Python. Verify with `python --version`. If it opens the Store,
+   disable the alias under *Settings → Apps → Advanced app settings → App execution aliases*
+   and install real Python from [python.org](https://www.python.org/downloads/windows/) or winget.
+2. **Long paths (MAX_PATH 260)**: household folders with deep nesting can exceed Windows'
+   legacy 260-character path limit. Either enable long paths (`reg add HKLM\SYSTEM\CurrentControlSet\Control\FileSystem /v LongPathsEnabled /t REG_DWORD /d 1 /f` as admin, then reboot)
+   or place household folders at a short root like `C:\cl\` instead of the default Documents tree.
+3. **File paths in prompts**: when passing file paths to sub-agents, use **forward slashes or
+   raw strings** in Python (`r"C:\cl\Smith"` or `"C:/cl/Smith"`). Mixing backslashes with
+   regular strings causes `\n`, `\t`, `\r` escapes to fire unexpectedly.
+4. **PowerShell execution policy**: running `.ps1` scripts may be blocked by the default
+   `Restricted` policy. For the refresh scripts, either run with `powershell -ExecutionPolicy Bypass -File tools\refresh-api-spec.ps1` or set the policy once with
+   `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+5. **No bash-isms**: Do not write `&&`, `||`, `$(...)` command substitution, `${VAR}`
+   expansion, single-quote heredocs, or `python -c "..."` with embedded newlines.
+   Always write scripts to a `.py` file and run them with `python script.py`.
+6. **Line endings**: Python handles CRLF/LF transparently. If you write a `.py` helper
+   script on Windows, don't worry about line endings.
+
+### Step 0: Load Saved Configuration + Authenticate
 
 **Do this FIRST before anything else.**
 
-Determine the home directory:
-- **macOS/Linux**: `HOME` environment variable
-- **Windows**: `USERPROFILE` environment variable
+Altitude implements a full **OAuth 2.1 + PKCE + Dynamic Client Registration** authorization
+server — the exact same protocol Claude uses for its MCP/connector integrations
+(RFC 8414 / RFC 7591 / RFC 9728 / RFC 7636). This is the preferred interactive auth mode
+for the skill: the user signs in on Altitude's own hosted login page in a browser, approves
+the client, and the skill receives a JWT access token via a local loopback callback.
 
-Use the **Read** tool to check for `{HOME_DIR}/.altitude/config.json`:
+The access token returned by OAuth is a standard Altitude JWT — it works for **every**
+REST endpoint (`/api/v1/individual`, `/api/v1/household`, `/api/v1/document`, etc.), not
+just MCP endpoints, despite the `mcp:read`/`mcp:write` scope names.
 
-If the file exists and contains valid JSON, use its values:
+**Auth modes supported:**
+
+| Mode | Header used on every request | When to use |
+|---|---|---|
+| **OAuth (browser)** | `Authorization: Bearer <access_token>` | **Default for interactive use.** Altitude-hosted login, optional MFA, refresh tokens. |
+| **API Key** | `X-API-Key: ak_live_...` | Automation, CI, long-lived server integrations. No browser needed. |
+| **JWT (direct)** | `Authorization: Bearer <id_token>` | Fallback: user pastes a JWT obtained out-of-band (e.g., from the Altitude UI session). |
+
+#### 0.a — Config file schema
+
+`{HOME_DIR}/.altitude/config.json` (where `HOME_DIR` is `$HOME` on macOS/Linux or
+`%USERPROFILE%` on Windows). The config supports all three modes via an `authMode`
+discriminator:
+
 ```json
 {
-  "apiKey": "ak_live_xxxxxxxx",
+  "authMode": "oauth" | "api_key" | "jwt",
   "baseUrl": "https://api.m62.live",
-  "firmName": "Wellington Advisors"
+  "firmName": "Wellington Advisors",
+
+  "apiKey": "ak_live_xxxxxxxx",                    // if authMode=api_key
+  "jwt": "eyJhbGciOiJIUzUxMi...",                  // if authMode=jwt (manual paste)
+
+  // if authMode=oauth — populated by the OAuth flow below:
+  "oauth": {
+    "clientId": "550e8400-e29b-...",
+    "accessToken": "eyJhbGciOiJIUzUxMi...",
+    "refreshToken": "k8f3...",
+    "tokenType": "Bearer",
+    "expiresAt": "2026-04-18T18:00:00Z",
+    "scope": "mcp:read mcp:write",
+    "email": "advisor@firm.com"                    // cached only for display
+  }
 }
 ```
 
-- Use `apiKey` for all API requests via the `X-API-Key` header
-- Use `baseUrl` as the API base URL
-- Use `firmName` as context
+**Security rules** (enforce strictly):
+1. **NEVER write the password to disk.** OAuth is specifically designed so the skill never
+   sees the password — the browser handles that directly with Altitude.
+2. Keep the config file `chmod 600` on Unix; on Windows, NTFS per-user ACLs under
+   `%USERPROFILE%` provide equivalent protection.
+3. When the `accessToken` is within 5 minutes of expiry, silently refresh via
+   `POST /oauth/token` with `grant_type=refresh_token`. If the refresh fails (revoked,
+   expired), fall back to the full browser auth flow.
 
-**If the config file exists and is valid, skip credential prompts — proceed directly with these values.**
+#### 0.b — If config exists and credentials are current
 
-### If No Config File Exists
+- `authMode=api_key` + `apiKey` set → smoke-test with `GET /api/v1/authenticate` → use
+- `authMode=oauth` + `accessToken` not expired → use immediately
+- `authMode=oauth` + `accessToken` expired but `refreshToken` valid → refresh silently
+- Any other state → run the appropriate auth flow below
 
-If the Read tool returns an error (file not found), ask the user for:
+#### 0.c — Auth Mode 1: OAuth (browser, recommended for interactive use)
 
-- **API Key** (recommended): `X-API-Key: ak_live_xxxxxxxx`
-  - Or **JWT**: POST to `/api/v1/authenticate` with credentials
-- **Environment**: Production (`https://api.m62.live`) or Development (`http://localhost:8080`)
-- **Firm name** (optional, for display)
+**This is the Claude-connector flow.** The skill acts as a public OAuth client:
 
-Then save using the **Write** tool to `{HOME_DIR}/.altitude/config.json`:
+1. **Discover endpoints** — GET `{baseUrl}/.well-known/oauth-authorization-server` returns:
+   ```json
+   {
+     "issuer": "https://api.m62.live",
+     "authorization_endpoint": "https://api.m62.live/oauth/authorize",
+     "token_endpoint": "https://api.m62.live/oauth/token",
+     "registration_endpoint": "https://api.m62.live/oauth/register",
+     "scopes_supported": ["mcp:read", "mcp:write"],
+     "grant_types_supported": ["authorization_code", "refresh_token"],
+     "response_types_supported": ["code"],
+     "code_challenge_methods_supported": ["S256"],
+     "token_endpoint_auth_methods_supported": ["none"]
+   }
+   ```
+   Cache these endpoints.
 
-```json
-{
-  "apiKey": "<their-api-key>",
-  "baseUrl": "<their-chosen-url>",
-  "firmName": "<their-firm-name>"
-}
+2. **Dynamically register the skill as an OAuth client** (RFC 7591). This is a one-time
+   operation — after the first successful registration, reuse the `clientId` from config.
+   POST `{registration_endpoint}` with JSON:
+   ```json
+   {
+     "client_name": "M62 Altitude Onboarding Skill",
+     "redirect_uris": ["http://127.0.0.1:<random-free-port>/callback"],
+     "grant_types": ["authorization_code", "refresh_token"],
+     "token_endpoint_auth_method": "none",
+     "response_types": ["code"]
+   }
+   ```
+   Allowed redirect URIs are `http://localhost`, `http://127.0.0.1`, or `https://`. The
+   response contains `client_id` — save it to `config.oauth.clientId` for reuse.
+
+3. **Start a local loopback HTTP server** on `127.0.0.1:<port>` to receive the OAuth
+   redirect. Bind port **0** to let the OS pick a free port, then read the assigned port.
+
+4. **Generate PKCE values** (RFC 7636, S256 only):
+   ```python
+   import secrets, hashlib, base64
+   code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode()
+   code_challenge = base64.urlsafe_b64encode(
+       hashlib.sha256(code_verifier.encode()).digest()
+   ).rstrip(b"=").decode()
+   state = secrets.token_urlsafe(32)  # CSRF protection
+   ```
+
+5. **Open the browser** to the authorization endpoint with query parameters:
+   ```
+   {authorization_endpoint}
+     ?response_type=code
+     &client_id={clientId}
+     &redirect_uri=http://127.0.0.1:{port}/callback
+     &scope=mcp:read%20mcp:write
+     &state={state}
+     &code_challenge={code_challenge}
+     &code_challenge_method=S256
+   ```
+   The user sees **Altitude's own login page** (not the skill's UI) in their browser,
+   enters their email + password, and Altitude authenticates them. On success, Altitude
+   redirects to `http://127.0.0.1:{port}/callback?code=XXX&state=YYY`.
+
+6. **Local server catches the redirect**, validates `state`, captures `code`, shows the
+   user a "Signed in — you can close this tab" page, then shuts down.
+
+7. **Exchange code for tokens** — POST `{token_endpoint}` as
+   `application/x-www-form-urlencoded`:
+   ```
+   grant_type=authorization_code
+   &code={captured_code}
+   &code_verifier={code_verifier}
+   &redirect_uri=http://127.0.0.1:{port}/callback
+   &client_id={clientId}
+   ```
+   Response (200):
+   ```json
+   {
+     "access_token": "eyJhbGciOiJIUzUxMi...",
+     "token_type": "Bearer",
+     "expires_in": 3600,
+     "refresh_token": "k8f3...",
+     "scope": "mcp:read mcp:write"
+   }
+   ```
+   Save `accessToken`, `refreshToken`, `expiresAt = now + expires_in - 30s` (30s buffer),
+   and `tokenType` to `config.oauth.*`.
+
+**Complete script** — write this to a temp file and run it. It handles the whole flow
+including the loopback server:
+
+```python
+# altitude_oauth_login.py
+import base64, hashlib, http.server, json, os, pathlib, secrets, socketserver
+import sys, threading, urllib.parse, urllib.request, webbrowser
+
+BASE = sys.argv[1]  # e.g., https://api.m62.live
+
+# 1. Discover endpoints
+meta_url = f"{BASE}/.well-known/oauth-authorization-server"
+meta = json.loads(urllib.request.urlopen(meta_url, timeout=10).read())
+
+# 2. Load or register client
+home = pathlib.Path(os.environ.get("USERPROFILE") or os.environ["HOME"])
+cfg_path = home / ".altitude" / "config.json"
+cfg_path.parent.mkdir(exist_ok=True)
+cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+client_id = cfg.get("oauth", {}).get("clientId")
+
+# 3. Pick a free loopback port
+with socketserver.TCPServer(("127.0.0.1", 0), None) as s:
+    port = s.server_address[1]
+redirect_uri = f"http://127.0.0.1:{port}/callback"
+
+if not client_id:
+    reg_body = json.dumps({
+        "client_name": "M62 Altitude Onboarding Skill",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "token_endpoint_auth_method": "none",
+        "response_types": ["code"],
+    }).encode()
+    req = urllib.request.Request(meta["registration_endpoint"], data=reg_body,
+                                 headers={"Content-Type": "application/json"})
+    reg = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    client_id = reg["client_id"]
+    print(f"Registered OAuth client: {client_id}")
+
+# 4. PKCE
+cv = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode()
+cc = base64.urlsafe_b64encode(hashlib.sha256(cv.encode()).digest()).rstrip(b"=").decode()
+state = secrets.token_urlsafe(32)
+
+# 5. Loopback server to catch the redirect
+result = {}
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass  # silence
+    def do_GET(self):
+        qs = urllib.parse.urlparse(self.path).query
+        params = dict(urllib.parse.parse_qsl(qs))
+        result.update(params)
+        body = b"<html><body><h2>Signed in. You can close this tab.</h2></body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+
+# 6. Open the browser
+auth_url = meta["authorization_endpoint"] + "?" + urllib.parse.urlencode({
+    "response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri,
+    "scope": "mcp:read mcp:write", "state": state,
+    "code_challenge": cc, "code_challenge_method": "S256",
+})
+print(f"Opening browser to: {auth_url}")
+try: webbrowser.open(auth_url)
+except Exception: print("Could not open browser automatically — open the URL manually.")
+
+# Wait for callback (with 5 min timeout)
+import time
+deadline = time.time() + 300
+while not result and time.time() < deadline:
+    time.sleep(0.5)
+server.shutdown()
+
+if "error" in result:
+    sys.exit(f"OAuth error: {result.get('error')} — {result.get('error_description','')}")
+if result.get("state") != state:
+    sys.exit("OAuth state mismatch — possible CSRF. Aborting.")
+if "code" not in result:
+    sys.exit("Timed out waiting for OAuth redirect.")
+
+# 7. Exchange code for tokens
+token_body = urllib.parse.urlencode({
+    "grant_type": "authorization_code",
+    "code": result["code"], "code_verifier": cv,
+    "redirect_uri": redirect_uri, "client_id": client_id,
+}).encode()
+req = urllib.request.Request(meta["token_endpoint"], data=token_body,
+    headers={"Content-Type": "application/x-www-form-urlencoded"})
+tok = json.loads(urllib.request.urlopen(req, timeout=10).read())
+
+# 8. Save config
+import datetime
+expires_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=tok["expires_in"] - 30)
+cfg["authMode"] = "oauth"
+cfg["baseUrl"] = BASE
+cfg.setdefault("oauth", {}).update({
+    "clientId": client_id,
+    "accessToken": tok["access_token"],
+    "refreshToken": tok.get("refresh_token"),
+    "tokenType": tok.get("token_type", "Bearer"),
+    "expiresAt": expires_at.isoformat() + "Z",
+    "scope": tok.get("scope"),
+})
+cfg_path.write_text(json.dumps(cfg, indent=2))
+if os.name == "posix":
+    os.chmod(cfg_path, 0o600)
+print("OAuth login complete. Config saved.")
 ```
 
-Tell the user: "Saved your configuration to `~/.altitude/config.json`. Future runs will use it automatically."
+#### 0.d — OAuth token refresh (automatic)
+
+When the access token is close to expiry, refresh silently:
+
+```python
+# altitude_oauth_refresh.py
+import json, os, pathlib, urllib.parse, urllib.request, datetime, sys
+home = pathlib.Path(os.environ.get("USERPROFILE") or os.environ["HOME"])
+cfg = json.loads((home / ".altitude" / "config.json").read_text())
+base = cfg["baseUrl"]
+oa = cfg["oauth"]
+body = urllib.parse.urlencode({
+    "grant_type": "refresh_token",
+    "refresh_token": oa["refreshToken"],
+    "client_id": oa["clientId"],
+}).encode()
+req = urllib.request.Request(f"{base}/oauth/token", data=body,
+    headers={"Content-Type": "application/x-www-form-urlencoded"})
+try:
+    tok = json.loads(urllib.request.urlopen(req, timeout=10).read())
+except urllib.error.HTTPError as e:
+    # Refresh failed (token revoked, expired) — caller should re-run full OAuth flow
+    sys.exit(f"REFRESH_FAILED:{e.code}")
+expires_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=tok["expires_in"] - 30)
+oa["accessToken"] = tok["access_token"]
+if tok.get("refresh_token"):  # refresh rotation
+    oa["refreshToken"] = tok["refresh_token"]
+oa["expiresAt"] = expires_at.isoformat() + "Z"
+(home / ".altitude" / "config.json").write_text(json.dumps(cfg, indent=2))
+```
+
+#### 0.e — Auth Mode 2: API Key (automation)
+
+User pastes the key (it starts with `ak_live_` for production or `ak_test_` for dev).
+Smoke-test with `GET {baseUrl}/api/v1/authenticate` — 200 means the key is valid. Save
+with `authMode="api_key"`.
+
+#### 0.f — Auth Mode 3: Direct JWT paste (fallback)
+
+If the user already has a JWT (from the Altitude UI's browser session, for example), they
+can paste it directly. Save with `authMode="jwt"` and `jwt=<token>`. This mode has no
+refresh capability — when the JWT expires, prompt for a new paste or switch to OAuth.
+
+#### 0.f.5 — DNS reachability test + loopback fallback
+
+**Run this test at Step 0 before any API calls.** On some networks (corporate DNS,
+split-horizon, DNS rebinding filters) `api.m62.live` fails to resolve via the system
+resolver even though the service is reachable by IP. This has caused 100% of API calls
+in the skill to fail with connection timeouts in prior runs.
+
+```python
+# altitude_dns_probe.py — run first, cache result
+import socket, subprocess, json, os, pathlib, sys
+def try_system_dns():
+    try:
+        ip = socket.gethostbyname("api.m62.live")
+        return ("system", ip)
+    except socket.gaierror:
+        return None
+def try_public_dns():
+    for server in ("1.1.1.1", "8.8.8.8", "9.9.9.9"):
+        try:
+            out = subprocess.check_output(
+                ["dig", f"@{server}", "api.m62.live", "+short", "+time=3"],
+                text=True, timeout=5
+            ).strip().splitlines()
+            ips = [x for x in out if x and not x.startswith(";")]
+            if ips: return ("public", ips[0])
+        except Exception: pass
+    return None
+
+result = try_system_dns() or try_public_dns()
+if not result:
+    sys.exit("DNS: cannot resolve api.m62.live via any method. Check network/VPN/firewall.")
+
+method, ip = result
+home = pathlib.Path(os.environ.get("USERPROFILE") or os.environ["HOME"])
+probe_file = home / ".altitude" / "dns_probe.json"
+probe_file.parent.mkdir(exist_ok=True)
+probe_file.write_text(json.dumps({"method": method, "ip": ip, "target": "api.m62.live"}))
+print(f"DNS OK via {method}: {ip}")
+```
+
+**If `method == "system"`** → system DNS works, use normal Python `requests` or `curl`.
+
+**If `method == "public"`** → system DNS is broken but public DNS has the IP. Every
+subsequent API call must override. Two patterns:
+
+1. **`curl` with `--resolve`** (simplest, reliable):
+   ```bash
+   curl --resolve "api.m62.live:443:<IP>" -H "X-API-Key: $KEY" "https://api.m62.live/api/v1/..."
+   ```
+
+2. **Python `requests` with connection patching** (cleaner for scripts):
+   ```python
+   # altitude_http.py
+   import json, os, pathlib, requests
+   from urllib3.util import connection
+   home = pathlib.Path(os.environ.get("USERPROFILE") or os.environ["HOME"])
+   probe = json.loads((home / ".altitude" / "dns_probe.json").read_text())
+   if probe["method"] == "public":
+       _orig = connection.create_connection
+       def _patched(addr, *args, **kwargs):
+           host, port = addr
+           if host == "api.m62.live":
+               addr = (probe["ip"], port)
+           return _orig(addr, *args, **kwargs)
+       connection.create_connection = _patched
+   # Now use requests normally — DNS patching is transparent
+   ```
+
+On Windows with `curl.exe`, the same `--resolve` flag works. PowerShell's `Invoke-WebRequest`
+does not support `--resolve`; use `curl.exe` or a Python script via PowerShell instead.
+
+**Re-probe every hour** (IP can change). Cache the IP in `dns_probe.json` with a TTL check.
+
+#### 0.g — Pick the right header per request
+
+The skill's helper emits the correct header automatically based on `authMode`:
+
+```python
+# altitude_auth.py — load once, reuse everywhere
+import json, os, pathlib, datetime
+home = pathlib.Path(os.environ.get("USERPROFILE") or os.environ["HOME"])
+cfg = json.loads((home / ".altitude" / "config.json").read_text())
+
+def ensure_fresh():
+    """Refresh OAuth token if within 5 minutes of expiry."""
+    if cfg.get("authMode") != "oauth": return
+    exp = datetime.datetime.fromisoformat(cfg["oauth"]["expiresAt"].rstrip("Z"))
+    if exp - datetime.datetime.utcnow() < datetime.timedelta(minutes=5):
+        import subprocess, sys
+        subprocess.check_call([sys.executable, "altitude_oauth_refresh.py"])
+        # reload
+        global cfg
+        cfg = json.loads((home / ".altitude" / "config.json").read_text())
+
+def headers():
+    ensure_fresh()
+    mode = cfg.get("authMode", "api_key")
+    if mode == "api_key":
+        return {"X-API-Key": cfg["apiKey"]}
+    if mode == "oauth":
+        return {"Authorization": f"Bearer {cfg['oauth']['accessToken']}"}
+    if mode == "jwt":
+        return {"Authorization": f"Bearer {cfg['jwt']}"}
+    raise RuntimeError(f"Unknown authMode: {mode}")
+
+def base_url(): return cfg["baseUrl"]
+def firm_name(): return cfg.get("firmName", "")
+```
+
+#### 0.h — Prompt the user to choose
+
+If no usable config exists, ask:
+
+> How should I authenticate to Altitude?
+> 1. **OAuth (browser, recommended)** — I'll open Altitude's login page in your browser. You sign in there; I never see your password. I'll cache a short-lived access token + refresh token.
+> 2. **API Key** (automation) — you paste an `ak_live_...` key. Good for CI or long-running integrations where no human is present.
+> 3. **JWT paste** (fallback) — paste a JWT obtained from your existing Altitude browser session.
+
+And: "Which environment? Production (`https://api.m62.live`) or Development (`http://localhost:8080`)?"
+
+Then run the script for the chosen mode, save config, and proceed.
+
+#### 0.i — Backwards compatibility
+
+Config files without `authMode` but with `apiKey` set should be treated as `authMode=api_key`
+for transparent upgrade. Write out an updated config with `authMode` set on the next run.
 
 ### Cross-Platform Setup
 
@@ -132,18 +590,35 @@ Phase 7:   Upload Documents     → Associate each document with its correct ent
 NEVER reads document contents directly. Instead, you spawn extraction agents that each
 handle a subset of files and write their results to disk.
 
-**Batching rules — split by subdirectory, then by count:**
+**Batching rules — split by subdirectory, then by count. Hard cap: 25 files per batch.**
 
 1. **Group files by subdirectory** first. Each top-level folder in the household directory
    becomes a candidate batch (e.g., `Identification/`, `LLC/`, `Tax Documents/`,
    `Financial Statements/`, `Insurance/`, `Estate Planning/`).
 
-2. **If a subdirectory has > 12 files**, split it into sub-batches of ~10 files each.
-   For example, `Tax Documents/` with 25 files becomes 3 batches of ~8-9 files.
+2. **Cap every batch at 25 files.** Any group exceeding 25 gets split:
+   - 26-50 files → 2 batches of ~18-25
+   - 51-75 files → 3 batches of ~17-25
+   - 76+ → more splits, 25-file cap
+   Never let a single batch exceed 30 files — sub-agent context pressure becomes severe
+   beyond that, and image-heavy PDFs compound the load.
 
 3. **If a subdirectory has < 4 files**, merge it with another small directory into one batch.
 
-4. **Target: 2-4 parallel agents** for most households. 1 agent for < 10 files total.
+4. **Target batch size**: 15-20 files is the sweet spot. Very small families (< 10 files
+   total) use 1 batch; larger families get 5-10 batches running in parallel.
+
+5. **Parallelism budget**: 5-8 concurrent agents is the default target. 10+ concurrent
+   agents has hit output-size limits in practice; split into waves if needed.
+
+6. **Imbalance is OK** — don't force-balance batches. A batch of 16 mixed files + a batch
+   of 22 all-statements is fine. Grouping by document type (all statements together, all
+   trust docs together) is more valuable than perfect file-count parity, because agents
+   can apply type-specific heuristics (statement period parsing, trust role extraction).
+
+**Historical precedent**:
+- Glickman (85 files) → 5 batches of 10-21 files, completed in ~9 minutes
+- Boro-Hamilton (215 files) → 8 batches of 16-37 files; the 37-file batch strained context and retried once. Cap of 25 would have prevented the retry.
 
 **Example batching for a 40-file household:**
 ```
@@ -191,14 +666,14 @@ Before touching any documents, query Altitude to understand what already exists.
 ### Step 1.1: Search for the household
 
 ```
-GET /api/v1/household/search?searchParams=searchFor:{household_name}&size=50
+GET /api/v1/household/search?searchFor={household_name}&size=50
 X-API-Key: {api_key}
 ```
 
 or with JWT:
 
 ```
-GET /api/v1/household/search?searchParams=searchFor:{household_name}&size=50
+GET /api/v1/household/search?searchFor={household_name}&size=50
 Authorization: Bearer {token}
 ```
 
@@ -232,6 +707,53 @@ Record:
 
 ### Step 1.3: Fetch full details for each entity
 
+**Account graph traversal — DO NOT trust `household.totalAccountCount`.** In practice the
+household count often exceeds the number of accounts reachable via direct
+`HOUSEHOLD → ACCOUNT_FINANCIAL` relationships, because most accounts hang off trusts and
+LLCs, not the household itself. In a $1.22B household with 48 accounts, fewer than a
+dozen were directly owned by the household — the rest were inside trust/LLC sub-graphs.
+
+**Traversal algorithm** (implement this before moving past Phase 1):
+
+```python
+# altitude_account_graph.py — recursively discover all accounts reachable from household
+visited_entities = set()   # (entity_type, entity_id) pairs we've already expanded
+all_accounts = {}          # account_id -> basic info
+
+def expand(entity_type, entity_id):
+    key = (entity_type, entity_id)
+    if key in visited_entities: return
+    visited_entities.add(key)
+    rels = api_get(f"/api/v1/entity-relationship/from/{entity_type}/{entity_id}")
+    for r in rels:
+        if r["targetEntityType"] == "ACCOUNT_FINANCIAL":
+            all_accounts[r["targetEntityId"]] = {
+                "id": r["targetEntityId"],
+                "name": r["targetEntityName"],
+                "ownerType": entity_type,
+                "ownerId": entity_id,
+                "ownerName": "<look up from existing cache>",
+            }
+        elif r["targetEntityType"] in ("LEGAL_ENTITY", "INDIVIDUAL"):
+            expand(r["targetEntityType"], r["targetEntityId"])  # recurse
+
+expand("HOUSEHOLD", household_id)
+```
+
+This expands Household → its individuals and legal entities → each of their
+outgoing relationships → any sub-LEs they hold → all the way down to every leaf
+ACCOUNT_FINANCIAL. The number of accounts discovered should match or exceed
+`household.totalAccountCount`. If the discovered count is LOWER, flag as open question
+(the household counter may include hard-deleted or orphan accounts).
+
+**Account search fallback** — some accounts may not be wired into the relationship graph
+(orphan accounts created directly). Also search by household name tokens AFTER graph
+traversal to catch these:
+
+```
+GET /api/v1/account-financial/search?searchFor={householdNameToken}&size=100
+```
+
 For each individual in the household:
 ```
 GET /api/v1/individual/{id}
@@ -242,7 +764,7 @@ For each legal entity in the household:
 GET /api/v1/legal-entity/{id}
 ```
 
-For each account in the household:
+For each account discovered via the traversal above:
 ```
 GET /api/v1/account-financial/{id}
 ```
@@ -279,8 +801,8 @@ household in Altitude. This is the baseline for comparison.
 Additionally, search for any accounts and contacts by name pattern:
 
 ```
-GET /api/v1/account-financial/search?searchParams=searchFor:{account_name_pattern}&size=50
-GET /api/v1/contact/search?searchParams=searchFor:{contact_name_pattern}&size=50
+GET /api/v1/account-financial/search?searchFor={account_name_pattern}&size=50
+GET /api/v1/contact/search?searchFor={contact_name_pattern}&size=50
 ```
 
 ### Step 1.5: Build the Altitude Universe index
@@ -344,6 +866,63 @@ Save as `{household_folder}/altitude_review/altitude_universe.json` for referenc
 
 ## Phase 2: Scan & Classify Documents
 
+### Step 2.0: OneDrive / cloud-sync hydration pre-scan (REQUIRED before spawning agents)
+
+OneDrive, Dropbox, iCloud and Box store files as "dataless placeholders" until accessed —
+reading one triggers a download. In extraction sub-agents, a cloud-stub read times out
+after tens of seconds (default socket timeout), wasting compute. Detect unhydrated files
+**before** spawning agents and report them to the user for bulk hydration in Finder/Explorer
+before the expensive extraction runs.
+
+```python
+# altitude_hydration_scan.py
+import os, subprocess, sys
+from pathlib import Path
+
+HOUSEHOLD = sys.argv[1]  # absolute path to household folder
+STUB_THRESHOLD_SECS = 3  # a 1-byte read taking > 3s is almost certainly a cloud stub
+
+def is_cloud_stub(path: str) -> bool:
+    try:
+        subprocess.check_output(
+            ["dd", f"if={path}", "bs=1", "count=1", "of=/dev/null"],
+            stderr=subprocess.DEVNULL, timeout=STUB_THRESHOLD_SECS,
+        )
+        return False
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        return True
+
+stubs = []
+for root, _, files in os.walk(HOUSEHOLD):
+    if "altitude_review" in root: continue
+    for f in files:
+        if f.startswith(".DS_Store"): continue
+        p = os.path.join(root, f)
+        if is_cloud_stub(p): stubs.append(p)
+
+if stubs:
+    print(f"❌ {len(stubs)} cloud-stub files detected (read times out):")
+    for s in stubs: print(f"  {s}")
+    print()
+    print("TO HYDRATE (macOS Finder):")
+    print("  Right-click the folder(s) containing these files → 'Always Keep on This Device'")
+    print("TO HYDRATE (Windows Explorer):")
+    print("  Right-click → 'Always keep on this device'")
+    print("After hydration (green circle icons), re-run the scan.")
+    sys.exit(2)
+else:
+    print(f"✅ All files hydrated. Safe to proceed with extraction.")
+```
+
+**If stubs are found**: present the list to the user in a compact form (grouped by
+parent directory, counts), ask them to hydrate, then **re-run this scan** before
+proceeding. Do NOT launch extraction agents if any unhydrated files remain — they
+will consume hundreds of seconds of agent time timing out on reads.
+
+**If all files are hydrated**: proceed to document classification below.
+
+### Step 2.1: Classify Documents
+
 List all files recursively in the household folder. Classify each document using the
 patterns in `references/document_type_patterns.md`. Key classification rules:
 
@@ -371,11 +950,46 @@ to use.
 
 ## Phase 3: Extract Entities from Documents
 
+### PDF Reading — TEXT-FIRST by default
+
+**⚠ CRITICAL: Do NOT start with Claude's Read tool on PDFs.** Claude's Read tool rejects
+images with any dimension >2000px, and many scanned PDFs (trust documents, deeds,
+handwritten notes, high-res scans) include pages that trip this limit. The result is
+`"image exceeds 2000px dimension limit"` errors that abort whole extraction batches.
+
+**Required reading order for every PDF**:
+
+1. **Text-first via `pdftotext`** (poppler) — works on any PDF with embedded text:
+   ```bash
+   pdftotext -layout -nopgbrk "file.pdf" - | head -c 200000 > /tmp/extracted.txt
+   ```
+   Then Read `/tmp/extracted.txt`. This is fast, safe, and avoids the image limit entirely.
+
+2. **If `pdftotext` returns mostly blank or gibberish** → the PDF is a scan. Render and OCR:
+   ```bash
+   # Render pages 1-5 at 150 dpi (cap pages for large scans)
+   pdftoppm -r 150 -f 1 -l 5 "file.pdf" /tmp/scan_page
+   # Each page becomes /tmp/scan_page-1.png, scan_page-2.png, etc.
+   for png in /tmp/scan_page-*.png; do
+     tesseract "$png" "${png%.png}" -l eng
+   done
+   cat /tmp/scan_page-*.txt > /tmp/extracted.txt
+   ```
+   Then Read `/tmp/extracted.txt`.
+
+3. **Only fall back to Claude's Read tool on the raw PDF** as a last resort — and only if
+   the file is **< 5 MB** (to avoid loading many high-res pages). If Read fails with the
+   2000px error, mark the file `status=FAILED_IMAGE_TOO_LARGE` in the tracker and move on.
+   Do not loop.
+
+**Use `pypdf` for page-index scanning** — this is still the best way to find the data-rich
+pages in a 200-page tax return without loading every page's content:
+
 ### Large PDF Strategy (20+ pages)
 
 Tax returns and combined statements are often 50-200+ pages. Reading only the first few pages
 will miss K-1 summaries, W-2s, 1099s, Schedule H, and passthrough entity details buried deep
-in the document. Use this two-pass strategy:
+in the document. Use this two-pass strategy, **built on the text-first foundation above**:
 
 **Pass 1 — Page Index Scan** (fast, text-only):
 
@@ -394,7 +1008,7 @@ for i, page in enumerate(reader.pages):
     print(f'  Page {i+1}: {text}')
 ```
 
-Run: `python page_scan.py "file.pdf"` (or `python3` on macOS/Linux if `python` is unavailable).
+Run: `{PYTHON} page_scan.py "file.pdf"` (where `{PYTHON}` is `python` on Windows and `python3` on macOS/Linux, per Cross-Platform Setup above).
 
 This produces a one-line summary per page. Scan the output for keywords that signal data-rich
 pages:
@@ -415,8 +1029,10 @@ pages:
 | `LESSER`, `TRUST`, or any family surname | Related trust/entity income | Read full page |
 
 **Pass 2 — Targeted Deep Read**:
-Read ONLY the flagged pages using Claude's Read tool with specific page ranges. For a typical
-200-page return, you'll usually need to read 15-25 key pages, not all 200.
+For each flagged page, extract text with `pdftotext -f N -l N "file.pdf"` (where N is the
+page number) to a temp file and Read that. Only use Claude's Read tool on the original PDF
+for the flagged pages if `pdftotext` returns empty for that specific page (indicating a
+scanned page). For a typical 200-page return, you'll usually need to read 15-25 key pages.
 
 **Minimum pages to ALWAYS read from a personal 1040 return:**
 1. Cover letter (page 1) — preparer firm, client address
@@ -467,8 +1083,8 @@ For each file, at minimum:
 - **Images (.jpg, .png)**: Read with Claude's vision. Even a property photo confirms a real
   asset exists.
 - **Word docs (.docx)**: Convert using the platform's `DOCX_CMD` (see Cross-Platform Setup).
-  Fallback chain: `textutil` (macOS) → `pandoc` (cross-platform) → `python-docx` library
-  (`python -c "from docx import Document; [print(p.text) for p in Document('file.docx').paragraphs]"`).
+  Fallback chain: `textutil` (macOS) → `pandoc` (cross-platform) → `python-docx` (write a
+  `docx_read.py` script — see Standard Document Extraction below for the exact script).
   If all fail, flag for user — don't silently skip.
 - **Emails (.eml)**: Parse headers + body. Extract attachments and process them too.
 
@@ -539,50 +1155,63 @@ except FileNotFoundError:
 For each Tier 1 and Tier 2 document, extract structured data. Use Claude's native tools:
 
 - **PDFs**: Use Claude Read tool natively (supports text and scanned PDFs with vision)
+> **Windows note**: Do NOT use `python -c "..."` with embedded newlines or nested quotes.
+> Windows cmd and PowerShell mangle multi-line argv strings and single-quote escaping
+> differently from bash. The cross-platform pattern is: **write the script to a temp `.py`
+> file with the `Write` tool, then run it as `python script.py`**. This avoids every
+> shell-quoting pitfall on every OS. All snippets below use this pattern.
+
 - **Word docs (.docx)**: Use the platform's `DOCX_CMD` (see Cross-Platform Setup):
   - macOS: `textutil -convert txt file.docx` then read the `.txt`
   - Cross-platform: `pandoc file.docx -t plain` (pipe or redirect output)
-  - Python fallback (works everywhere): `python -c "from docx import Document; [print(p.text) for p in Document('file.docx').paragraphs]"`
+  - Python fallback (works everywhere): write `docx_read.py` below, then `python docx_read.py "file.docx"`
+
+```python
+# docx_read.py
+import sys
+from docx import Document
+for p in Document(sys.argv[1]).paragraphs:
+    print(p.text)
+```
   Install `python-docx` if needed: `pip install python-docx`
 - **Images (.jpg, .png)**: Use Claude Read tool — Claude can see images natively (multimodal)
-- **Spreadsheets (.xlsx)**: Use inline Python (use `PYTHON` from Cross-Platform Setup):
-  ```
-  python -c "import openpyxl; wb=openpyxl.load_workbook('file.xlsx'); print([sheet.title for sheet in wb.sheetnames])"
-  ```
-  Install if needed: `pip install openpyxl`
-- **Emails (.eml)**: Parse with Python's `email` module (uses `PYTHON` from Cross-Platform Setup):
-  ```
-  python -c "
-  import email, sys
-  with open('file.eml', 'rb') as f:
-      msg = email.message_from_binary_file(f)
-  print('From:', msg['From'])
-  print('To:', msg['To'])
-  print('Date:', msg['Date'])
-  print('Subject:', msg['Subject'])
-  for part in msg.walk():
-      if part.get_content_type() == 'text/plain':
-          print(part.get_payload(decode=True).decode(errors='replace'))
-  "
-  ```
-  Extract entity data from the email body (e.g., account confirmations, policy updates,
-  advisor correspondence). Save any attachments to a temp directory and process them
-  separately as their native file type (PDF, DOCX, etc.):
-  ```
-  python -c "
-  import email, os, tempfile
-  with open('file.eml', 'rb') as f:
-      msg = email.message_from_binary_file(f)
-  att_dir = os.path.join(tempfile.gettempdir(), 'eml_attachments')
-  os.makedirs(att_dir, exist_ok=True)
-  for part in msg.walk():
-      fn = part.get_filename()
-      if fn:
-          with open(os.path.join(att_dir, fn), 'wb') as out:
-              out.write(part.get_payload(decode=True))
-          print(f'Saved attachment: {fn}')
-  "
-  ```
+- **Spreadsheets (.xlsx)**: Write `xlsx_read.py` below, then `python xlsx_read.py "file.xlsx"`. Install if needed: `pip install openpyxl`
+
+```python
+# xlsx_read.py
+import sys, openpyxl
+wb = openpyxl.load_workbook(sys.argv[1], data_only=True)
+for sheet in wb.sheetnames:
+    ws = wb[sheet]
+    print(f"=== {sheet} ({ws.max_row} rows x {ws.max_column} cols) ===")
+    for row in ws.iter_rows(values_only=True):
+        print(row)
+```
+
+- **Emails (.eml)**: Write `eml_read.py` below, then `python eml_read.py "file.eml"`. Extract entity data from the email body (e.g., account confirmations, policy updates, advisor correspondence). Process any saved attachments as their native file type.
+
+```python
+# eml_read.py — prints headers + body, saves attachments to temp dir
+import email, os, sys, tempfile
+with open(sys.argv[1], 'rb') as f:
+    msg = email.message_from_binary_file(f)
+for h in ('From', 'To', 'Date', 'Subject'):
+    print(f"{h}: {msg[h]}")
+att_dir = os.path.join(tempfile.gettempdir(), 'eml_attachments')
+os.makedirs(att_dir, exist_ok=True)
+for part in msg.walk():
+    ctype = part.get_content_type()
+    if ctype == 'text/plain':
+        body = part.get_payload(decode=True)
+        if body:
+            print(body.decode(errors='replace'))
+    fn = part.get_filename()
+    if fn:
+        out_path = os.path.join(att_dir, fn)
+        with open(out_path, 'wb') as out:
+            out.write(part.get_payload(decode=True))
+        print(f"Saved attachment: {out_path}")
+```
 
 For each document, extract:
 
@@ -680,13 +1309,122 @@ Tag every extracted field with its `_source` document path.
 `references/document_type_patterns.md`. These checklists ensure you don't miss middle names,
 occupations, relationship inferences, entity hierarchies, or absence-as-data signals.
 
+### Step 3.4: Sensitive Data Detection (mandatory, first-class artifact)
+
+**Before merging extraction caches, scan for sensitive data that must NEVER enter API
+payloads or the main extraction cache.** This includes:
+
+- Credit card numbers (PCI DSS)
+- Plaintext passwords / passphrases
+- Social media / banking login credentials
+- Full SSNs in document body text (outside structured extraction fields)
+- Passport numbers, driver's license numbers beyond the structured DL fields
+- Wire/ACH routing + account number pairs for unrelated parties
+- Private encryption keys or API tokens pasted into documents
+
+**Write a separate artifact**: `altitude_review/sensitive_data.json` — lists every
+finding with file, a short description, and a redaction recommendation. This artifact
+is visible to the user in the review but is **NEVER merged into `create_payloads.json`,
+`extraction_cache.jsonl`, or any API-facing file**.
+
+**Schema**:
+```json
+[
+  {
+    "id": 1,
+    "file": "Onboarding/Fischer Travel Participation Agreement.pdf",
+    "fileNumber": 14,
+    "type": "credit_card",
+    "description": "Visa ending 9115, expiry 9/29, CVV visible",
+    "recommendation": "Rotate card immediately. Redact before uploading document OR upload only the redacted version. Never store in any Altitude field.",
+    "severity": "high"
+  },
+  {
+    "id": 2,
+    "file": "Family Office/FO Tracker/SRB SIN PW.pdf",
+    "type": "credential",
+    "description": "Social Insurance Number password (Canadian SIN auth)",
+    "recommendation": "Move to password manager (1Password/Bitwarden). Do not upload raw file to Altitude.",
+    "severity": "high"
+  }
+]
+```
+
+**Severity levels**:
+- `critical` — PCI data (credit cards), plaintext banking passwords → warn user explicitly in Phase 5 review
+- `high` — passport #s, SIN passwords, full SSN in body text → flag for redaction
+- `medium` — partial credentials, personal-notes-with-secrets → flag, low action required
+- `low` — reference notes, flagged for awareness
+
+**Extraction agents must emit sensitive findings to this artifact, NOT to notes or
+entity fields.** Each batch writes its own `sensitive_data_batch_{N}.json` which the
+orchestrator merges.
+
+**In Phase 5 review**, include a dedicated "Sensitive Data Found" section at the top
+(above normal entity updates) so the user sees it immediately. If any `critical`
+severity items exist, the review should recommend pausing Phase 6 until rotation is
+confirmed.
+
+**Document upload policy**: files containing sensitive data should either be
+(a) redacted before upload, (b) excluded from upload with a note, or (c) uploaded with
+a warning tag so downstream consumers know the file needs handling. Default: **do NOT
+upload files with `severity=critical` unless the user explicitly overrides**.
+
 ### Step 3.5: Cross-Document Validation Pass
 
 After extracting from ALL documents, run these mandatory checks before proceeding to Phase 4:
 
+0. **⛔ CRITICAL: Latest-date-wins field resolution** — When the **same field** appears on the
+   same entity in multiple documents with different values, the value from the **most recent
+   source document wins**. This is the single most important merge rule — it supersedes the
+   "most complete value" heuristic below when values actually differ.
+
+   **Determine each document's "as-of date" using this priority** (first match wins):
+   1. Explicit "As of" date printed on the document (e.g., "As of 3/31/2026")
+   2. Document execution/signing/effective date (e.g., restated trust date, policy effective date)
+   3. Filing or issue date (e.g., 1099 tax year = Dec 31 of that year; deed recording date)
+   4. Statement period end date (e.g., "November 2025 statement" → 2025-11-30)
+   5. Filename-embedded date patterns: `YYYY.MM.DD`, `YYYY-MM-DD`, `MM.DD.YY`, `YYYY_MM` (e.g.,
+      `Certificate of IconTrust 2025.05.15.pdf` → 2025-05-15; `DL_2024.docx` → 2024-01-01 as
+      month/day unknown fallback)
+   6. File `mtime` (filesystem modification time) — only as a **last resort**, as OneDrive/
+      Dropbox sync often rewrites mtime to the download time
+
+   **Persist `asOfDate` on every cache entry**: each JSONL line in
+   `extraction_cache_batch_{N}.jsonl` must include an `asOfDate` field (ISO format
+   YYYY-MM-DD) so Phase 4 can resolve conflicts deterministically.
+
+   **Apply to every scalar field** — address, email, phone, marital status, employer,
+   occupation, trustee, beneficiary, policy status, account balance, valuation, etc.
+   **Exceptions** (older value wins):
+   - `dateOfBirth`, `ssn`, `formationDate`, `taxId` — immutable; first confirmed value wins,
+     later contradictions are conflicts to flag
+   - `originalBalance`, `originationDate`, `purchaseDate`, `purchasePrice` — historical
+     values, don't overwrite with later docs
+   - `firstName`, `lastName` at birth — flag middle/preferred name additions as enrichment
+     rather than replacement
+
+   **Apply to amendments & restatements**: a "Restated Trust" or "Second Amendment" supersedes
+   the original trust agreement for ALL trustee/grantor/beneficiary fields. The original
+   becomes historical (set `effectiveTo` on old relationships). Filename tokens to watch:
+   `Amendment`, `Restated`, `Restatement`, `Amended`, `Second`, `Third`, `Revised`, `Updated`,
+   `Final` (prefer `Final` over `draft`).
+
+   **Apply to account statements**: a November 2025 statement's balance/valuation supersedes
+   a July 2025 statement's for the same account. Older statements are read for history, not
+   for the current balance.
+
+   **In Phase 5 review**, when a field is overwritten by a later doc, show BOTH values so the
+   reviewer can audit the decision:
+
+   | Field | Winning Value | Winning Source (date) | Superseded Value | Superseded Source (date) |
+   |-------|--------------|----------------------|------------------|--------------------------|
+   | addressLegal | 123 Main St, Denver CO | Driver's License (2025-08-14) | 456 Oak Ave, Boulder CO | 2022 Tax Return (2023-04-15) |
+
 1. **Name enrichment** — For each individual, find the MOST COMPLETE version of their name
    across all documents. Tax returns and account statements often reveal middle names that
-   onboarding sheets omit.
+   onboarding sheets omit. For actual name *conflicts* (different spellings), apply the
+   latest-date-wins rule from item 0.
 
 2. **Relationship inference** — Check for implicit relationships:
    - Joint 1040 filing → SPOUSE relationship
@@ -818,8 +1556,16 @@ using these identity signals:
 - Name similarity ≥ 0.8 AND lender name matches (case-insensitive)
 - Lender + liability type + current balance within 5% tolerance (probable)
 
-When merging across documents, prefer the most specific/complete value for each field.
-Track all source documents.
+When merging across documents for the **same field**:
+1. **Different values** → latest-date-wins (see Phase 3.5 Step 0). Record winner, loser, and
+   both `asOfDate`s for Phase 5 review.
+2. **One null, one non-null** → take the non-null value (no date check needed).
+3. **Different levels of specificity** (e.g., "Denver" vs "Denver, CO 80202") → prefer the
+   more specific value **only if** its source is newer or equal in age; otherwise latest-date-wins.
+4. **Immutable fields** (ssn, dateOfBirth, formationDate, taxId) → first confirmed value wins;
+   flag any later contradiction as a hard conflict, don't overwrite silently.
+
+Always track all source documents + their as-of dates on every field.
 
 ### Step 4.2: Match extracted entities to Altitude Universe
 
@@ -847,7 +1593,20 @@ For each merged extracted entity, attempt to match it to an existing Altitude en
 1. email exact match → definitive match
 2. phone exact match → definitive match
 3. firstName + lastName exact match (case-insensitive) + jobTitle match → strong match
-4. No match → candidate for new entity creation
+4. **FIRM-WIDE contact search** (do this before creating any new Contact): Query
+   `GET /api/v1/contact/search?searchFor={firstName}+{lastName}&size=50` to find existing
+   Contacts across OTHER households in the same firm. A JPM banker serving Verita may
+   already exist under a different household — reuse, don't duplicate. If found:
+   - Add the new household as an additional client relationship on the existing Contact
+     (relationship: HOUSEHOLD→CONTACT, type ADVISOR/ATTORNEY/etc.)
+   - Merge any new fields (if the existing Contact has no email and you have one, PATCH)
+   - Do NOT create a duplicate Contact
+5. No match anywhere → candidate for new entity creation
+
+**Firm-wide dedup applies especially to**: JPM bankers, attorneys (Kirkland & Ellis,
+Venable LLP, etc.), CPAs (large firms serve multiple clients), insurance agents,
+Verita's own staff (they work across every household). These should be shared Contacts,
+not per-household duplicates.
 
 **Tangible Asset matching against Altitude:**
 1. serialOrIdentifier exact match → definitive match
@@ -869,12 +1628,16 @@ For each merged extracted entity, attempt to match it to an existing Altitude en
 
 ### Step 4.3: Field-level diff against Altitude
 
-For each matched entity, compare every field:
+For each matched entity, compare every field. Altitude records carry an `updatedAt` timestamp
+(the last write time for that entity). Treat `updatedAt` as the Altitude value's effective
+date when resolving conflicts.
 
 ```
 For each field in the extracted entity:
-  altitude_value = existing_altitude_entity[field]
-  extracted_value = extracted_entity[field]
+  altitude_value     = existing_altitude_entity[field]
+  altitude_asof      = existing_altitude_entity.updatedAt   # last API write
+  extracted_value    = extracted_entity[field].value
+  extracted_asof     = extracted_entity[field].asOfDate     # from Phase 3.5 Step 0
 
   IF altitude_value is null/empty AND extracted_value is not null/empty:
     → FILL: Queue this field for automatic update (safe to copy)
@@ -882,17 +1645,24 @@ For each field in the extracted entity:
   ELIF altitude_value is not null/empty AND extracted_value is not null/empty:
     IF altitude_value == extracted_value:
       → MATCH: Values agree, no action needed
-    ELSE:
-      → CONFLICT: Values differ, flag for user review
+    ELIF field is immutable (ssn, dateOfBirth, formationDate, taxId):
+      → HARD_CONFLICT: Values differ on an immutable field — flag for user, do NOT auto-resolve
+    ELIF extracted_asof > altitude_asof:
+      → SUPERSEDE: Documents have newer info → queue for update, show both values in review
+    ELSE:  # altitude_asof >= extracted_asof
+      → STALE: Altitude was updated more recently than the document — keep Altitude, show
+        both in review in case the user wants to override
 
   ELIF altitude_value is not null/empty AND extracted_value is null/empty:
     → KEEP: Altitude has data we don't, leave it alone
 ```
 
-Generate three lists for each entity:
+Generate four lists for each entity:
 1. **Auto-fill fields** — empty in Altitude, has value from documents
 2. **Matching fields** — same value in both (no action)
-3. **Conflicting fields** — different values, need user decision
+3. **Supersede fields** — documents newer than Altitude, will overwrite (show diff in review)
+4. **Stale fields** — Altitude newer than documents, will keep Altitude (show in review as FYI)
+5. **Hard-conflict fields** — immutable fields that differ → block on user decision
 
 ### Step 4.4: Extract and validate relationships
 
@@ -1032,6 +1802,176 @@ Group them as:
 - **New insurance policies** to be created via `POST /api/v1/insurance-policy`
 - **New liabilities** to be created via `POST /api/v1/liability`
 - **New relationships** to be created via `POST /api/v1/entity-relationship`
+
+### Step 4.7: Role Replacements (Trustee / Advisor / Attorney / Accountant / Officer Changes)
+
+When documents show that a role holder has been **replaced** (new trustee named in an
+amendment, new CPA preparing the current tax return, new attorney on the restated trust,
+resigned/removed officer), the skill must reflect the change — NOT merely add a new
+relationship while leaving the old one active.
+
+**Detect replacement signals:**
+
+- Amendment/restatement documents name a DIFFERENT person in the same role as the original
+  (e.g., original 2022 trust names John Smith as trustee; 2023 Second Amendment names
+  IconTrust LLC — John Smith is replaced)
+- A new document explicitly states a removal/resignation ("effective 3/15/2024, Jane Doe
+  resigned as Co-Trustee")
+- The **current** filing at a corporate registry lists a different officer than earlier docs
+- A newer tax return is prepared by a different CPA firm than prior years
+
+**Action on replacement — depends on whether the prior relationship EXISTS in Altitude:**
+
+**Case A: Prior holder + relationship EXIST in Altitude** (full retire-and-replace path):
+
+1. **Retire the old relationship** by PATCHing `effectiveTo` to the replacement date:
+   ```
+   PATCH /api/v1/entity-relationship/{oldRelationshipId}
+   Content-Type: application/merge-patch+json
+   {
+     "effectiveTo": "2023-12-18",
+     "notes": "Replaced by {new role holder} per {source document}. Superseded at Phase 6."
+   }
+   ```
+   Do NOT delete the old relationship — Altitude needs the historical record (hard-delete
+   also triggers the soft-delete uniqueness conflict in rule #21).
+
+2. **Create the new relationship** with `effectiveFrom` = replacement date:
+   ```
+   POST /api/v1/entity-relationship
+   {
+     "sourceEntityType": "...", "sourceEntityId": "...",
+     "targetEntityType": "...", "targetEntityId": "<new role holder>",
+     "relationshipType": "TRUSTEE",
+     "effectiveFrom": "2023-12-18",
+     "effectiveTo": null,
+     "notes": "Replaces {old holder name} retired on same date"
+   }
+   ```
+
+3. **role_replacements.json** entry: `action: "retire_old_and_create_new"` with both
+   old and new relationship IDs for the audit trail.
+
+**Case B: Prior holder does NOT exist in Altitude** (create-new-only path — the common case):
+
+Documents reference a prior trustee/grantor/advisor who was never imported into Altitude
+(e.g., a 2012 trust grantor superseded by a 2020 restatement — only the current state
+is in Altitude). In this case:
+
+1. **(Optional) Create the historical holder as a Contact** — for audit-trail completeness,
+   but not strictly required. Mark with `biography` noting they are historical.
+
+2. **Create the new relationship** as above with `effectiveFrom` = replacement date.
+
+3. **role_replacements.json** entry: `action: "create_new_only"` with `replacesPriorHolder`
+   field noting the superseded name for provenance.
+
+**Detection — how to tell which case applies**:
+
+For each relationship marked `isReplacement: true` in the extraction cache:
+
+```python
+# Check if any existing Altitude relationship matches the role being replaced
+existing = api_get(f"/api/v1/entity-relationship/from/{source_type}/{source_id}")
+candidates = [r for r in existing
+              if r["relationshipType"] == new_type
+              and r["effectiveTo"] is None]  # only active ones
+if candidates:
+    # Case A: we found the relationship to retire
+    action = "retire_old_and_create_new"
+    old_relationship_id = candidates[0]["id"]  # or match by target if multiple
+else:
+    # Case B: no existing relationship to retire, just create
+    action = "create_new_only"
+```
+
+**If multiple existing relationships match** (e.g., GWN Trust has 2 current TRUSTEE
+relationships and the restatement replaces both with a corporate trustee) — retire ALL
+matching ones with the same effectiveTo date. Do NOT silently pick one.
+
+**Within Phase 6 execution order**: run retirement PATCHes BEFORE creating new
+relationships. Altitude's uniqueness constraint rejects duplicates: you must retire the
+old one first so the new POST doesn't hit 409 Conflict.
+
+4. **In Phase 5 review**, render replacements as their own table:
+
+   | Role | Old Holder | New Holder | Replacement Date | Source Document |
+   |------|------------|------------|------------------|-----------------|
+   | Trustee of DPG Trust | John Smith (CONTACT) | IconTrust LLC (CONTACT) | 2023-12-18 | Second Amendment and Restatement of the DPG Trust (signed 12.18.23) |
+
+**Common replacement scenarios to watch for:**
+- Trust restatement naming new trustee, successor trustee, or distribution advisor
+- LLC operating agreement amendment naming new managing member
+- Corporate board meeting minutes replacing officers
+- Current tax return preparer differs from prior-year preparer → old CPA relationship retires
+- New engagement letter for attorney/advisor → flag whether it supersedes a prior engagement
+- Named-insured change on insurance policy → update OWNERSHIP relationships on the policy
+
+**When unsure**: if the document does not explicitly state a replacement (could be an
+additional co-trustee rather than a replacement), leave the old relationship intact and
+flag in Open Questions. Never silently retire a relationship on ambiguous signals.
+
+### Step 4.8: Addepar (or any externally-synced) Account Handling — READ-ONLY
+
+Accounts with an active external sync (Addepar, Orion, Black Diamond, custodian direct feed)
+are **authoritative from the external source**. The onboarding skill must NOT overwrite
+their fields from documents — the external sync will either overwrite the manual change on
+its next run (data loss) or produce conflicting records.
+
+**Detect externally-synced accounts:**
+
+After fetching each account in Phase 1.3 (`GET /api/v1/account-financial/{id}`), check:
+- `externalIds[]` array — if any entry has `provider: "ADDEPAR"` (or `ORION`, `BLACK_DIAMOND`,
+  `SCHWAB`, `FIDELITY`, etc.), the account is externally synced
+- `providerDetails.sourceSystemName` — same signal via the older field
+
+Mark each account as one of:
+
+| Status | Meaning | Skill Action |
+|--------|---------|--------------|
+| `SYNCED_HEALTHY` | Has external provider + non-zero `totalMarketValue` | **Read-only** on core fields; flag discrepancies between docs and Altitude but do NOT PATCH. Still update non-synced metadata (nickname, description, tags, tax notes) if extracted from docs. |
+| `SYNCED_BUT_ZERO` | Has external provider but `totalMarketValue == 0` or null `lastSyncedAt` | **Flag to user** — sync configured but not running. Don't update fields; show the user the expected values from docs so they can investigate the sync. |
+| `NOT_SYNCED` | No external provider | Normal PATCH/POST behavior — treat like any other entity |
+
+**Fields protected on SYNCED accounts (never PATCH from docs):**
+
+`accountNumber`, `name`, `custodianId`, `accountCategory`, `subCategory`, `taxStatus`,
+`wrapper`, `totalMarketValue`, `totalCashBalance`, `totalCostBasis`, `holdings`,
+`positions`, `valuations`, `providerDetails.*`, `externalIds[].*`
+
+**Fields still safe to update on SYNCED accounts (manual-only metadata):**
+
+`description`, `tags`, `manualNotes` (if present), `ownershipType`, account-level
+PATCH-compatible flags that are not part of the sync contract.
+
+**Discrepancy flagging** — when a document value differs from a SYNCED account's Altitude
+value, don't PATCH but DO include in the review under a dedicated section:
+
+```markdown
+## Addepar / External Sync Discrepancies — Needs Investigation
+
+| Account | Field | Altitude (from Addepar) | Document Value | Source Doc | asOfDate | Likely Cause |
+|---------|-------|------------------------|----------------|------------|----------|--------------|
+| DPG Trust Schwab Brokerage | totalMarketValue | $0.00 | $12,450,210 | Glickman_David_portfolio_07-08-2025.xlsx | 2025-07-08 | Sync not running — lastSyncedAt is null |
+| DPG Trust Schwab Brokerage | name | "DPG TR BROKERAGE" | "DPG Trust Brokerage Account" | Schwab Account App (draft) | 2024-09-01 | Addepar uses a different display name — cosmetic only |
+```
+
+**Zero-value sync alert** — if ANY account has an external provider AND
+`totalMarketValue == 0` (or the expected sum from documents is materially nonzero), raise
+this as a blocking item in the review:
+
+```markdown
+## ⚠ Accounts With Zero Values Despite Active Sync
+
+The following accounts are configured to sync from Addepar but show $0 market value.
+This usually means the sync has not run, the external account ID is wrong, or the custodian
+connection is broken. Please investigate before proceeding.
+
+- {Account Name} ({account UUID}) — provider: {ADDEPAR}, externalId: {...}, lastSyncedAt: null
+```
+
+Do this check **before** Phase 6. The user needs to see this immediately, not buried at the
+end of a 200-line review.
 
 ---
 
@@ -1221,14 +2161,46 @@ run is interrupted mid-way, the next run can resume from where it stopped.
 
 ### Save Artifacts
 
-Write these files to `{household_folder}/altitude_review/`:
+All review artifacts go to `{household_folder}/altitude_review/` (the review directory is
+ALWAYS created at the root of the household folder — sibling to the source document
+subfolders, never buried deeper):
+
 - `review.md` — complete human-readable review (ALL sections above)
 - `file_tracker.md` — every file with READ status and extraction summary
 - `altitude_universe.json` — initial state from Phase 1
 - `create_payloads.json` — POST requests for new entities
 - `patch_payloads.json` — PATCH requests for existing entities (if matching)
 - `relationships_to_create.json` — relationship creation plan
+- `role_replacements.json` — trustee/advisor/attorney/officer replacements (see Phase 4.7)
+- `addepar_discrepancies.json` — doc-vs-sync mismatches for synced accounts (see Phase 4.8)
 - `document_uploads.json` — document upload plan (file → entity → subType)
+- `supersede_log.json` — **REQUIRED, ALWAYS WRITE** when any latest-date-wins decision was made.
+  Audit trail of every field where a later document superseded an earlier one (or overrode an
+  existing Altitude value). Format:
+  ```json
+  [
+    {
+      "entityType": "Individual",
+      "entityName": "Seth Boro",
+      "entityId": "e9f2...",
+      "field": "addressLegal",
+      "winningValue": "429 Elizabeth St, San Francisco CA 94114",
+      "winningSource": "DPG 2022 Trust Amendment (signed 2020-04-16)",
+      "winningAsOfDate": "2020-04-16",
+      "losingValue": "221 Gold Mine Drive, San Francisco CA 94131",
+      "losingSource": "Onboarding Sheet 2018 draft",
+      "losingAsOfDate": "2018-06-01",
+      "classification": "SUPERSEDE",
+      "appliedToAltitude": true,
+      "reviewApprovedAt": "2026-04-17T16:40:00Z"
+    }
+  ]
+  ```
+  Categories: `FILL` (empty→value), `MATCH` (no change), `SUPERSEDE` (newer wins), `STALE`
+  (older, keep Altitude), `HARD_CONFLICT` (immutable fields — never auto-resolve). This file
+  is the audit trail for latest-date-wins decisions — auditors and future onboarding sessions
+  can inspect to understand why a field has its current value.
+- `sensitive_data.json` — **REQUIRED if any sensitive data was found**, see Step 3.4.
 - `open_questions.json` — **REQUIRED, ALWAYS WRITE THIS FILE** even if empty. Structured JSON
   for programmatic tracking across families. Format:
   ```json
@@ -1238,8 +2210,113 @@ Write these files to `{household_folder}/altitude_review/`:
   ]
   ```
   This file must ALSO be written — embedding questions only in review.md is insufficient.
-  Categories: `estate_planning`, `data_conflict`, `missing_data`, `ownership`, `insurance`, `address`, `account`, `other`
+  Categories: `estate_planning`, `data_conflict`, `missing_data`, `ownership`, `insurance`, `address`, `account`, `other`, `addepar_sync`, `family_status`, `file_access`, `asset_detail`, `entity_detail`, `liability_detail`, `advisor_relationships`, `schema`, `holdings_data`, `account_status`
 - `run_state.json` — persistent state for incremental reruns (entity IDs, document upload status, failures)
+
+### Approval Q&A Trail (REQUIRED — separate from altitude_review/)
+
+In ADDITION to the structured `open_questions.json` inside `altitude_review/`, **write a
+human-readable Q&A tracking file at the ROOT of the household folder** (sibling to
+`altitude_review/`, alongside the source subfolders). This file captures every question
+asked during validation/approval, the user's response, and when each was resolved.
+
+**File name**: `altitude_questions_{YYYY-MM-DD}.md` — dated, so multiple onboarding sessions
+or revisits produce separate files and the audit trail survives.
+
+**File location**: `{household_folder}/altitude_questions_{YYYY-MM-DD}.md` — the household
+root, NOT inside `altitude_review/`. Reason: the Q&A log is user-facing and survives
+cleanup/rebuild of the review directory.
+
+**Required template** (populate as the session progresses; update in place when user responds):
+
+```markdown
+# Altitude Onboarding — Approval Questions
+
+**Household**: {name}
+**Altitude Household ID**: {uuid or "new"}
+**Firm**: {firm}
+**Session Date**: {YYYY-MM-DD}
+**Source folder**: {absolute path}
+**Review artifacts**: `./altitude_review/review.md`
+
+## Session Timeline
+
+| When | Phase | Actor | Note |
+|---|---|---|---|
+
+## Pre-Approval Blocking Questions
+
+### Q1 — {short title}
+**Severity**: Blocking | Non-blocking
+**Category**: {one of the categories above}
+
+**Question**: {full question with context}
+
+**Proposed answer** (skill's best guess; user can confirm with "yes" or override):
+{the skill's recommended resolution, with rationale}
+
+Example: "Use tax return SSN `614-75-8183` (authoritative) and overwrite Altitude's
+invalid `140965906`. Rationale: SSA issues SSNs in ranges 001-665, 667-699, 750-772;
+140-965-906 falls outside all ranges, so it's data entry error. 2022 + 2023 1040 both
+confirm 614-75-8183."
+
+**User Response**: _awaiting_ | {response text — "yes" = accept proposed answer}
+**Resolved**: _pending_ | YYYY-MM-DD HH:MM
+**Resolution**: _pending_ | {final decision — populated from Proposed answer if user said "yes"}
+
+## Non-Blocking Open Questions (see open_questions.json for full list)
+
+{summary list — full detail lives in open_questions.json}
+
+## Post-Approval Questions (populated during Phase 6/7)
+
+{append each mid-execution question as it arises}
+
+## Approval Record
+
+**Final approval granted at**: _pending_ | YYYY-MM-DD HH:MM
+**Approver**: _pending_ | {user name/role}
+**Scope approved**:
+- [ ] {each proposed change item}
+
+**Any excluded items**: _pending_ | {list}
+```
+
+**Update rules**:
+- Write the file at Phase 5 completion (presenting the review to the user).
+- **Append** additional questions as they arise during Phase 6/7 under "Post-Approval Questions".
+- **Update in place** when the user responds — fill the `User Response`, `Resolved`, and
+  `Resolution` fields with timestamps.
+- **Do NOT overwrite** prior session's file — if running a re-onboarding for the same family,
+  use today's date in the filename so both audit trails survive.
+
+### Upload Q&A File to Household as Document
+
+As the final step of Phase 7, upload the `altitude_questions_{YYYY-MM-DD}.md` file to the
+primary individual in Altitude (Households don't support direct document upload — see Phase 7
+note). Use these parameters:
+
+```
+POST /api/v1/individual/{primaryIndividualId}/document?sessionId={sessionId}&skipDuplicates=true
+createRequest:
+  title: "Altitude Onboarding Q&A — {Household Name} — {YYYY-MM-DD}"
+  description: "Validation and approval questions from onboarding session on {YYYY-MM-DD}."
+  documentSubType: "OTHER"
+  contentType: "MARKDOWN"
+```
+
+After upload, create entity associations so the document appears on both the Individual AND
+the Household:
+
+```
+POST /api/v1/document/{docId}/associations?entityType=INDIVIDUAL&entityId={primaryIndividualId}&associationType=OWNER&entityDisplayName={name}
+POST /api/v1/document/{docId}/associations?entityType=HOUSEHOLD&entityId={householdId}&associationType=SUBJECT&entityDisplayName={householdName}
+```
+
+This way future onboarding sessions (and auditors) can reconstruct the decision trail from
+within Altitude without needing access to the source document folder.
+
+---
 
 Present the review to the user and wait for approval + conflict resolution.
 
@@ -1578,6 +2655,84 @@ Record the returned IDs for relationship creation.
 - INSURED: Individual → InsurancePolicy (who is covered by the policy)
 - BENEFICIARY: Individual → InsurancePolicy (who receives the payout)
 
+### Step 6.2.5: Pre-baked enum mapping table
+
+**Altitude's relationship `relationshipType` enum is smaller than what documents typically
+describe.** Historical runs discovered these remappings via 400 errors — apply them
+automatically before POSTing to avoid wasted round-trips. Preserve the original semantic
+via the `role` field.
+
+| Document-described type | Altitude API type | `role` field | Notes |
+|---|---|---|---|
+| TRUST_PROTECTOR | TRUSTEE | "Trust Protector" | Trust agreements use this term for oversight role separate from day-to-day trustee |
+| SUCCESSOR_TRUST_PROTECTOR | TRUSTEE | "Successor Trust Protector #N" | Include priority |
+| INVESTMENT_COMMITTEE_MEMBER | ADVISOR | "Investment Committee" | |
+| POWER_OF_APPOINTMENT_COMMITTEE_MEMBER | ADVISOR | "Power of Appointment Committee" | |
+| DISTRIBUTION_COMMITTEE_MEMBER | ADVISOR | "Distribution Committee" | |
+| CRUMMEY_POWER_HOLDER | BENEFICIARY | "Crummey Power Holder" | |
+| EMPLOYMENT | EMPLOYEE | (firm name + title) | The IND→LE direction requires EMPLOYEE |
+| EMPLOYER | EMPLOYEE | (flip source/target first) | Normalize to IND→LE EMPLOYEE |
+| FAMILY | SIBLING | "Brother" / "Sister" / "Cousin" | FAMILY is a category, SIBLING is the concrete enum |
+| IN_LAWS | FAMILY | "In-law (parent/sibling)" | No direct enum — use FAMILY subtype |
+| DONOR | MEMBER | "Donor" | For charitable/DAF contributions |
+| FOUNDER | MEMBER | "Founder" | For foundation/LLC formation role |
+| MANAGER | OFFICER | "Manager" | LLC managers map to OFFICER type |
+| MANAGING_MEMBER | OFFICER | "Managing Member" + pct | Also create MEMBER relationship with pct |
+| REGISTERED_AGENT | ATTORNEY | "Registered Agent" | Non-litigation legal role |
+| NAMED_INSURED | INSURED | — | Direct mapping |
+| INSURED_DRIVER | INSURED | "Driver" | Auto policies list multiple drivers |
+| TREASURER | OFFICER | "Treasurer" | |
+| SECRETARY | OFFICER | "Secretary" | |
+| PRESIDENT | OFFICER | "President" | |
+| VICE_PRESIDENT | OFFICER | "Vice President" | |
+| CHAIRMAN | OFFICER | "Chairman" | |
+| CEO | OFFICER | "Chief Executive Officer" | |
+| CFO | OFFICER | "Chief Financial Officer" | |
+| COO | OFFICER | "Chief Operating Officer" | |
+
+**Account `subCategory` remaps** (account POSTs with document-described values that Altitude rejects):
+
+| Document-described | Altitude API | Notes |
+|---|---|---|
+| "Private Investment Fund" | LIMITED_LIABILITY_COMPANY | LLC structure |
+| "Statutory/Business Trust" | IRREVOCABLE_TRUST | Trust with business purpose |
+| "Donor-Advised Fund" | OTHER | DAF not a first-class type; use DAF in name/description |
+| "Private Foundation" | OTHER | Use charitableDetails fields |
+| "Carried Interest" | OTHER | Include "Carry" in name |
+| "CARRY" | OTHER | Same |
+
+**Liability `liabilityType` remaps**:
+
+| Document-described | Altitude API | Notes |
+|---|---|---|
+| INTRAFAMILY_LOAN | PRIVATE_LOAN | |
+| INTERCOMPANY_LOAN | PRIVATE_LOAN | |
+| REVOLVING_CREDIT | CREDIT_LINE | |
+| HELOC | HOME_EQUITY_LOC | |
+
+**LegalEntity `entityType` remaps**:
+
+| Document-described | Altitude API | Notes |
+|---|---|---|
+| DONOR_ADVISED_FUND | OTHER | Use charitableDetails |
+| PRIVATE_FOUNDATION | FOUNDATION | Verify enum exists; else OTHER |
+| DISREGARDED_LLC | LLC | Use taxClassification=DISREGARDED_ENTITY |
+| SERIES_LLC | LLC | Note series in description |
+
+**LegalEntity `taxClassification` remaps**:
+
+| Document-described | Altitude API |
+|---|---|
+| "Partnership (Form 1065)" | PARTNERSHIP |
+| "Disregarded Entity" | DISREGARDED_ENTITY |
+| "C Corporation" / "C-Corp" | C_CORP |
+| "S Corporation" / "S-Corp" | S_CORP |
+
+**Apply these proactively.** When building POST payloads, run the values through these
+maps before sending. On any unknown enum value that the server rejects with 400, fall
+back to `OTHER` (or the closest match above) and record the remap in
+`run_state.enum_mappings[<original>]`.
+
 ### Step 6.3: Create relationships
 
 ```
@@ -1641,6 +2796,352 @@ flag for user review.
 
 After entities are created/updated, upload source documents and associate them with
 the correct entity.
+
+### contentType enum (EXACT values accepted by API — use precisely)
+
+Altitude's `DocumentContentType` enum accepts exactly these 18 values — nothing else:
+
+```
+CSV, DOC, DOCX, GIF, HTML, JPG, JSON, MP3, MP4,
+PDF, PNG, PPT, PPTX, TXT, XLS, XLSX, XML, ZIP
+```
+
+**NOT supported** (must be converted before upload): `EML`, `MD`, `MSG`, `RTF`, `HEIC`, `TIF/TIFF`, `WEBP`.
+
+**File-extension → contentType mapping** (use this exactly — NEVER pass `OTHER`, `EML`, or `MARKDOWN`):
+
+| Extension | contentType | Notes |
+|---|---|---|
+| `.pdf` | `PDF` | |
+| `.docx` | `DOCX` | |
+| `.doc` | `DOC` | |
+| `.xlsx` | `XLSX` | |
+| `.xls` | `XLS` | |
+| `.pptx` | `PPTX` | |
+| `.ppt` | `PPT` | |
+| `.jpg`, `.jpeg` | `JPG` | |
+| `.png` | `PNG` | |
+| `.gif` | `GIF` | |
+| `.csv` | `CSV` | |
+| `.txt` | `TXT` | |
+| `.json` | `JSON` | |
+| `.xml` | `XML` | |
+| `.html`, `.htm` | `HTML` | |
+| `.mp3` | `MP3` | |
+| `.mp4`, `.mov` (convert) | `MP4` | |
+| `.zip` | `ZIP` | |
+| `.md` | **convert to `.txt`** then upload as `TXT` | Rename extension + upload |
+| `.eml` | **convert to `.txt`** (parse headers+body with Python `email` module) then `TXT` | |
+| `.msg` | **convert to `.eml`→`.txt`** or skip | Outlook proprietary; extract-msg library |
+| `.rtf` | **convert to `.txt`** via `textutil -convert txt` | |
+| `.heic` | **convert to `.jpg`** via `sips -s format jpeg` (macOS) or `heif-convert` | |
+| `.tif`, `.tiff` | **convert to `.pdf`** via `tiff2pdf` or reject | |
+
+**.eml conversion helper** (apply before upload):
+
+```python
+# eml_to_txt.py
+import email, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+with open(p, 'rb') as f:
+    msg = email.message_from_binary_file(f)
+out = [f"From: {msg['From']}", f"To: {msg['To']}", f"Date: {msg['Date']}", f"Subject: {msg['Subject']}", ""]
+for part in msg.walk():
+    if part.get_content_type() == 'text/plain':
+        body = part.get_payload(decode=True)
+        if body: out.append(body.decode(errors='replace'))
+out_path = p.with_suffix('.txt')
+out_path.write_text('\n'.join(out))
+print(out_path)
+```
+
+Then upload with `contentType=TXT` and `documentSubType=CORRESPONDENCE` (or entity-specific equivalent).
+
+### documentSubType — intelligent selection (NEVER default to OTHER)
+
+Each entity type has its own `documentSubType` enum with rich taxonomies. Classify every
+document by filename pattern + content, matching to the most specific valid value. Fall back
+to `OTHER` ONLY when nothing fits — and log the unmatched pattern in a `documentSubType_unmatched.json`
+artifact so future runs can improve the mapping.
+
+**Per-entity enums** (full lists — discoverable via `Grep "documentSubType" api.json`):
+
+#### IndividualDocumentCreateRequestDto.documentSubType (62 values)
+
+Identity: `PASSPORT`, `DRIVERS_LICENSE`, `ENHANCED_DRIVERS_LICENSE`, `NATIONAL_ID`, `STATE_ID`,
+`BIRTH_CERTIFICATE`, `SOCIAL_SECURITY_CARD`, `CITIZENSHIP_CERTIFICATE`, `CERTIFICATE_OF_NATURALIZATION`,
+`PERMANENT_RESIDENT_CARD`, `MILITARY_ID`, `GLOBAL_ENTRY_CARD`, `TRIBAL_ID`, `CONSULAR_ID`,
+`FOREIGN_VOTER_CARD`, `REFUGEE_TRAVEL_DOCUMENT`, `DIPLOMATIC_ID`
+
+Tax: `FORM_1040`, `FORM_W2`, `FORM_W9`, `FORM_1099_DIV`, `FORM_1099_INT`, `FORM_1099_B`,
+`FORM_1099_MISC`, `FORM_1099_R`, `FORM_K1_1065`, `FORM_K1_1120S`, `FORM_W8BEN`, `STATE_TAX_RETURN`,
+`PROPERTY_TAX_DOCUMENTS`
+
+Compliance: `ACCREDITED_INVESTOR_VERIFICATION`, `QUALIFIED_PURCHASER_VERIFICATION`,
+`AML_QUESTIONNAIRE`, `KYC_DOCUMENTATION`, `FATCA_CERTIFICATION`, `CRS_SELF_CERTIFICATION`,
+`OFAC_SCREENING`, `PEP_DISCLOSURE`
+
+Financial: `BANK_STATEMENT`, `INVESTMENT_STATEMENT`, `NET_WORTH_STATEMENT`, `CREDIT_REPORT`,
+`EMPLOYMENT_VERIFICATION`, `INCOME_VERIFICATION`, `FINANCIAL_STATEMENT`, `UTILITY_BILL`,
+`LEASE_AGREEMENT`, `PROPERTY_DEED`, `MORTGAGE_STATEMENT`
+
+Estate/Legal: `POWER_OF_ATTORNEY`, `NAME_CHANGE_DOCUMENT`, `MARRIAGE_CERTIFICATE`, `DIVORCE_DECREE`,
+`COURT_ORDER`, `LIVING_WILL`, `LAST_WILL_AND_TESTAMENT`, `HEALTHCARE_SURROGATE`
+
+Investment: `SUBSCRIPTION_AGREEMENT`, `INVESTMENT_POLICY_STATEMENT`, `INVESTMENT_QUESTIONNAIRE`,
+`INVESTOR_ACCREDITATION`
+
+Fallback: `OTHER`
+
+#### LegalEntityDocumentCreateRequestDto.documentSubType (84 values)
+
+Trust: `TRUST_AGREEMENT`, `TRUST_CERTIFICATION`, `TRUST_AMENDMENTS`, `REVOCABLE_TRUST_DOCUMENT`,
+`IRREVOCABLE_TRUST_DOCUMENT`, `TRUSTEE_CERTIFICATION`, `BENEFICIARY_DESIGNATION`,
+`TRUST_ASSET_SCHEDULE`
+
+Corporate: `ARTICLES_OF_INCORPORATION`, `CERTIFICATE_OF_INCORPORATION`, `CORPORATE_BYLAWS`,
+`CORPORATE_RESOLUTION`, `BOARD_MINUTES`, `SHAREHOLDER_MINUTES`, `STOCK_CERTIFICATE`,
+`STOCK_LEDGER`, `SHAREHOLDER_AGREEMENT`, `CERTIFICATE_OF_GOOD_STANDING`, `ANNUAL_REPORT`
+
+LLC: `ARTICLES_OF_ORGANIZATION`, `OPERATING_AGREEMENT`, `CERTIFICATE_OF_FORMATION`,
+`MEMBER_RESOLUTION`, `MEMBERSHIP_SCHEDULE`, `MANAGER_AUTHORIZATION`
+
+Partnership: `PARTNERSHIP_AGREEMENT`, `CERTIFICATE_OF_LIMITED_PARTNERSHIP`, `GENERAL_PARTNER_AUTHORIZATION`,
+`LIMITED_PARTNER_AGREEMENT`, `PARTNERSHIP_INTEREST_SCHEDULE`
+
+Foundation: `FOUNDATION_CHARTER`, `FOUNDATION_BYLAWS`, `BOARD_OF_DIRECTORS_ROSTER`, `GRANT_POLICY`,
+`FORM_990`, `FORM_990_PF`, `CHARITABLE_REGISTRATION`, `SOLICITATION_LICENSE`, `TAX_EXEMPT_DETERMINATION`
+
+Registration/Tax: `TAX_IDENTIFICATION`, `BUSINESS_LICENSE`, `BUSINESS_REGISTRATION`, `EIN_CONFIRMATION`,
+`DBA_CERTIFICATE`, `PROFESSIONAL_LICENSE`
+
+Entity tax: `FORM_1065`, `FORM_1120`, `FORM_1120S`, `FORM_1041`, `FORM_K1_1065`, `FORM_K1_1120S`,
+`FORM_K1_1041`, `FORM_W9`, `FORM_W8BEN_E`, `STATE_TAX_RETURN`, `PROPERTY_TAX_DOCUMENTS`
+
+Compliance: `AML_CERTIFICATION`, `KYC_DOCUMENTATION`, `BENEFICIAL_OWNERSHIP_CERTIFICATION`,
+`FATCA_CERTIFICATION`, `CRS_ENTITY_CERTIFICATION`, `OFAC_SCREENING`, `ACCREDITED_INVESTOR_VERIFICATION`,
+`QUALIFIED_PURCHASER_VERIFICATION`
+
+Financial: `AUDITED_FINANCIALS`, `BALANCE_SHEET`, `INCOME_STATEMENT`, `CASH_FLOW_STATEMENT`,
+`BANK_STATEMENT`, `INVESTMENT_STATEMENT`, `BUSINESS_CREDIT_REPORT`
+
+Other legal: `POWER_OF_ATTORNEY`, `AUTHORIZED_SIGNER_DOCUMENTATION`, `LEGAL_OPINION`,
+`INCUMBENCY_CERTIFICATE`, `CORPORATE_SEAL`, `AMENDMENT`, `PROMISSORY_NOTE`, `PERSONAL_GUARANTY`,
+`SUBSCRIPTION_AGREEMENT`, `INVESTMENT_POLICY_STATEMENT`, `INVESTOR_QUESTIONNAIRE`, `PPM_ACKNOWLEDGMENT`
+
+Fallback: `OTHER`
+
+#### AccountFinancialDocumentCreateRequestDto.documentSubType (92 values)
+
+Account: `ACCOUNT_AGREEMENT`, `ACCOUNT_APPLICATION`, `TRANSFER_FORM`, `BENEFICIARY_DESIGNATION`,
+`CUSTODIAL_STATEMENT`, `CUSTODY_AGREEMENT`, `FEE_SCHEDULE`, `BROKERAGE_STATEMENT`, `MARGIN_AGREEMENT`,
+`OPTIONS_AGREEMENT`, `TRADE_CONFIRMATION`, `BANK_STATEMENT`, `VOIDED_CHECK`, `DIRECT_DEPOSIT_FORM`,
+`WIRE_INSTRUCTIONS`, `ACH_AUTHORIZATION`
+
+Tax (same extensive list as Individual)
+
+Retirement: `IRA_ADOPTION_AGREEMENT`, `PLAN_DOCUMENT_401K`, `RMD_NOTICE`, `ROLLOVER_CERTIFICATION`
+
+Authorizations + identity (same as Individual) — use CUSTODIAL_STATEMENT / BROKERAGE_STATEMENT /
+BANK_STATEMENT / TRADE_CONFIRMATION before OTHER.
+
+#### TangibleAssetDocumentCreateRequestDto.documentSubType (96 values)
+
+Ownership: `TITLE`, `DEED`, `REGISTRATION`, `BILL_OF_SALE`, `PURCHASE_RECEIPT`, `CERTIFICATE_OF_OWNERSHIP`,
+`TRANSFER_DOCUMENT`, `LIEN`, `LIEN_RELEASE`
+
+Valuation: `APPRAISAL`, `VALUATION_REPORT`, `TAX_ASSESSMENT`, `COMPARABLE_ANALYSIS`,
+`BROKER_PRICE_OPINION`, `FMV_DETERMINATION`
+
+Insurance: `INSURANCE_POLICY`, `INSURANCE_CLAIM`, `COVERAGE_CERTIFICATE`, `INSURANCE_RIDER`,
+`INSURANCE_DECLARATION`, `INSURANCE_BINDER`, `PROOF_OF_INSURANCE`, `INSURANCE_RENEWAL`,
+`INSURANCE_CANCELLATION`
+
+Maintenance: `SERVICE_RECORD`, `INSPECTION_REPORT`, `WARRANTY`, `EXTENDED_WARRANTY`,
+`REPAIR_INVOICE`, `REPAIR_ESTIMATE`, `MAINTENANCE_LOG`, `RESTORATION_DOCUMENT`, `CONSERVATION_REPORT`
+
+Vehicle-specific: `VEHICLE_HISTORY_REPORT`, `EMISSIONS_CERTIFICATE`, `SAFETY_INSPECTION`,
+`AIRWORTHINESS_CERTIFICATE`, `AIRCRAFT_LOGS`, `MARINE_SURVEY`, `COAST_GUARD_DOCUMENTATION`
+
+Real-property: `SURVEY`, `TITLE_INSURANCE`, `HOME_INSPECTION`, `PEST_INSPECTION`,
+`ENVIRONMENTAL_ASSESSMENT`, `HOA_DOCUMENTS`, `ZONING_DOCUMENT`, `BUILDING_PERMIT`,
+`CERTIFICATE_OF_OCCUPANCY`, `FLOOR_PLANS`
+
+Collectibles: `CERTIFICATE_OF_AUTHENTICITY`, `CERTIFICATE_OF_ORIGIN`, `AUTHENTICATION_REPORT`,
+`PROVENANCE_HISTORY`, `AUCTION_DOCUMENTATION`, `CONDITION_REPORT`, `CATALOGUE_RAISONNE`,
+`EXHIBITION_HISTORY`, `LITERATURE_REFERENCE`, `EXPERT_OPINION`, `GRADING_CERTIFICATE`,
+`ENCAPSULATION_CERTIFICATE`, `CELLAR_INVENTORY`, `STORAGE_RECORDS`, `WINE_PROVENANCE`
+
+Photos: `PRIMARY_PHOTO`, `DETAIL_PHOTO`, `CONDITION_PHOTO`, `RESTORATION_PHOTO`, `DAMAGE_PHOTO`, `PHOTO`
+
+Legal/tax: `LEGAL_AGREEMENT`, `POWER_OF_ATTORNEY`, `TRUST_DOCUMENT`, `LOAN_AGREEMENT`, `MORTGAGE`,
+`LEASE_AGREEMENT`, `RENTAL_AGREEMENT`, `BILL_OF_LADING`, `CUSTOMS_DECLARATION`, `IMPORT_EXPORT_DOCUMENT`,
+`PROPERTY_TAX`, `DEPRECIATION_SCHEDULE`, `TAX_BASIS`, `EXCHANGE_1031`, `GIFT_TAX_DOCUMENT`,
+`ESTATE_TAX_DOCUMENT`, `CHARITABLE_DONATION_RECEIPT`, `ESTATE_APPRAISAL`
+
+Other: `BENEFICIARY_DESIGNATION`, `WILL_EXCERPT`, `DONATION_INTENT`, `RECEIPT`, `CORRESPONDENCE`,
+`NOTES`, `OTHER`
+
+#### LiabilityDocumentCreateRequestDto.documentSubType (13 values — small)
+
+`LOAN_AGREEMENT`, `PROMISSORY_NOTE`, `MORTGAGE_DEED`, `COLLATERAL_AGREEMENT`,
+`LINE_OF_CREDIT_AGREEMENT`, `REFINANCE_DOCUMENTS`, `AMORTIZATION_SCHEDULE`, `PAYOFF_STATEMENT`,
+`ACCOUNT_STATEMENT`, `FORM_1098`, `INSURANCE_CERTIFICATE`, `CORRESPONDENCE`, `OTHER`
+
+#### InsurancePolicyDocumentCreateRequestDto.documentSubType (26 values)
+
+Policy: `POLICY_DECLARATION`, `POLICY_CONTRACT`, `POLICY_AMENDMENT`, `POLICY_RENEWAL`,
+`POLICY_SCHEDULE`, `APPLICATION`, `UNDERWRITING_REPORT`
+
+Medical: `MEDICAL_EXAM`, `MEDICAL_RECORDS`
+
+Claims: `CLAIM_FORM`, `CLAIM_CORRESPONDENCE`, `CLAIM_SETTLEMENT`
+
+Billing: `PREMIUM_NOTICE`, `PAYMENT_RECEIPT`, `BILLING_STATEMENT`, `ANNUAL_STATEMENT`,
+`ILLUSTRATION`, `IN_FORCE_LEDGER`
+
+Beneficiary: `BENEFICIARY_DESIGNATION`, `BENEFICIARY_CHANGE`, `POWER_OF_ATTORNEY`,
+`TRUST_ASSIGNMENT`, `IRREVOCABLE_ASSIGNMENT`, `OWNERSHIP_CHANGE`
+
+Other: `CORRESPONDENCE`, `OTHER`
+
+### Filename → documentSubType classifier (ALWAYS apply before upload)
+
+Use this regex-based classifier; it catches the majority of documents. When a filename
+matches multiple patterns, prefer the MORE SPECIFIC one:
+
+```python
+# filename_to_subtype.py
+import re
+def classify(filename: str, entity_type: str) -> str:
+    """Return best-guess documentSubType. Never returns OTHER unless truly no match."""
+    f = filename.lower()
+    # Identity
+    if re.search(r'\bdl\b|driver.?s? lic|driver.?s.?license|drivers.?licen', f): return 'DRIVERS_LICENSE'
+    if 'passport' in f: return 'PASSPORT'
+    if re.search(r'state.?id|national.?id', f): return 'STATE_ID'
+    if 'birth.?certif' in f: return 'BIRTH_CERTIFICATE'
+    # Tax forms (specific first)
+    if re.search(r'\bw-?2\b|\bw2\b', f): return 'FORM_W2'
+    if re.search(r'\bw-?9\b|\bw9\b', f): return 'FORM_W9'
+    if re.search(r'w-?8ben-?e\b', f): return 'FORM_W8BEN_E' if entity_type == 'LEGAL_ENTITY' else 'FORM_W8BEN'
+    if re.search(r'w-?8ben\b', f): return 'FORM_W8BEN'
+    if re.search(r'k-?1.*1065|1065.*k-?1', f): return 'FORM_K1_1065'
+    if re.search(r'k-?1.*1120s|1120s.*k-?1', f): return 'FORM_K1_1120S'
+    if re.search(r'k-?1.*1041|1041.*k-?1', f): return 'FORM_K1_1041'
+    if re.search(r'\bk-?1\b', f): return 'FORM_K1_1065'  # default partnership
+    if '1099-div' in f: return 'FORM_1099_DIV'
+    if '1099-int' in f: return 'FORM_1099_INT'
+    if '1099-b' in f: return 'FORM_1099_B'
+    if '1099-r' in f: return 'FORM_1099_R'
+    if '1099-misc' in f or '1099-nec' in f: return 'FORM_1099_MISC'
+    if re.search(r'\b1098\b|mortgage.?interest', f): return 'FORM_1098'
+    if re.search(r'\b5498\b', f): return 'FORM_5498'
+    if re.search(r'\b1040\b|personal.?tax.?return', f): return 'FORM_1040'
+    if re.search(r'\b1065\b|partnership.?return', f): return 'FORM_1065'
+    if re.search(r'\b1120s\b|s-?corp.?return', f): return 'FORM_1120S'
+    if re.search(r'\b1120\b', f): return 'FORM_1120'
+    if re.search(r'\b1041\b|trust.?return|estate.?return', f): return 'FORM_1041'
+    if re.search(r'\b990-?pf\b', f): return 'FORM_990_PF'
+    if re.search(r'\b990\b', f): return 'FORM_990'
+    if re.search(r'\b8949\b', f): return 'FORM_8949'
+    # Trust / estate
+    if re.search(r'trust.?agreement|trust.?agt\b', f): return 'TRUST_AGREEMENT'
+    if re.search(r'trust.?amend|amendment.?and.?restate|restatement', f): return 'TRUST_AMENDMENTS'
+    if re.search(r'trust.?certif', f): return 'TRUST_CERTIFICATION'
+    if re.search(r'certificate.?of.?trust', f): return 'TRUST_CERTIFICATION'
+    if re.search(r'irrevocable', f) and 'trust' in f: return 'IRREVOCABLE_TRUST_DOCUMENT'
+    if re.search(r'revocable', f) and 'trust' in f: return 'REVOCABLE_TRUST_DOCUMENT'
+    if re.search(r'benefic.*designation|designation.*benefic', f): return 'BENEFICIARY_DESIGNATION'
+    # Corporate / LLC / LP
+    if re.search(r'articles.?of.?incorp', f): return 'ARTICLES_OF_INCORPORATION'
+    if re.search(r'articles.?of.?organ', f): return 'ARTICLES_OF_ORGANIZATION'
+    if re.search(r'operating.?agreement', f): return 'OPERATING_AGREEMENT'
+    if re.search(r'partnership.?agreement', f): return 'PARTNERSHIP_AGREEMENT'
+    if re.search(r'certificate.?of.?formation', f): return 'CERTIFICATE_OF_FORMATION'
+    if re.search(r'certificate.?of.?incorp', f): return 'CERTIFICATE_OF_INCORPORATION'
+    if re.search(r'certificate.?of.?good.?standing', f): return 'CERTIFICATE_OF_GOOD_STANDING'
+    if re.search(r'bylaws', f): return 'CORPORATE_BYLAWS' if entity_type == 'LEGAL_ENTITY' else 'BYLAWS'
+    if re.search(r'\bein\b.?letter|ein.?confirm', f): return 'EIN_CONFIRMATION'
+    if re.search(r'business.?license', f): return 'BUSINESS_LICENSE'
+    if re.search(r'business.?reg|state.?filing|sunbiz', f): return 'BUSINESS_REGISTRATION'
+    # Accounts / statements
+    if re.search(r'\bstatement\b', f) and ('bank' in f or 'chequing' in f or 'checking' in f or 'savings' in f):
+        return 'BANK_STATEMENT'
+    if re.search(r'brokerage.?statement|broker.?stmt', f): return 'BROKERAGE_STATEMENT'
+    if re.search(r'cap.?acct|capital.?account.?summary', f): return 'INVESTMENT_STATEMENT'
+    if re.search(r'trade.?confirm|confirmation', f) and 'account' not in f: return 'TRADE_CONFIRMATION'
+    if re.search(r'account.?agreement|acct.?agreement', f): return 'ACCOUNT_AGREEMENT'
+    if re.search(r'account.?application|acct.?app|new.?account', f): return 'ACCOUNT_APPLICATION'
+    if re.search(r'wire.?instr|dtc.?instr', f): return 'WIRE_INSTRUCTIONS'
+    if re.search(r'fee.?schedule', f): return 'FEE_SCHEDULE'
+    if re.search(r'margin.?agreement', f): return 'MARGIN_AGREEMENT'
+    # Tangible asset
+    if re.search(r'\bdeed\b', f): return 'DEED'
+    if re.search(r'\btitle\b', f) and 'insurance' not in f: return 'TITLE'
+    if re.search(r'title.?insurance', f): return 'TITLE_INSURANCE'
+    if re.search(r'bill.?of.?sale', f): return 'BILL_OF_SALE'
+    if re.search(r'\bregistration\b.*\b(vehicle|reg)', f) or re.search(r'\breg.?application', f):
+        return 'REGISTRATION'
+    if re.search(r'appraisal', f): return 'APPRAISAL'
+    if re.search(r'valuation|val.?report', f): return 'VALUATION_REPORT'
+    if re.search(r'authentic|authenticity|coa\b', f): return 'CERTIFICATE_OF_AUTHENTICITY'
+    if re.search(r'provenance', f): return 'PROVENANCE_HISTORY'
+    if re.search(r'emissions', f): return 'EMISSIONS_CERTIFICATE'
+    if re.search(r'warranty', f): return 'WARRANTY'
+    # Insurance
+    if re.search(r'policy.?decl|declaration.*polic|declarations.?page', f): return 'POLICY_DECLARATION'
+    if re.search(r'policy.?contract|insurance.?contract', f): return 'POLICY_CONTRACT'
+    if re.search(r'policy.?amend', f): return 'POLICY_AMENDMENT'
+    if re.search(r'policy.?renewal', f): return 'POLICY_RENEWAL'
+    if re.search(r'policy.?schedule|schedule.?of.?values', f): return 'POLICY_SCHEDULE'
+    if re.search(r'claim.?form', f): return 'CLAIM_FORM'
+    if re.search(r'premium.?notice', f): return 'PREMIUM_NOTICE'
+    # Liability
+    if re.search(r'loan.?agreement', f): return 'LOAN_AGREEMENT'
+    if re.search(r'promissory.?note', f): return 'PROMISSORY_NOTE'
+    if re.search(r'mortgage.?deed', f): return 'MORTGAGE_DEED'
+    if re.search(r'payoff.?stmt|payoff.?statement', f): return 'PAYOFF_STATEMENT'
+    if re.search(r'amortization', f): return 'AMORTIZATION_SCHEDULE'
+    # Estate planning docs
+    if re.search(r'\bwill\b|last.?will', f): return 'LAST_WILL_AND_TESTAMENT'
+    if re.search(r'living.?will', f): return 'LIVING_WILL'
+    if re.search(r'healthcare.?surrogate|healthcare.?directive|advance.?directive', f): return 'HEALTHCARE_SURROGATE'
+    if re.search(r'power.?of.?attorney|\bpoa\b', f): return 'POWER_OF_ATTORNEY'
+    if re.search(r'marriage.?certif', f): return 'MARRIAGE_CERTIFICATE'
+    if re.search(r'divorce', f): return 'DIVORCE_DECREE'
+    if re.search(r'court.?order', f): return 'COURT_ORDER'
+    # Compliance
+    if re.search(r'\bkyc\b', f): return 'KYC_DOCUMENTATION'
+    if re.search(r'\baml\b', f): return 'AML_CERTIFICATION' if entity_type == 'LEGAL_ENTITY' else 'AML_QUESTIONNAIRE'
+    if re.search(r'fatca', f): return 'FATCA_CERTIFICATION'
+    if re.search(r'\bcrs\b', f): return 'CRS_ENTITY_CERTIFICATION' if entity_type == 'LEGAL_ENTITY' else 'CRS_SELF_CERTIFICATION'
+    if re.search(r'ofac', f): return 'OFAC_SCREENING'
+    if re.search(r'accredited', f): return 'ACCREDITED_INVESTOR_VERIFICATION'
+    # Financial
+    if re.search(r'balance.?sheet', f): return 'BALANCE_SHEET'
+    if re.search(r'income.?statement', f): return 'INCOME_STATEMENT'
+    if re.search(r'cash.?flow', f): return 'CASH_FLOW_STATEMENT'
+    if re.search(r'audited.?financ', f): return 'AUDITED_FINANCIALS'
+    if re.search(r'financial.?stat', f): return 'FINANCIAL_STATEMENT'
+    if re.search(r'net.?worth', f): return 'NET_WORTH_STATEMENT'
+    if re.search(r'credit.?report', f): return 'CREDIT_REPORT'
+    # Investment / subscription
+    if re.search(r'subscription', f): return 'SUBSCRIPTION_AGREEMENT'
+    if re.search(r'ppm|offering.?memorand', f): return 'PPM_ACKNOWLEDGMENT'
+    if re.search(r'ips\b|investment.?policy', f): return 'INVESTMENT_POLICY_STATEMENT'
+    if re.search(r'investor.?question', f): return 'INVESTOR_QUESTIONNAIRE'
+    # Correspondence
+    if re.search(r'email|correspondence|letter\b|meeting.?notes', f): return 'CORRESPONDENCE'
+    # Receipt
+    if re.search(r'receipt|invoice', f): return 'RECEIPT' if entity_type == 'TANGIBLE_ASSET' else 'CORRESPONDENCE'
+    # Unmatched → record + return OTHER
+    return 'OTHER'
+```
+
+**When `OTHER` is returned**, append the (filename, entityType) pair to
+`altitude_review/documentSubType_unmatched.json` for follow-up improvements. The goal
+is to drive this list to zero over time.
 
 ### Document Association Rules
 
@@ -1735,12 +3236,37 @@ X-API-Key: {api_key}
 - `associationType` — `OWNER` (the entity that owns this document)
 - `entityDisplayName` — human-readable name (e.g., "Brett Podolsky", "Hercules Lender LLC")
 
-**Example:**
-```bash
+**Example (shell-agnostic — pseudo-variables in braces, not `${…}` or `%…%`):**
+```
 # Upload returns {"id": "abc123", ...}
-# Then create the association:
-curl -X POST "${BASE}/document/abc123/associations?entityType=INDIVIDUAL&entityId=${BRETT_ID}&associationType=OWNER&entityDisplayName=Brett%20Podolsky" \
-  -H "X-API-Key: ${API_KEY}" -H "X-Firm-Id: ${FIRM_ID}"
+# Then call the association endpoint:
+POST {baseUrl}/api/v1/document/abc123/associations
+     ?entityType=INDIVIDUAL
+     &entityId={brettId}
+     &associationType=OWNER
+     &entityDisplayName=Brett%20Podolsky
+Headers:
+  X-API-Key: {apiKey}
+  X-Firm-Id: {firmId}
+```
+
+Prefer Python `requests` or `urllib` over shell `curl` — it avoids all cross-shell quoting
+issues (bash `${VAR}`, cmd `%VAR%`, PowerShell `$env:VAR`, `--data-binary` quirks) and
+works identically on macOS/Linux/Windows:
+
+```python
+# post_association.py
+import os, sys, requests
+base, api_key, firm_id, doc_id, entity_type, entity_id, name = sys.argv[1:8]
+r = requests.post(
+    f"{base}/api/v1/document/{doc_id}/associations",
+    params={"entityType": entity_type, "entityId": entity_id,
+            "associationType": "OWNER", "entityDisplayName": name},
+    headers={"X-API-Key": api_key, "X-Firm-Id": firm_id},
+    timeout=30,
+)
+r.raise_for_status()
+print(r.json())
 ```
 
 This is idempotent — calling it twice for the same document+entity+type returns the existing
@@ -1782,8 +3308,14 @@ POST /api/v1/document/{trustAgreementDocId}/associations?entityType=INDIVIDUAL&e
 9. **Handle sensitive data carefully.** SSNs, EINs, tax IDs should only appear in
    structured payloads, not logs or markdown.
 
-10. **Use API key authentication when possible.** It's simpler than JWT and doesn't
-    require token refresh.
+10. **Auth: OAuth for humans, API key for automation.** The skill supports three auth modes
+    (see Step 0). For interactive use by a human advisor, prefer OAuth — Altitude hosts its
+    own login page, we never see the password, and refresh tokens give a smooth long session.
+    For CI, scripts, or unattended automation, API keys are simpler (no browser, no refresh).
+    Direct JWT paste is a fallback when neither option is available. The skill's helper
+    (`altitude_auth.headers()`) emits the correct `Authorization: Bearer` or `X-API-Key`
+    header based on `config.authMode` — examples in this skill show `X-API-Key` for brevity
+    but the helper substitutes correctly.
 
 11. **Save checkpoints after each phase.** Write intermediate results to disk
     (`altitude_review/` folder) after Phase 1 (universe), Phase 4 (matches), and
@@ -1949,6 +3481,51 @@ POST /api/v1/document/{trustAgreementDocId}/associations?entityType=INDIVIDUAL&e
     Copy these files to the system temp directory (use Python `tempfile.gettempdir()`) with
     clean names before uploading, then delete the temp copies after upload completes.
 
+40. **Latest-date-wins for field merging.** When the same entity field appears in multiple
+    documents (or in Altitude vs documents) with different values, the value from the most
+    recent source wins — determined by the document's `asOfDate` (explicit "as of" date,
+    execution/signing date, statement period end, filing date, filename-embedded date, or
+    file mtime as last resort). See Phase 3.5 Step 0 for the full rule. Exceptions:
+    immutable fields (SSN, DOB, EIN, formationDate, taxId) must agree and are flagged as
+    hard conflicts on disagreement; historical fields (originalBalance, purchasePrice) keep
+    their first confirmed value. For trust restatements, LLC amendments, and policy
+    endorsements, the amending document supersedes the original for all mutable fields.
+
+41. **Role replacements retire the old relationship.** When an amendment, restatement, or
+    new engagement names a DIFFERENT person in a role previously held by someone else
+    (trustee, managing member, advisor, attorney, accountant, officer, named insured): PATCH
+    `effectiveTo` on the old relationship to the replacement date, then POST a new
+    relationship with `effectiveFrom` = replacement date. Never delete — the historical
+    record must survive, and soft-deletes still enforce uniqueness (see rule #21). See
+    Phase 4.7 for the full workflow and review table format. If the document is ambiguous
+    (e.g., could be an additional co-trustee rather than a replacement), leave the old
+    relationship intact and flag in Open Questions.
+
+43. **Approval Q&A trail goes at the root of the household folder, not inside `altitude_review/`.**
+    Create `altitude_questions_{YYYY-MM-DD}.md` at `{household_folder}/` (sibling to the
+    source subfolders like `Onboarding/`, `Trust & Estate/`, etc., and sibling to
+    `altitude_review/`). Populate at Phase 5 with every pre-approval question + severity +
+    category. Update in place when the user responds (fill User Response, Resolved, Resolution
+    fields). Append new questions under "Post-Approval Questions" as they arise during
+    Phase 6/7. Never overwrite prior sessions — the date in the filename gives each session
+    its own audit trail. As the final step of Phase 7, upload the Q&A file to the primary
+    individual with entity associations to both the Individual and the Household, so the
+    decision trail lives inside Altitude too. See Phase 5 → "Approval Q&A Trail" for the
+    full template.
+
+42. **Externally-synced accounts (Addepar, Orion, custodian) are READ-ONLY from documents.**
+    When an AccountFinancial has an `externalIds[]` entry with a provider or a
+    `providerDetails.sourceSystemName` set, the external sync is the source of truth for
+    account fields (`accountNumber`, `name`, `custodianId`, `totalMarketValue`,
+    `totalCostBasis`, holdings, positions, valuations, etc.). Do NOT PATCH these from
+    documents — the next sync will either overwrite the change or produce conflicts. DO
+    update non-synced metadata (description, tags, manual notes, ownershipType). When a
+    document contains a materially different value for a synced field, include it in the
+    "Addepar / External Sync Discrepancies" section of the review (Phase 4.8) so the user
+    can investigate the sync rather than overriding it by hand. If a synced account has
+    `totalMarketValue == 0` or `lastSyncedAt == null`, raise a blocking alert in the
+    review — the sync is probably broken.
+
 ---
 
 ## Running the Skill
@@ -2011,10 +3588,13 @@ Write file tracker to: {folder}/altitude_review/file_tracker_batch_{N}.md
 - Word docs (cross-platform fallback chain):
   1. `textutil -convert txt file.docx` (macOS only)
   2. `pandoc file.docx -t plain` (cross-platform)
-  3. `python -c "from docx import Document; [print(p.text) for p in Document('file.docx').paragraphs]"` (Python fallback)
+  3. Write `docx_read.py` (see SKILL.md → Standard Document Extraction) and run `python docx_read.py "file.docx"` (Python fallback)
 - Images: Read tool (Claude has vision)
-- Emails: Parse with Python email module
-- Use `python` (not `python3`) for Windows compatibility. Detect with `platform.system()`.
+- Emails: Write `eml_read.py` (see SKILL.md → Standard Document Extraction) and run it
+- Spreadsheets: Write `xlsx_read.py` (see SKILL.md → Standard Document Extraction) and run it
+- **NEVER use `python -c "..."` with embedded newlines or nested quotes** — it breaks on
+  Windows cmd and PowerShell. Always write scripts to a `.py` file first.
+- Use `{PYTHON}` from Cross-Platform Setup (`python` on Windows, `python3` elsewhere). Detect with `platform.system()`.
 
 ## What to Extract (per file)
 For EACH file, append one JSONL line to your cache with:
