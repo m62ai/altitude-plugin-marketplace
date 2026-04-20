@@ -1,7 +1,7 @@
 # Altcore API Schema Reference
 
-**Updated:** 2026-04-06
-**API Version:** 0.0.1
+**Updated:** 2026-04-17
+**API Version:** 1.0.0
 **Production URL:** https://api.m62.live
 **Development URL:** http://localhost:8080
 

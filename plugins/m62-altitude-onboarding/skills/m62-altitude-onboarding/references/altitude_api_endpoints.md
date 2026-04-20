@@ -3,9 +3,9 @@
 ## Overview
 This document contains comprehensive details for key Altitude API endpoints including authentication, search, relationships, document uploads, and PATCH operations.
 
-**Updated:** 2026-04-06
-**API Version:** 0.0.1
-**API Title:** Altcore API
+**Updated:** 2026-04-17
+**API Version:** 1.0.0
+**API Title:** Altitude API
 **Production URL:** https://api.m62.live
 **Local Dev:** http://localhost:8080
 
@@ -45,7 +45,7 @@ Use the API key header for any endpoint. Recommended for automation and scripts.
 
 **Example:**
 ```bash
-curl -X GET "https://api.m62.live/api/v1/individual/search?searchParams=searchFor:John" \
+curl -X GET "https://api.m62.live/api/v1/individual/search?searchFor=John" \
   -H "X-API-Key: ak_live_xxxxxxxx"
 ```
 
@@ -84,7 +84,7 @@ All search endpoints follow the same pattern and support pagination, sorting, an
 
 **Example:**
 ```bash
-curl -X GET "https://api.m62.live/api/v1/individual/search?searchParams=searchFor:John&page=0&size=20" \
+curl -X GET "https://api.m62.live/api/v1/individual/search?searchFor=John&page=0&size=20" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
