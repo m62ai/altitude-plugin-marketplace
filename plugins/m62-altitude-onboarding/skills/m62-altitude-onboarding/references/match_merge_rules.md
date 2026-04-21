@@ -2,16 +2,34 @@
 
 ## Entity Matching
 
+### Matching Priority (ALL entity types)
+
+**External provider IDs take precedence over every other signal.** When an Altitude entity
+has `externalIds: [{provider, externalId}]` set (common when a firm imported a hierarchy
+spreadsheet from Addepar/Orion/Schwab before onboarding), a matching external ID in the
+extracted data is a **definitive match** regardless of name/DOB/EIN. Do NOT create a
+duplicate entity. Do NOT overwrite the external ID — it is a stable cross-system key. See
+SKILL.md Rule 42 on externally-synced accounts being READ-ONLY.
+
 ### Individual Matching
 
 Match extracted individuals against existing Altitude records.
 
 **Matching hierarchy (try in order, stop at first definitive match):**
 
+0. **External ID Match** (definitive)
+   - If the extracted data has any `externalIds[{provider, externalId}]` entry matching an
+     Altitude individual's entry → confirmed same person; proceed to field merge.
+
 1. **SSN Match** (definitive)
    - Normalize both SSNs to 9 digits (strip dashes, spaces)
    - If SSNs match exactly → confirmed same person
    - If both have SSNs but they differ → confirmed different people (stop)
+   - **Cross-check**: before trusting an extracted SSN, confirm the value doesn't equal the
+     EIN of any LegalEntity in the same folder. Grantor trusts often use the grantor's SSN
+     as the EIN, so a carelessly filled worksheet can place the EIN in the SSN field. If
+     the "SSN" matches a known EIN elsewhere, flag as probable conflation and leave SSN
+     blank pending user confirmation.
 
 2. **Name + DOB Match** (strong)
    - Normalize names: lowercase, strip titles (Mr/Mrs/Dr), strip suffixes (Jr/Sr/III)
@@ -31,6 +49,11 @@ Match extracted individuals against existing Altitude records.
 
 5. **No Match** → candidate for new entity
 
+**Same-family name collision rule**: when multiple candidates within the same household
+match on first+last name alone (e.g. Dan A. Emmett father vs Daniel W. Emmett son), do NOT
+merge. Require an additional disambiguator: middle initial, DOB, SSN, or explicit
+role-in-document (grantor vs beneficiary, father vs son). Flag for user if none available.
+
 **Matching output:**
 ```json
 {
@@ -44,10 +67,16 @@ Match extracted individuals against existing Altitude records.
 
 ### Legal Entity Matching
 
+0. **External ID Match** (definitive)
+   - Match on any matching `{provider, externalId}` pair.
+
 1. **EIN/Tax ID Match** (definitive)
    - Normalize: strip dashes, keep only digits
    - Exact match → confirmed same entity
    - Both have EIN but differ → confirmed different entities
+   - **Cross-check**: confirm the value is plausibly an EIN (`XX-XXXXXXX`). If it looks more
+     like an SSN (`XXX-XX-XXXX`), it may be a grantor-trust tax ID equal to the grantor's
+     SSN — record both facts.
 
 2. **Legal Name Exact Match** (strong)
    - Case-insensitive comparison after normalizing punctuation
@@ -903,5 +932,60 @@ The match-merge process produces:
 
 ---
 
+## Structural Corrections (added 2026-04-21)
+
+Standard Match & Merge produces FILL / MATCH / SUPERSEDE / STALE / HARD_CONFLICT lists per
+entity (see SKILL.md Step 4.3). A sixth category — **STRUCTURAL_CORRECTION** — is needed
+when the existing Altitude state is actively wrong according to authoritative source
+documents (operating agreements, partnership agreements, trust instruments, Articles).
+
+**Trigger conditions** — any of:
+- Extracted ownership relationships have different source/target from existing relationships
+  for the same target entity.
+- Extracted ownership percentages sum to 100% but Altitude has 100% assigned to a different
+  owner.
+- Extracted entity type contradicts Altitude (e.g. Altitude says LLC, Articles say
+  Corporation).
+- Extracted jurisdiction/formation-state contradicts Altitude.
+
+**Output format for review**:
+```
+## Structural Corrections (user authorization required)
+
+### Correction: Casa Rincon LLC ownership
+- **Altitude current**: Dan Emmett (IND) → Casa Rincon LLC (LE), OWNERSHIP 100%
+  relationshipId: 8f3c...
+- **Document reality**: 4 Emmett children @ 25% each (Operating Agreement 2014-07-22 § 3.1)
+- **Affected relationships to replace**: 1
+- **New relationships to create**: 4
+- **Recommended action**: HARD_DELETE existing + POST 4 new
+- **Blast radius**: Ownership rollup shifts from Dan to the 4 children
+- **User decision**: [approve HARD_DELETE / approve MARK_HISTORICAL / defer]
+```
+
+**API recipe — HARD_DELETE** (for "never was true" corrections):
+```bash
+OLD_ID="8f3c..."
+curl -X DELETE "$API/api/v1/entity-relationship/$OLD_ID/hard" -H "X-API-Key: $KEY"
+# then POST new OWNERSHIP relationships
+```
+
+**API recipe — MARK_HISTORICAL** (for "was true, has ended" transitions):
+```bash
+OLD_ID="8f3c..."
+curl -X PATCH "$API/api/v1/entity-relationship/$OLD_ID" \
+  -H "Content-Type: application/merge-patch+json" -H "X-API-Key: $KEY" \
+  -d '{"effectiveTo":"2025-07-08"}'
+# then POST new relationships with effectiveFrom: "2025-07-08"
+```
+
+Do NOT use soft-delete (`DELETE /{id}` without `/hard`) — the uniqueness constraint on
+(source, target, type) is enforced even on soft-deleted rows, so a subsequent POST with the
+same tuple fails with HTTP 409. This is the same constraint SKILL.md Rule 21 and Rule 41
+(role replacements) rely on.
+
+---
+
 ## Generated
-2026-03-19
+2026-03-19 (last updated 2026-04-21: external ID matching, SSN/EIN cross-check, same-family
+name collision rule, Structural Corrections workflow)

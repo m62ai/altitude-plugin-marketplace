@@ -663,6 +663,40 @@ Do NOT launch them sequentially — that defeats the purpose.
 
 Before touching any documents, query Altitude to understand what already exists.
 
+### API Response Shapes — READ THIS FIRST
+
+Altitude endpoints return two different response shapes. Confusing them leads to silent bugs
+(e.g. `len(resp) == 2` is the dict key count, not the item count).
+
+| Endpoint pattern | Shape | Count extraction |
+|---|---|---|
+| `GET /api/v1/{entity}?size=N` (list) | `{"content":[], "page":{"totalElements":N,...}}` | `resp["page"]["totalElements"]` |
+| `GET /api/v1/{entity}/search?searchFor=X` | Paginated wrapper (same) | same |
+| `GET /api/v1/{entity}/by-individual/{id}` / `by-household/{id}` / `by-owner/{type}/{id}` | Paginated wrapper | same |
+| `GET /api/v1/entity-relationship/from/{type}/{id}` / `/to/...` | **Bare JSON array** `[...]` | `len(resp)` |
+| `GET /api/v1/household/{id}/relationships/from` | **Bare JSON array** | `len(resp)` |
+| `GET /api/v1/{entity}/{id}` (single) | Bare JSON object | n/a |
+
+**Write a universal parser** once and reuse:
+```python
+def items(resp):
+    if isinstance(resp, list): return resp
+    if isinstance(resp, dict) and "content" in resp: return resp["content"]
+    return []
+
+def total(resp):
+    if isinstance(resp, list): return len(resp)
+    if isinstance(resp, dict): return resp.get("page", {}).get("totalElements", len(resp.get("content", [])))
+    return 0
+```
+
+### Graph-First Discovery Rule
+
+Phase 1 discovery **starts from the household and traverses the relationship graph outward**.
+Name-pattern search is a fallback — account names in Altitude are often generic ("Holding",
+"Custody", "Quantinno") and won't match family-surname searches. Step 1.3 has the traversal
+algorithm; Step 1.4 is a fallback for orphan accounts.
+
 ### Step 1.1: Search for the household
 
 ```
@@ -919,7 +953,108 @@ parent directory, counts), ask them to hydrate, then **re-run this scan** before
 proceeding. Do NOT launch extraction agents if any unhydrated files remain — they
 will consume hundreds of seconds of agent time timing out on reads.
 
-**If all files are hydrated**: proceed to document classification below.
+**If all files are hydrated**: proceed to the file cache check, then document classification.
+
+### Step 2.05: Incremental-Run File Cache (skip-already-seen)
+
+**Goal**: on a rerun, do not re-extract files whose content hasn't changed since the last
+successful extraction. Saves substantial time for large households and avoids burning tokens
+on repeat OCR of 100-page trust agreements.
+
+Maintain a persistent cache at `{household_folder}/altitude_review/file_cache.json`:
+
+```json
+{
+  "version": 1,
+  "lastRunAt": "2026-04-21T18:40:00Z",
+  "files": {
+    "Onboarding/Trust Agreement.pdf": {
+      "mtime": "2025-05-06T14:22:00Z",
+      "size": 2457123,
+      "sha256": "a1b2c3...",
+      "extractedAt": "2026-04-21T18:05:12Z",
+      "cacheLineNumbers": [23],
+      "status": "READ"
+    }
+  }
+}
+```
+
+**Cache-hit rule** — a file can be SKIPPED if and only if ALL three hold AND `force` is OFF:
+1. The path exists in `file_cache.json`.
+2. Current `mtime` and `size` match the cached values exactly **OR** `sha256` matches.
+3. The cache's `cacheLineNumbers` references still exist in `extraction_cache.jsonl` and
+   parse correctly.
+
+**Cloud-sync caveat** (OneDrive / Dropbox / iCloud / Box): filesystem `mtime` can change
+without file content changing when cloud sync touches the file. Prefer `sha256` as the
+primary cache key when running against a cloud-synced folder. Fall back to `mtime+size` only
+when sha256 computation is prohibitively slow.
+
+**Force mode** — bypasses the cache and re-reads every file, overwriting cache entries with
+fresh extraction. Supported invocations:
+- `force=true` / `--force` / `no-cache=true` — bypass cache for all files
+- `force=<glob>` — bypass cache for matching paths only (e.g. `force=Tax/**/*.pdf`)
+
+Use force mode when:
+- The extraction logic has changed (new entity types, new rules, new checklist items)
+- The skill has been updated and you want to re-run with the new prompts
+- You suspect prior extraction missed data (OCR was incomplete)
+- The user explicitly asks to re-extract or reprocess
+
+Default: `force=false`. Log each file as `SKIPPED (cache hit)` or `READ (force=true, cache
+bypassed)` in the tracker.
+
+**Orchestrator snippet** (run before spawning extraction agents):
+
+Write `file_cache_scan.py` and run `{PYTHON} file_cache_scan.py` (Cross-Platform Setup):
+
+```python
+# file_cache_scan.py
+import hashlib, json, os, pathlib, sys
+from datetime import datetime, timezone
+
+household_folder = sys.argv[1]
+force = (len(sys.argv) > 2 and sys.argv[2] in ("true", "--force", "no-cache"))
+force_paths = sys.argv[3:]  # optional glob patterns
+
+def sha256_file(p, chunk=1024*1024):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""): h.update(b)
+    return h.hexdigest()
+
+review_dir = pathlib.Path(household_folder) / "altitude_review"
+review_dir.mkdir(exist_ok=True)
+cache_path = review_dir / "file_cache.json"
+cache = {"version": 1, "files": {}}
+if cache_path.exists():
+    cache = json.loads(cache_path.read_text())
+
+to_process, to_skip = [], []
+for root, _, files in os.walk(household_folder):
+    if "altitude_review" in root: continue
+    for fn in files:
+        if fn.startswith(".DS_Store"): continue
+        full = os.path.join(root, fn)
+        rel = os.path.relpath(full, household_folder).replace(os.sep, "/")
+        st = os.stat(full)
+        current_mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+        entry = cache["files"].get(rel)
+        force_this = force or any(pathlib.PurePath(rel).match(p) for p in force_paths)
+        if (not force_this and entry and entry.get("size") == st.st_size and
+                (entry.get("sha256") == sha256_file(full) or entry.get("mtime") == current_mtime)):
+            to_skip.append(rel)
+        else:
+            to_process.append(rel)
+
+print(json.dumps({"process": to_process, "skip": to_skip, "force": force}))
+```
+
+Pass `process` to the extraction agents. Pre-populate `file_tracker.md` with one row per
+`skip` file: `| N | path | SKIPPED (cache hit) | (see extraction_cache line K) |`. After
+extraction agents complete, update `file_cache.json` with the new mtime/sha256/extractedAt
+for each processed file.
 
 ### Step 2.1: Classify Documents
 
@@ -939,7 +1074,8 @@ patterns in `references/document_type_patterns.md`. Key classification rules:
   account statements, insurance policy declarations, property tax bills, beneficiary designations
 - **Tier 3**: Financial statements, meeting notes, presentations, valuations, estate planning flowcharts
 - **Tier 4** (skip): Duplicates ("Copy of", "zDupes"), receipts, .msg files, spreadsheets
-  with personal notes
+  with personal notes, **generic LLM/schema templates with no populated family data**
+  (see Generic-Template Detection heuristic in `references/document_type_patterns.md`)
 
 **Document-to-entity association** — each document maps to an entity type for upload:
 Read `references/document_entity_association.md` for the complete mapping of which
@@ -1113,6 +1249,47 @@ agents complete. For folders with < 10 files, a single agent handles all files.
 **After reading EACH file**, each extraction agent appends what it learned to its own cache file:
 `altitude_review/extraction_cache_batch_{N}.jsonl` (one JSON object per line, append-only).
 The orchestrator later merges all batch files into `altitude_review/extraction_cache.jsonl`.
+
+#### ⛔ STRICT SCHEMA RULE — ONE JSON OBJECT PER LINE, ONE LINE PER FILE
+
+**Every line in the JSONL file MUST be a single valid JSON object with at minimum these
+required top-level keys**: `file`, `fileNumber`, `readAt`, `entities`.
+
+**Forbidden**:
+- Splitting one file's data across multiple lines (no "Dan as Individual on line 5, Dan's
+  trust as LegalEntity on line 6"). All entities/relationships/contacts extracted from a
+  single file belong on the SAME line as nested arrays under `entities`.
+- Concatenating multiple JSON objects on one line without a newline between them.
+- Pretty-printed multi-line JSON.
+
+**Orchestrator MUST validate** each batch file after the extraction agent completes, before
+merging. If validation fails, respawn a repair agent for that batch with stricter prompts.
+
+```python
+# validate_jsonl.py — run after each batch completes, before merge
+import json, pathlib, sys
+def validate_jsonl(path):
+    errors = []
+    with open(path) as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line: continue
+            try:
+                obj = json.loads(line)
+            except Exception as e:
+                errors.append(f"Line {i}: invalid JSON ({e})")
+                continue
+            for key in ("file", "fileNumber", "entities"):
+                if key not in obj:
+                    errors.append(f"Line {i}: missing required key '{key}'")
+            if "entities" in obj and not isinstance(obj["entities"], dict):
+                errors.append(f"Line {i}: 'entities' must be a dict")
+    return errors
+
+for batch in sorted(pathlib.Path(sys.argv[1]).glob("extraction_cache_batch_*.jsonl")):
+    errs = validate_jsonl(batch)
+    print(f"{'FAIL' if errs else 'OK'} {batch.name}: {errs[:5] if errs else ''}")
+```
 
 Each line captures everything extracted from a single file:
 
@@ -1569,31 +1746,42 @@ Always track all source documents + their as-of dates on every field.
 
 ### Step 4.2: Match extracted entities to Altitude Universe
 
-For each merged extracted entity, attempt to match it to an existing Altitude entity:
+For each merged extracted entity, attempt to match it to an existing Altitude entity.
+
+**External provider IDs take precedence over every other signal.** When an Altitude entity
+has `externalIds: [{provider, externalId}]` set (common when a firm imported a hierarchy
+spreadsheet from Addepar/Orion/Schwab before onboarding), a matching external ID in the
+extracted data is a **definitive match** — use the existing entity, do NOT create a
+duplicate, and do NOT overwrite the externalIds array (see Rule 42 on externally-synced
+accounts).
 
 **Individual matching against Altitude:**
-1. SSN exact match (if both have SSN) → definitive match
-2. firstName + lastName exact match (case-insensitive) → strong match
-3. firstName + lastName fuzzy match (≥ 0.85 similarity) + DOB match → strong match
-4. lastName match + DOB match → probable match (flag for confirmation)
-5. No match → candidate for new entity creation
+1. **External ID match** (Addepar/Orion/Schwab) → definitive match, use existing
+2. SSN exact match (if both have SSN) → definitive match
+3. firstName + lastName exact match (case-insensitive) → strong match
+4. firstName + lastName fuzzy match (≥ 0.85 similarity) + DOB match → strong match
+5. lastName match + DOB match → probable match (flag for confirmation)
+6. No match → candidate for new entity creation
 
 **Legal Entity matching against Altitude:**
-1. EIN/taxId exact match → definitive match
-2. legalName exact match (case-insensitive) → strong match
-3. legalName fuzzy match (≥ 0.8 similarity) + entityType match → strong match
-4. No match → candidate for new entity creation
+1. **External ID match** → definitive match
+2. EIN/taxId exact match → definitive match
+3. legalName exact match (case-insensitive) → strong match
+4. legalName fuzzy match (≥ 0.8 similarity) + entityType match → strong match
+5. No match → candidate for new entity creation
 
 **Account matching against Altitude:**
-1. accountNumber exact match → definitive match
-2. Account name fuzzy match (≥ 0.85 similarity) + custodian match → strong match
-3. No match → candidate for new entity creation
+1. **External ID match** → definitive match
+2. accountNumber exact match → definitive match
+3. Account name fuzzy match (≥ 0.85 similarity) + custodian match → strong match
+4. No match → candidate for new entity creation
 
 **Contact matching against Altitude:**
-1. email exact match → definitive match
-2. phone exact match → definitive match
-3. firstName + lastName exact match (case-insensitive) + jobTitle match → strong match
-4. **FIRM-WIDE contact search** (do this before creating any new Contact): Query
+1. **External ID match** → definitive match
+2. email exact match → definitive match
+3. phone exact match → definitive match
+4. firstName + lastName exact match (case-insensitive) + jobTitle match → strong match
+5. **FIRM-WIDE contact search** (do this before creating any new Contact): Query
    `GET /api/v1/contact/search?searchFor={firstName}+{lastName}&size=50` to find existing
    Contacts across OTHER households in the same firm. A JPM banker serving Verita may
    already exist under a different household — reuse, don't duplicate. If found:
@@ -1601,7 +1789,7 @@ For each merged extracted entity, attempt to match it to an existing Altitude en
      (relationship: HOUSEHOLD→CONTACT, type ADVISOR/ATTORNEY/etc.)
    - Merge any new fields (if the existing Contact has no email and you have one, PATCH)
    - Do NOT create a duplicate Contact
-5. No match anywhere → candidate for new entity creation
+6. No match anywhere → candidate for new entity creation
 
 **Firm-wide dedup applies especially to**: JPM bankers, attorneys (Kirkland & Ellis,
 Venable LLP, etc.), CPAs (large firms serve multiple clients), insurance agents,
@@ -1609,22 +1797,30 @@ Verita's own staff (they work across every household). These should be shared Co
 not per-household duplicates.
 
 **Tangible Asset matching against Altitude:**
-1. serialOrIdentifier exact match → definitive match
-2. Name + category + owner match → strong match
-3. Address match (for real property) → strong match
-4. No match → candidate for new entity creation
+1. **External ID match** → definitive match
+2. serialOrIdentifier exact match → definitive match
+3. Name + category + owner match → strong match
+4. Address match (for real property) → strong match
+5. No match → candidate for new entity creation
 
 **Insurance Policy matching against Altitude:**
-1. policyNumber exact match → definitive match
-2. name + carrierName match (case-insensitive) → strong match
-3. carrierName + coverageAmount + policyCategory match → probable match
-4. No match → candidate for new entity creation
+1. **External ID match** → definitive match
+2. policyNumber exact match → definitive match
+3. name + carrierName match (case-insensitive) → strong match
+4. carrierName + coverageAmount + policyCategory match → probable match
+5. No match → candidate for new entity creation
 
 **Liability matching against Altitude:**
-1. accountNumber + lenderName exact match → definitive match
-2. name + lenderName match (case-insensitive) → strong match
-3. lenderName + liabilityType + currentBalance within 5% → probable match
-4. No match → candidate for new entity creation
+1. **External ID match** → definitive match
+2. accountNumber + lenderName exact match → definitive match
+3. name + lenderName match (case-insensitive) → strong match
+4. lenderName + liabilityType + currentBalance within 5% → probable match
+5. No match → candidate for new entity creation
+
+**Same-family name collision** — when multiple candidates within the same household match on
+first+last name alone (e.g., Dan A. Emmett father vs Daniel W. Emmett son), do NOT merge.
+Require a disambiguator (middle initial, DOB, SSN, or explicit role-in-document). Flag for
+user if none is available. See Rule 45.
 
 ### Step 4.3: Field-level diff against Altitude
 
@@ -1657,12 +1853,58 @@ For each field in the extracted entity:
     → KEEP: Altitude has data we don't, leave it alone
 ```
 
-Generate four lists for each entity:
+Generate six lists for each entity (five field-level + one relationship-level):
 1. **Auto-fill fields** — empty in Altitude, has value from documents
 2. **Matching fields** — same value in both (no action)
 3. **Supersede fields** — documents newer than Altitude, will overwrite (show diff in review)
 4. **Stale fields** — Altitude newer than documents, will keep Altitude (show in review as FYI)
 5. **Hard-conflict fields** — immutable fields that differ → block on user decision
+6. **Structural corrections** — see Step 4.3.5 below
+
+### Step 4.3.5: Structural Correction Handling
+
+A **structural correction** arises when Altitude's existing relationship/structure is
+actively wrong per authoritative source documents — distinct from field-level conflicts:
+- Existing ownership percentages contradict operating agreements or partnership agreements
+  (e.g., Altitude shows Dan owning 100% of Casa Rincon LLC, but the operating agreement
+  clearly lists 4 children at 25% each)
+- Existing entity type contradicts Articles (Altitude says LLC, Articles say Corporation)
+- Existing trustee/officer lists contradict current trust/corporate documents
+
+**Do NOT auto-apply structural corrections.** Surface them in the review under
+`## Structural Corrections (user authorization required)` with:
+- Current Altitude state (relationship id(s), source/target, percentage)
+- Document reality (per document citation)
+- Affected relationships to replace
+- New relationships to create
+- Recommended action: `HARD_DELETE` or `MARK_HISTORICAL`
+- Blast radius (which rollups / displays shift)
+
+**Choosing HARD_DELETE vs MARK_HISTORICAL:**
+- **HARD_DELETE** (`DELETE /api/v1/entity-relationship/{id}/hard`) — use when the prior
+  relationship was simply incorrect (data-entry error, hierarchy-spreadsheet approximation).
+  No audit trail needed for "never was true."
+- **MARK_HISTORICAL** (`PATCH /api/v1/entity-relationship/{id}` with `effectiveTo={today}`)
+  — use when the prior relationship WAS true but ended (LP sold their interest, trustee
+  resigned). Preserves the audit trail.
+
+> ⚠️ Soft-delete does NOT release uniqueness. If you soft-delete OWNERSHIP X→Y and POST a
+> new OWNERSHIP X→Y, you get HTTP 409. Use hard-delete or mark-historical — never
+> soft-delete-and-recreate with the same source+target+type. This is the same constraint
+> Rule 41 (Role replacements) relies on.
+
+API recipes:
+```bash
+# HARD_DELETE (for "never was true")
+OLD_ID="8f3c..."
+curl -X DELETE "$API/api/v1/entity-relationship/$OLD_ID/hard" -H "X-API-Key: $KEY"
+
+# MARK_HISTORICAL (for "was true, has ended")
+curl -X PATCH "$API/api/v1/entity-relationship/$OLD_ID" \
+  -H "Content-Type: application/merge-patch+json" -H "X-API-Key: $KEY" \
+  -d '{"effectiveTo":"2025-07-08"}'
+# then POST new relationships with effectiveFrom: "2025-07-08"
+```
 
 ### Step 4.4: Extract and validate relationships
 
@@ -1694,6 +1936,14 @@ to validate that source→target combinations are allowed:
 | ADVISOR | Engagement letters, onboarding sheets | HH→CONTACT, IND→CONTACT, LE→CONTACT | No | Unidirectional (entity points TO the advisor) |
 | ACCOUNTANT | Tax returns (preparer name), onboarding sheets | HH→CONTACT, IND→CONTACT, LE→CONTACT | No | Unidirectional (entity points TO the CPA) |
 | ATTORNEY | Trust docs (drafting attorney), will, onboarding | HH→CONTACT, IND→CONTACT, LE→CONTACT | No | Unidirectional (entity points TO the attorney) |
+| OWNERSHIP (LE→LE) | Trust owns LLC, LLC is member of LP, Holdco owns sub | LE→LE | Yes | Unidirectional (parent → child entity) |
+| MEMBER (LE→LE) | LLC where another entity (not a natural person) is a member | LE→LE | Yes | Unidirectional |
+| PARTNER (LE→LE) | Partnership where an entity (not a natural person) is a partner | LE→LE | Yes | Unidirectional |
+
+**Entity-to-entity chains**: multi-generational family structures often involve LE→LE
+ownership (Trust → LLC → LP → operating-LLC → real property). See
+`references/entity_chains.md` for worked examples and the correct relationship types for
+each pattern (trust-owned LLC, GP/LP partnership, holdco-manager, ILIT chain).
 
 **Validation rules:**
 - SPOUSE: symmetric (both directions, max 1 per person)
@@ -3526,6 +3776,62 @@ POST /api/v1/document/{trustAgreementDocId}/associations?entityType=INDIVIDUAL&e
     `totalMarketValue == 0` or `lastSyncedAt == null`, raise a blocking alert in the
     review — the sync is probably broken.
 
+44. **SSN vs EIN format — always cross-check before writing.** SSN is 9 digits displayed as
+    `XXX-XX-XXXX`; EIN is 9 digits displayed as `XX-XXXXXXX`. When a grantor trust uses the
+    grantor's SSN as its tax ID, an onboarding spreadsheet may accidentally copy the EIN into
+    the individual's SSN field (or vice versa). Before writing `individual.ssn`, check: does
+    this 9-digit value match the EIN of any LegalEntity in the same folder? If yes, flag as
+    probable conflation and leave SSN blank until the user confirms.
+
+45. **Resolve name collisions within a family.** Two "Dan"s (father Dan A. Emmett and son
+    Daniel W. Emmett), two "John"s (grandfather + grandson), or two "Mary"s are common.
+    Never match on first+last name alone within the same household. Require a
+    disambiguator: middle initial, DOB, SSN, or explicit role-in-document (grantor vs
+    beneficiary, father vs son, trustee vs successor trustee).
+
+46. **Flag expired identification documents.** When extracting DLs, passports, or other IDs,
+    record the expiration date. If expired as of the run date, add an OPEN_QUESTION:
+    "Client [X]'s [DL/passport] expired on [date]. Verify renewal or request updated
+    documentation." Do NOT block entity creation — the individual still exists.
+
+47. **Skip generic templates (Tier 4).** LLM prompt worksheets, generic Addepar schema
+    references, blank intake forms, or templates with no populated instance values should
+    be classified SKIP with reason "generic template — no family data". Detection heuristic:
+    if a doc has > 100 lines of field labels ("Full Name:", "DOB:") with fewer than 10%
+    having non-empty values after the delimiter, and no family proper nouns appear, skip.
+    See `references/document_type_patterns.md` Generic-Template Detection.
+
+48. **Populate Household.billing from the engagement agreement.** The fee structure maps
+    directly:
+    - Flat annual fee: `{"feeStructure": "FLAT", "flatFee": 400000, "billingFrequency": "QUARTERLY", "billingMethod": "IN_ARREARS", "agreementDate": "2025-07-08", "effectiveDate": "2025-07-08"}`
+    - Tiered AUM: `{"feeStructure": "TIERED", "feeScheduleId": "...", "billingFrequency": "QUARTERLY", "billingMethod": "IN_ARREARS"}`
+    - Flat AUM %: `{"feeStructure": "FLAT_PERCENT", "feePercent": 0.75, "minimumFee": 25000, ...}`
+    Always record `agreementDate` (execution) and `effectiveDate` (first billing period
+    start) — they may differ.
+
+49. **Blank onboarding sheets are not failures.** If `Client Onboarding Information.docx`
+    exists but contains only field labels with no filled values, don't abort. Cross-document
+    inference from tax returns, account statements, trust agreements, IDs, and insurance
+    summaries substitutes. Note in review: "Onboarding sheet was blank — data sourced from
+    [list of contributing documents]".
+
+50. **File-cache skip + force bypass.** Before reading a file, consult
+    `altitude_review/file_cache.json`. Skip files whose path + (sha256 OR mtime+size) match
+    the cached entry unchanged. Log as SKIPPED (cache hit). A user can bypass with
+    `force=true` (all files), `force=<glob>` (matching paths), or `no-cache=true`. Always
+    re-read when the skill version has changed or the extraction logic has been updated.
+    See Phase 2.05 for the orchestrator snippet.
+
+51. **Leased items are tangible assets — CREATE them, don't ask.** When a lease agreement,
+    lease schedule, or insurance policy lists a leased vehicle, leased aircraft, leased
+    watercraft, or any leased tangible item, create a TangibleAsset for it. Do NOT ask the
+    user "is this leased?" as if that's a disqualifier. Leased assets belong to the client's
+    effective holdings and the liability side is tracked via a companion Liability (lease
+    payable). Set `acquisitionType: "LEASE"` on the TangibleAsset and note lessor details
+    in the asset description. Create an accompanying Liability with
+    `liabilityType: "AUTO_LOAN"` (for vehicles), `"AIRCRAFT_LOAN"`, `"BOAT_LOAN"`, or
+    `"PERSONAL_LOAN"` and record the lease term + remaining payments.
+
 ---
 
 ## Running the Skill
@@ -3628,7 +3934,8 @@ For EACH file, append one JSONL line to your cache with:
 ## Reference Files
 
 - `references/altitude_api_schema.md` — Complete Altitude API field mappings and endpoints
-- `references/altitude_api_endpoints.md` — Detailed search, PATCH, document upload, and relationship endpoints
-- `references/document_type_patterns.md` — How to classify documents by filename and content
+- `references/altitude_api_endpoints.md` — Detailed search, PATCH, document upload, and relationship endpoints. **Includes the API Response Shape Primer** (paginated wrapper vs bare array).
+- `references/document_type_patterns.md` — How to classify documents by filename and content. Includes OCR fallback, Generic-Template SKIP heuristic, and Expired ID detection.
 - `references/document_entity_association.md` — Which documents associate with which entity type + documentSubType values
-- `references/match_merge_rules.md` — Detailed entity matching and field merge logic
+- `references/match_merge_rules.md` — Detailed entity matching and field merge logic. Includes external-ID match priority, SSN/EIN cross-check, same-family name collision rule, and **Structural Corrections** workflow (HARD_DELETE vs MARK_HISTORICAL).
+- `references/entity_chains.md` — Multi-generational entity ownership patterns (trust→LLC, GP/LP, holdco manager, ILIT chain) with LE→LE relationship modeling.

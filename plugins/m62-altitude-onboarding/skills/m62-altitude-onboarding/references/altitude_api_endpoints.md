@@ -15,6 +15,43 @@ This document contains comprehensive details for key Altitude API endpoints incl
 
 ---
 
+## API Response Shape Primer — READ FIRST
+
+Different Altitude endpoints return different response shapes. A careless parser that calls
+`len(resp)` on the wrong shape gets `2` (the `content` and `page` keys) and silently reports
+"2 items exist." Use a universal parser:
+
+```python
+def items(resp):
+    if isinstance(resp, list):   return resp
+    if isinstance(resp, dict):   return resp.get("content", [])
+    return []
+
+def total(resp):
+    if isinstance(resp, list):   return len(resp)
+    if isinstance(resp, dict):   return resp.get("page", {}).get("totalElements", len(resp.get("content", [])))
+    return 0
+```
+
+| Endpoint family | Shape |
+|---|---|
+| `/{entity}` (list with `?size=N`) | Paginated wrapper `{content:[], page:{totalElements, size, number}}` |
+| `/{entity}/search?searchFor=...` | Paginated wrapper (same) |
+| `/{entity}/by-individual/{id}` | Paginated wrapper |
+| `/{entity}/by-household/{id}` | Paginated wrapper |
+| `/{entity}/by-legal-entity/{id}` | Paginated wrapper |
+| `/{entity}/by-owner/{type}/{id}` | Paginated wrapper |
+| `/entity-relationship/from/{type}/{id}` | **Bare JSON array** `[...]` |
+| `/entity-relationship/to/{type}/{id}` | **Bare JSON array** |
+| `/household/{id}/relationships/from` | **Bare JSON array** |
+| `/{entity}/{id}` — single-entity fetch | Bare JSON object |
+
+**Graph-first discovery**: start from the household and traverse the relationship graph to
+find linked LEs, accounts, contacts. Name-pattern search is a fallback — account names in
+Altitude are often generic ("Holding", "Custody") and won't match family-surname searches.
+
+---
+
 ## 0. AUTHENTICATION
 
 ### JWT Authentication

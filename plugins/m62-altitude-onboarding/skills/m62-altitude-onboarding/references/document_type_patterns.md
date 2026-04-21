@@ -75,9 +75,65 @@ Emails often contain account confirmations, policy updates, advisor corresponden
 - **Attachments**: Save to temp directory and classify/process each as its native file type (PDF, DOCX, etc.)
 
 ### PDF and Document Files
-- **PDFs**: Use Claude's Read tool to read PDF files directly. Claude can read both text and scanned PDFs natively.
+- **PDFs**: Use Claude's Read tool to read PDF files directly. Claude can read both text and scanned PDFs natively. **Default first**: use the text-first pipeline from SKILL.md Phase 3 (`pdftotext -layout -nopgbrk`) before falling back to the Read tool to avoid the 2000px image dimension limit.
 - **Word docs (.docx)**: Use the platform's `DOCX_CMD` from the Cross-Platform Setup in SKILL.md. Fallback chain: `textutil -convert txt file.docx` (macOS) → `pandoc file.docx -t plain` (cross-platform) → write a `docx_read.py` script (see SKILL.md → Standard Document Extraction for the exact script; install via `pip install python-docx`). Then read the text output with Claude's Read tool. **Do NOT use `python -c "..."` with embedded newlines — it breaks on Windows cmd and PowerShell. Always write to a `.py` file and run it.**
 - **Spreadsheets (.xlsx)**: Write an `xlsx_read.py` script (see SKILL.md → Standard Document Extraction) and run `python xlsx_read.py "file.xlsx"`. Use `python` (not `python3`) — the Cross-Platform Setup in SKILL.md resolves the right command for the host OS.
+
+### Large Scanned PDFs — OCR Fallback
+
+When `pdftotext` returns mostly blank output (the PDF is a scan), use OCR:
+
+**Detect empty text layer:**
+```bash
+python3 -c "from pypdf import PdfReader; r=PdfReader('input.pdf'); n=sum(len((p.extract_text() or '').strip()) for p in r.pages); print(f'{n} text chars across {len(r.pages)} pages'); print('LIKELY SCANNED' if n < 200*len(r.pages) else 'has text layer')"
+```
+
+**OCR pipeline (poppler + tesseract):**
+```bash
+# Install on macOS: brew install poppler tesseract
+# Install on Windows: choco install poppler tesseract  (or winget/scoop)
+mkdir -p /tmp/ocr_work && rm -f /tmp/ocr_work/*
+pdftoppm -r 200 -gray input.pdf /tmp/ocr_work/page
+for p in /tmp/ocr_work/page-*.png; do tesseract "$p" "${p%.png}" 2>/dev/null; done
+cat /tmp/ocr_work/page-*.txt > /tmp/ocr_full.txt
+```
+
+Then Read `/tmp/ocr_full.txt`. Delete `/tmp/ocr_work/` after extraction. Recognition
+accuracy is typically 95%+ for clean scans; older faxed/photocopied documents may be lower.
+
+**Rule of thumb**: For scanned PDFs > 50 pages, OCR first. For < 50 pages, Claude vision is
+usually fine.
+
+### Generic-Template Detection (SKIP heuristic)
+
+Some folders contain LLM prompt worksheets, generic Addepar schema references, or blank
+intake templates that have no family-specific content. Processing them wastes tokens and
+pollutes the extraction cache.
+
+**Classify as SKIP (Tier 4) when ALL of these hold:**
+1. The document has > 100 lines of field labels (e.g. "Full Name:", "DOB:", "Address:") or
+   schema headers.
+2. Fewer than 10% of those labels have non-empty values after the colon/delimiter.
+3. No proper nouns specific to the family (surname, LLC names, trust names) appear in the
+   document body.
+
+**Also classify as SKIP:**
+- Files named `*ChatGPT*`, `*Experiment*`, `*Template*`, `*Blank Form*`, `*Worksheet*`
+  (when combined with generic content)
+- Any `.docx` that's effectively a schema dump of entity fields without instance values
+- Signed-by-nobody PDFs that are draft templates (no signatures, dates, or filled fields)
+
+When skipping, still log in the file_tracker with status `SKIPPED_TEMPLATE` and a one-line
+reason ("Generic Addepar schema template, no family data").
+
+### Expired ID Detection
+
+When extracting from driver licenses, passports, or any identification:
+- Record the expiration date.
+- Compare to the current run date.
+- If expired → add an OPEN_QUESTION entry for the review: "Individual [X]'s [DL/passport]
+  expired on [date]. Verify renewal or request updated documentation."
+- Do NOT block entity creation on an expired ID — the person still exists. Just flag it.
 
 ## Extraction Priority
 
