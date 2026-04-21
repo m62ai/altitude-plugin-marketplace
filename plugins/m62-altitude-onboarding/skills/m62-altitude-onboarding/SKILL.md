@@ -15,6 +15,72 @@ This skill extracts entity data from household document folders and updates the 
 platform. It follows a query-first, match-and-merge approach — never blindly creating
 entities. Every change is reviewed before pushing.
 
+## Life-event modes (detect early, branch appropriately)
+
+Before anything else, sniff the folder for **life-event signals** that change how this flow
+should behave. If any of these markers are present, add a banner to the review and branch.
+
+| Signal in folder | Mode | Implications |
+|---|---|---|
+| `divorce`, `MSA`, `Judgment`, `schedule of assets`, `FL-150`, `Kevin Divorce Documents` | **Divorce / post-divorce** | Expect HISTORICAL spouse, joint-trust division, community property allocation. Expect the final MSA/Judgment to be authoritative — if missing, defer ownership decisions. Treat ex-spouse as Contact (optionally Individual for historical SPOUSE). |
+| `prenuptial`, `transmutation`, `Cal Fam Code §852` | **CP transmutation** | All pre-marital separate property may now be community. Don't assume pre-2025 ownership carries forward. |
+| `estate of`, `probate`, `letters testamentary` | **Post-death** | Primary individual may be deceased. Use `lifecycleStatus=DECEASED` and `dateOfDeath`. Estate is the active entity, not the individual. |
+| `prospect`, unsigned client agreement | **Pre-engagement** | Record client-since date. Anything dated before the signed client agreement is prospect data. |
+| Folder from partner firm (e.g. Verita Partner Share) with `USE THESE PER ...` or `LATEST` or `FINAL` directory/filename prefixes | **Authority markers** | Prefer files in authority-marked folders over other sources when resolving conflicts. |
+
+**For the Divorce mode specifically**: (a) Every joint-titled asset belongs in **Tier B —
+Pending MSA** until the final judgment specifies allocation. Don't create joint-trust
+accounts under the client's Household without flagging. (b) The ex-spouse is NOT a client.
+Create as a Contact with role "Former spouse / counterparty" OR as an Individual with
+`SPOUSE` relationship marked HISTORICAL (set `effectiveTo` to the decree date once known).
+(c) Family trusts that existed before the divorce are typically being divided — track them
+as HISTORICAL and create the NEW post-divorce trusts as current entities.
+
+## Fund-entity flood (aggregate vs create individually)
+
+When the client's household includes an operating partner at a VC/PE firm, or any limited
+partner in 50+ investment vehicles (Accel, Sequoia, KKR, Accel-India, IDG-Accel China, etc.),
+you will extract hundreds of partnership LegalEntities (Accel XVI Investors LLC, Accel
+London VII LP, etc.). These are typically already tracked in Addepar at the position level.
+
+**Default rule: DO NOT create individual LegalEntity records for investment fund vehicles.**
+Instead:
+- Track aggregate exposure as supplemental attributes on the parent trust or account
+  ("Total Accel carry: $120M unrealized, $40M side-funds")
+- If the client wants entity-level tracking, create a single umbrella LegalEntity
+  (e.g. "Accel Carry — Comolli Family Trust") with supplemental attributes listing the
+  component funds
+- Full fund list stays in the extraction cache (`altitude_review/extraction_cache.jsonl`)
+  for audit / future refinement
+
+## Absence-as-data: empty folders and missing documents
+
+Wealth management firms often use standardized folder templates. When you encounter empty
+folders (`Insurance/`, `Investments/`, `Client Reporting/`, `Miscellaneous/`), treat them
+as **absence signals**, not ignore-able:
+
+- Empty `Insurance/` → "No insurance documents collected yet" → open question: does client have
+  policies we need to request?
+- Empty `Investments/` → "No investment docs" → is this because investments are via a separate
+  custodian, or because we haven't collected them?
+- Empty `Client Reporting/` → "Client may be pre-engagement" → confirm client-since date
+
+Record absence facts in `altitude_review/open_questions.json` and the review, don't drop them.
+
+## Addepar-sync provenance (do not clobber synced fields)
+
+Any entity whose `externalIds` includes `provider: ADDEPAR` is populated by nightly Addepar
+sync. PATCHing Addepar-owned fields risks having your changes overwritten on the next sync.
+
+Rule of thumb before PATCHing:
+1. Check `externalIds` on the entity — if `provider=ADDEPAR` exists, the Addepar sync owns:
+   - Account: accountNumber, custodianId, accountCategory, provider-side balances, position data
+   - Individual: synced name + DOB from the Addepar "party" record
+   - Household: the Addepar hierarchy name
+2. Only PATCH fields that are NOT owned by Addepar (estatePlanning, email, phone,
+   supplementalAttributeValues, Altitude-side metadata)
+3. If you must PATCH a synced field, leave a note in the review flagging the sync conflict risk
+
 ## Prerequisites
 
 ### Required Tools
@@ -1936,6 +2002,9 @@ to validate that source→target combinations are allowed:
 | ADVISOR | Engagement letters, onboarding sheets | HH→CONTACT, IND→CONTACT, LE→CONTACT | No | Unidirectional (entity points TO the advisor) |
 | ACCOUNTANT | Tax returns (preparer name), onboarding sheets | HH→CONTACT, IND→CONTACT, LE→CONTACT | No | Unidirectional (entity points TO the CPA) |
 | ATTORNEY | Trust docs (drafting attorney), will, onboarding | HH→CONTACT, IND→CONTACT, LE→CONTACT | No | Unidirectional (entity points TO the attorney) |
+| HEALTHCARE_AGENT | Advance healthcare directive, DPANOC | IND→IND | No | Unidirectional (source is the agent; target is the person whose healthcare they decide) — use `role` to mark "Primary" / "Alternate" for priority |
+| EXECUTOR | Will | IND→IND, LE→IND | No | Unidirectional — use `role` to mark "Primary" / "Contingent". Corporate fiduciaries (trust companies) as LE source. |
+| TRUST_PROTECTOR | Modern trust instruments | IND→LE, CONTACT→LE, LE→LE | No | Unidirectional — independent oversight of trustees |
 | OWNERSHIP (LE→LE) | Trust owns LLC, LLC is member of LP, Holdco owns sub | LE→LE | Yes | Unidirectional (parent → child entity) |
 | MEMBER (LE→LE) | LLC where another entity (not a natural person) is a member | LE→LE | Yes | Unidirectional |
 | PARTNER (LE→LE) | Partnership where an entity (not a natural person) is a partner | LE→LE | Yes | Unidirectional |
@@ -3047,6 +3116,52 @@ flag for user review.
 After entities are created/updated, upload source documents and associate them with
 the correct entity.
 
+### Step 7.0: Create an upload session FIRST (REQUIRED)
+
+**You MUST create an upload session before any file uploads.** Generating a random UUID and
+passing it as `sessionId` fails with HTTP 404 `Document upload session not found`.
+
+```bash
+curl -s -X POST "${BASE}/document-upload-session" \
+  -H "X-API-Key: ${API_KEY}" -H "X-Firm-Id: ${FIRM_ID}" \
+  -H "Content-Type: application/json" \
+  -d '{"sessionName": "Comolli onboarding upload"}'
+```
+
+Returns:
+```json
+{"id": "<uuid>", "status": "In Progress", "autoCompleteAfterHours": 24, ...}
+```
+
+Use the returned `id` as the `sessionId` query parameter in every upload call that follows.
+The session auto-completes after 24 hours if not explicitly closed. Endpoint is **singular**
+(`/document-upload-session`), not plural.
+
+### Large-file split recipe (nginx 10 MB upload ceiling)
+
+Uploads of roughly **≥10 MB** are rejected by nginx with `413 Request Entity Too Large`
+(empirically: 11.9 MB and 14.2 MB both failed; 9.1 MB and 7.4 MB both succeeded). For any
+file larger than ~9 MB, split it first and upload each part separately with a
+`Part N of M` suffix in the title:
+
+```bash
+# Count pages
+python3 -c "from pypdf import PdfReader; print(len(PdfReader('big.pdf').pages))"
+
+# Split in half (or thirds if still too big)
+qpdf big.pdf --pages big.pdf 1-30 -- /tmp/big_part1of2.pdf
+qpdf big.pdf --pages big.pdf 31-60 -- /tmp/big_part2of2.pdf
+ls -la /tmp/big_part*.pdf   # verify each <10MB
+```
+
+If a single page contains most of the weight (e.g. a high-res scanned image), compress it:
+```bash
+pdftocairo -jpeg -r 100 -jpegopt quality=60 big.pdf /tmp/out
+# then rebuild PDF from the JPGs
+```
+
+Record split parts in the upload plan with titles like `<Original Title> — Part 1 of 2`.
+
 ### contentType enum (EXACT values accepted by API — use precisely)
 
 Altitude's `DocumentContentType` enum accepts exactly these 18 values — nothing else:
@@ -3557,6 +3672,14 @@ POST /api/v1/document/{trustAgreementDocId}/associations?entityType=INDIVIDUAL&e
 
 9. **Handle sensitive data carefully.** SSNs, EINs, tax IDs should only appear in
    structured payloads, not logs or markdown.
+
+   **Protective Order / confidential materials**: If the folder contains a court-issued
+   protective order (e.g. `Stipulation re Protective Order`, `12 . Stip re Protective Order
+   [F.01.29.26].pdf`), STOP and flag it to the user BEFORE uploading any documents. Ask:
+   (a) which files (if any) are subject to the order, (b) whether they can be stored in
+   Altitude at all, (c) if yes, whether they need restricted access via supplemental
+   attribute or a flag. Do not assume uploads are permitted just because the documents
+   are in the folder.
 
 10. **Auth: OAuth for humans, API key for automation.** The skill supports three auth modes
     (see Step 0). For interactive use by a human advisor, prefer OAuth — Altitude hosts its
