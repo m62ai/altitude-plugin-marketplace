@@ -1026,21 +1026,44 @@ before the expensive extraction runs.
 
 ```python
 # altitude_hydration_scan.py
-import os, subprocess, sys
+#
+# IMPORTANT: do NOT use `dd bs=1 count=1` as the stub probe. On OneDrive/macOS
+# an attribute lookup for a 1-byte read blocks for seconds even on already-
+# hydrated files — a 3-second threshold mis-flags nearly every file as a stub
+# (16x false-positive rate observed on Lamond run, 2026-04-22).
+#
+# Correct probe: attempt an actual 4 KB read through Python with a signal
+# timeout (POSIX) or a daemon thread join (Windows). Hydrated files return in
+# < 10 ms; real cloud stubs either time out or raise OSError 60 ("Operation
+# timed out").
+import os, platform, signal, sys, threading
 from pathlib import Path
 
-HOUSEHOLD = sys.argv[1]  # absolute path to household folder
-STUB_THRESHOLD_SECS = 3  # a 1-byte read taking > 3s is almost certainly a cloud stub
+HOUSEHOLD = sys.argv[1]              # absolute path to household folder
+HYDRATION_TIMEOUT_SECS = 30          # ceiling for first-time hydration on slow links
 
-def is_cloud_stub(path: str) -> bool:
-    try:
-        subprocess.check_output(
-            ["dd", f"if={path}", "bs=1", "count=1", "of=/dev/null"],
-            stderr=subprocess.DEVNULL, timeout=STUB_THRESHOLD_SECS,
-        )
-        return False
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        return True
+class _Timeout(Exception): pass
+
+def is_cloud_stub(path: str, timeout_secs: int = HYDRATION_TIMEOUT_SECS) -> bool:
+    """True only if the file truly fails to hydrate within `timeout_secs`."""
+    result = {"ok": False}
+
+    def _read():
+        try:
+            with open(path, "rb") as f: f.read(4096)
+            result["ok"] = True
+        except Exception: pass  # treat any read error as a stub
+
+    if platform.system() == "Windows":
+        t = threading.Thread(target=_read, daemon=True); t.start(); t.join(timeout_secs)
+        return not result["ok"]
+    def _on_alarm(sig, frame): raise _Timeout()
+    old = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(timeout_secs)
+    try: _read()
+    except _Timeout: return True
+    finally: signal.alarm(0); signal.signal(signal.SIGALRM, old)
+    return not result["ok"]
 
 stubs = []
 for root, _, files in os.walk(HOUSEHOLD):
@@ -2743,6 +2766,28 @@ Address structure fields:
 
 Process in order: Household → Individuals → Legal Entities → Accounts → Contacts → Tangible Assets (via subtype endpoints) → Insurance Policies → Liabilities. Then create all relationships, then PATCH estate planning.
 
+**⚠ DO NOT include `notes` on a PATCH/POST body for Individual, LegalEntity,
+TangibleAsset, Liability, InsurancePolicy, or AccountFinancial.** That field is a
+`Set<NoteDto>`, not a string — passing a string returns 400 "Cannot deserialize value
+of type `HashSet<…NoteDto>`". Notes are created via the separate child endpoint:
+
+```
+POST /api/v1/individual/{id}/notes
+POST /api/v1/legal-entity/{id}/notes
+POST /api/v1/tangible-asset/{id}/notes
+POST /api/v1/liability/{id}/notes
+POST /api/v1/insurance-policy/{id}/notes
+POST /api/v1/account-financial/{id}/notes
+Content-Type: application/json
+X-API-Key: {api_key}
+
+{"noteText": "Free-form note body here"}
+```
+
+The DTO's **required field is `noteText`** — **NOT** `note` or `text`. Missing/wrong
+field name returns 400 `"noteText: must not be null"`. This was a repeat pitfall on
+Lamond (2026-04-22) — every early POST with `{"note": …}` failed silently.
+
 If an API call fails, log it, save state, and ask user to retry or continue with others.
 
 ### Step 6.2: Create new entities (POST)
@@ -2866,7 +2911,25 @@ Content-Type: application/json
 }
 ```
 
-For new tangible assets (use SUBTYPE-SPECIFIC endpoints — NOT the base `/tangible-asset`):
+For new tangible assets (use SUBTYPE-SPECIFIC endpoints — NOT the base `/tangible-asset`).
+
+**⚠ `valuationSource` is an ENUM, not a freeform string.** Accepted values only:
+`PROFESSIONAL_APPRAISAL`, `AUCTION_ESTIMATE`, `INSURANCE_APPRAISAL`, `DEALER_ESTIMATE`,
+`COMPARABLE_SALES`, `TAX_ASSESSMENT`, `PURCHASE_PRICE`, `REPLACEMENT_COST`,
+`OWNER_ESTIMATE`. Sending a human-readable label like `"BDT Balance Sheet 2025"` returns
+400. Mapping cheatsheet:
+
+| Document source | Use this enum |
+|---|---|
+| Client balance sheet / family-office spreadsheet | `OWNER_ESTIMATE` |
+| Appraisal report (Gurr Johns, Sothebys, etc.) | `PROFESSIONAL_APPRAISAL` |
+| Insurance schedule / Chubb Collections | `INSURANCE_APPRAISAL` |
+| Auction house sale estimate | `AUCTION_ESTIMATE` |
+| Local dealer/broker pricing (NetJets FMV quote, vehicle dealer) | `DEALER_ESTIMATE` |
+| Recent local comps (Zillow, Redfin, BPO) | `COMPARABLE_SALES` |
+| County tax assessor | `TAX_ASSESSMENT` |
+| Closing statement / purchase receipt | `PURCHASE_PRICE` |
+| Insurance replacement-cost endorsement | `REPLACEMENT_COST` |
 
 ```
 POST /api/v1/tangible-asset/real-property
@@ -2881,6 +2944,8 @@ Content-Type: application/json
   "serialOrIdentifier": "06-42-47-04-02-000-0390",
   "location": "Palm Beach County, FL",
   "currentValue": 5674000,
+  "valuationDate": "2025-12-31",
+  "valuationSource": "OWNER_ESTIMATE",
   "isInsured": true,
   "insuredValue": 5674000
 }
@@ -2894,6 +2959,7 @@ POST /api/v1/tangible-asset/vehicle
   "assetType": "CAR",
   "serialOrIdentifier": "WP0CD2A94RS257187",
   "currentValue": 317480,
+  "valuationSource": "DEALER_ESTIMATE",
   "isInsured": true
 }
 ```
@@ -2906,6 +2972,7 @@ POST /api/v1/tangible-asset/luxury
   "assetType": "WATCH",
   "serialOrIdentifier": "LH0496U",
   "currentValue": 31928,
+  "valuationSource": "INSURANCE_APPRAISAL",
   "isInsured": true,
   "insuredValue": 31928
 }
@@ -3094,17 +3161,30 @@ via the `role` field.
 |---|---|---|
 | DONOR_ADVISED_FUND | OTHER | Use charitableDetails |
 | PRIVATE_FOUNDATION | FOUNDATION | Verify enum exists; else OTHER |
-| DISREGARDED_LLC | LLC | Use taxClassification=DISREGARDED_ENTITY |
+| DISREGARDED_LLC | LLC | Use `taxClassification=INDIVIDUAL_SOLE_PROPRIETOR_OR_SINGLE_MEMBER_LLC` (there is no `DISREGARDED_ENTITY` enum value — see taxClassification table below) |
 | SERIES_LLC | LLC | Note series in description |
 
 **LegalEntity `taxClassification` remaps**:
 
-| Document-described | Altitude API |
-|---|---|
-| "Partnership (Form 1065)" | PARTNERSHIP |
-| "Disregarded Entity" | DISREGARDED_ENTITY |
-| "C Corporation" / "C-Corp" | C_CORP |
-| "S Corporation" / "S-Corp" | S_CORP |
+The only accepted enum values are: `INDIVIDUAL_SOLE_PROPRIETOR_OR_SINGLE_MEMBER_LLC`,
+`C_CORPORATION`, `S_CORPORATION`, `PARTNERSHIP`, `TRUST_ESTATE`, `LLC`,
+`LLC_C_CORPORATION`, `LLC_S_CORPORATION`, `LLC_PARTNERSHIP`, `RETIREMENT_PLAN`, `OTHER`.
+**`GRANTOR_TRUST` and `DISREGARDED_ENTITY` are NOT valid** — they were produced by the
+server as 400 errors on the Lamond run (2026-04-22). Apply this table before sending:
+
+| Document-described | Altitude API | Notes |
+|---|---|---|
+| "Partnership (Form 1065)" | `PARTNERSHIP` | |
+| "Disregarded Entity" / "Disregarded LLC" | `INDIVIDUAL_SOLE_PROPRIETOR_OR_SINGLE_MEMBER_LLC` | For single-member LLCs treated as disregarded for tax purposes |
+| "C Corporation" / "C-Corp" | `C_CORPORATION` | NOT `C_CORP` |
+| "S Corporation" / "S-Corp" | `S_CORPORATION` | NOT `S_CORP` |
+| "Grantor Trust" / "Revocable Living Trust" / "IDGT" | `TRUST_ESTATE` | Grantor-trust status lives on `trust.isGrantor`, NOT here |
+| "Simple Trust" / "Complex Trust" / "Non-Grantor Trust" | `TRUST_ESTATE` | |
+| "Irrevocable Trust" (any flavor) | `TRUST_ESTATE` | |
+| "LLC taxed as partnership" | `LLC_PARTNERSHIP` | |
+| "LLC taxed as S-Corp" | `LLC_S_CORPORATION` | |
+| "LLC taxed as C-Corp" | `LLC_C_CORPORATION` | |
+| "IRA" / "401(k)" / "Pension" / "Profit-Sharing Plan" | `RETIREMENT_PLAN` | |
 
 **Apply these proactively.** When building POST payloads, run the values through these
 maps before sending. On any unknown enum value that the server rejects with 400, fall
@@ -3196,6 +3276,23 @@ Use the returned `id` as the `sessionId` query parameter in every upload call th
 The session auto-completes after 24 hours if not explicitly closed. Endpoint is **singular**
 (`/document-upload-session`), not plural.
 
+**Explicitly close the session after uploads finish** (not required — auto-closes at 24h —
+but cleaner for audit):
+
+```bash
+# ⚠ Close is POST, NOT PATCH. PATCHing returns 405 "Method Not Allowed".
+curl -s -X POST "${BASE}/document-upload-session/${SESSION_ID}/complete" \
+  -H "X-API-Key: ${API_KEY}"
+```
+
+Other useful session verbs (per api.json 2026-04-22):
+- `GET /document-upload-session/{id}` — retrieve session details
+- `GET /document-upload-session/{id}/status` — status only
+- `GET /document-upload-session/{id}/documents` — all documents uploaded in this session
+- `POST /document-upload-session/{id}/complete` — close session
+- `DELETE /document-upload-session/{id}` — cancel session
+- `PATCH /document-upload-session/{id}` — update sessionName/metadata only (NOT complete)
+
 ### Large-file split recipe (nginx 10 MB upload ceiling)
 
 Uploads of roughly **≥10 MB** are rejected by nginx with `413 Request Entity Too Large`
@@ -3279,7 +3376,10 @@ out_path.write_text('\n'.join(out))
 print(out_path)
 ```
 
-Then upload with `contentType=TXT` and `documentSubType=CORRESPONDENCE` (or entity-specific equivalent).
+Then upload with `contentType=TXT` and `documentSubType=CORRESPONDENCE` only if the
+target entity type is `ACCOUNT_FINANCIAL`, `TANGIBLE_ASSET`, `INSURANCE_POLICY`, or
+`LIABILITY`. For `INDIVIDUAL` or `LEGAL_ENTITY` targets use `documentSubType=OTHER` —
+their enums do NOT include `CORRESPONDENCE` (per api.json 2026-04-22).
 
 ### documentSubType — intelligent selection (NEVER default to OTHER)
 
@@ -3555,10 +3655,18 @@ def classify(filename: str, entity_type: str) -> str:
     if re.search(r'ppm|offering.?memorand', f): return 'PPM_ACKNOWLEDGMENT'
     if re.search(r'ips\b|investment.?policy', f): return 'INVESTMENT_POLICY_STATEMENT'
     if re.search(r'investor.?question', f): return 'INVESTOR_QUESTIONNAIRE'
-    # Correspondence
-    if re.search(r'email|correspondence|letter\b|meeting.?notes', f): return 'CORRESPONDENCE'
+    # Correspondence — NOT in IndividualDocumentSubType or LegalEntityDocumentSubType enums.
+    # Per api.json (2026-04-22): only AccountFinancial / TangibleAsset / InsurancePolicy /
+    # Liability accept CORRESPONDENCE. For Individual / LegalEntity / Fund / Order / Account,
+    # fall back to OTHER — sending CORRESPONDENCE returns HTTP 400.
+    # This broke 24/62 uploads on the Lamond run before being rewritten.
+    _CORR_ALLOWED = {'ACCOUNT_FINANCIAL', 'TANGIBLE_ASSET', 'INSURANCE_POLICY', 'LIABILITY'}
+    if re.search(r'email|correspondence|letter\b|meeting.?notes', f):
+        return 'CORRESPONDENCE' if entity_type in _CORR_ALLOWED else 'OTHER'
     # Receipt
-    if re.search(r'receipt|invoice', f): return 'RECEIPT' if entity_type == 'TANGIBLE_ASSET' else 'CORRESPONDENCE'
+    if re.search(r'receipt|invoice', f):
+        if entity_type == 'TANGIBLE_ASSET': return 'RECEIPT'
+        return 'CORRESPONDENCE' if entity_type in _CORR_ALLOWED else 'OTHER'
     # Unmatched → record + return OTHER
     return 'OTHER'
 ```
