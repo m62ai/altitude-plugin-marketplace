@@ -22,11 +22,11 @@ should behave. If any of these markers are present, add a banner to the review a
 
 | Signal in folder | Mode | Implications |
 |---|---|---|
-| `divorce`, `MSA`, `Judgment`, `schedule of assets`, `FL-150`, `Kevin Divorce Documents` | **Divorce / post-divorce** | Expect HISTORICAL spouse, joint-trust division, community property allocation. Expect the final MSA/Judgment to be authoritative — if missing, defer ownership decisions. Treat ex-spouse as Contact (optionally Individual for historical SPOUSE). |
+| `divorce`, `MSA`, `Judgment`, `schedule of assets`, `FL-150`, `<client> divorce documents` | **Divorce / post-divorce** | Expect HISTORICAL spouse, joint-trust division, community property allocation. Expect the final MSA/Judgment to be authoritative — if missing, defer ownership decisions. Treat ex-spouse as Contact (optionally Individual for historical SPOUSE). |
 | `prenuptial`, `transmutation`, `Cal Fam Code §852` | **CP transmutation** | All pre-marital separate property may now be community. Don't assume pre-2025 ownership carries forward. |
 | `estate of`, `probate`, `letters testamentary` | **Post-death** | Primary individual may be deceased. Use `lifecycleStatus=DECEASED` and `dateOfDeath`. Estate is the active entity, not the individual. |
 | `prospect`, unsigned client agreement | **Pre-engagement** | Record client-since date. Anything dated before the signed client agreement is prospect data. |
-| Folder from partner firm (e.g. Verita Partner Share) with `USE THESE PER ...` or `LATEST` or `FINAL` directory/filename prefixes | **Authority markers** | Prefer files in authority-marked folders over other sources when resolving conflicts. |
+| Folder from partner firm (e.g. <partner firm> Share) with `USE THESE PER ...` or `LATEST` or `FINAL` directory/filename prefixes | **Authority markers** | Prefer files in authority-marked folders over other sources when resolving conflicts. |
 
 **For the Divorce mode specifically**: (a) Every joint-titled asset belongs in **Tier B —
 Pending MSA** until the final judgment specifies allocation. Don't create joint-trust
@@ -48,7 +48,7 @@ Instead:
 - Track aggregate exposure as supplemental attributes on the parent trust or account
   ("Total Accel carry: $120M unrealized, $40M side-funds")
 - If the client wants entity-level tracking, create a single umbrella LegalEntity
-  (e.g. "Accel Carry — Comolli Family Trust") with supplemental attributes listing the
+  (e.g. "Accel Carry — the household's Trust") with supplemental attributes listing the
   component funds
 - Full fund list stays in the extraction cache (`altitude_review/extraction_cache.jsonl`)
   for audit / future refinement
@@ -98,7 +98,7 @@ curl -s "${BASE}/user?firmId=${FIRM_ID}&size=200" -H "X-API-Key: ${API_KEY}" \
 
 Then for every Contact candidate, block creation if ANY of these match:
 - The candidate's email is in the firm users list (exact match)
-- The candidate's email domain matches the firm's domain (e.g. `@veritawealth.com`, `@m62.ai`)
+- The candidate's email domain matches the firm's domain (e.g. `@<firm-domain>.com`, `@m62.ai`)
 - The candidate's full name (first+last, case-insensitive) matches a firm user
 
 If matched, record in `altitude_review/firm_users_skipped.md` (name + why) and skip Contact
@@ -108,7 +108,7 @@ client. The FirmTeam admin flow handles attachment to the household.
 **Who SHOULD be a Contact:**
 - External professionals: outside attorneys, outside CPAs, insurance agents at external
   brokerages, prior-firm advisors (e.g. pre-transition), corporate trustees from other
-  companies (e.g. San Pasqual Fiduciary Trust Company)
+  companies (e.g. an independent corporate trustee)
 - Family members and personal contacts (healthcare agents, successor trustees, guardians,
   executors who are individuals)
 - Vendors / service providers (property managers, household staff when recorded as Contacts,
@@ -121,10 +121,9 @@ client. The FirmTeam admin flow handles attachment to the household.
 - Firm interns
 - **Any email ending in the firm's domain**
 
-Real example: the Comolli onboarding run created Christine Leong Connors, Matt Kirby,
-Autumn Anderson, Sean Rumrill, and Kelly Coffey (all `@veritawealth.com`) as Contacts +
-ADVISOR relationships. They belong on the Comolli Family Household's FirmTeam, not as
-per-household Contacts. All 5 were deleted from prod as cleanup.
+Real example: a recent onboarding run wrongly created 5 firm employees (all matching the
+firm's email domain) as Contacts + ADVISOR relationships. They belong on the household's
+FirmTeam, not as per-household Contacts. Always run the precheck above first.
 
 ## Prerequisites
 
@@ -3170,7 +3169,7 @@ passing it as `sessionId` fails with HTTP 404 `Document upload session not found
 curl -s -X POST "${BASE}/document-upload-session" \
   -H "X-API-Key: ${API_KEY}" -H "X-Firm-Id: ${FIRM_ID}" \
   -H "Content-Type: application/json" \
-  -d '{"sessionName": "Comolli onboarding upload"}'
+  -d '{"sessionName": "the household onboarding upload"}'
 ```
 
 Returns:
