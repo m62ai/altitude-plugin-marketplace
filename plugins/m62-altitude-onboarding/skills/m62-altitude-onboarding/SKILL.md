@@ -918,23 +918,29 @@ For each contact in the household:
 GET /api/v1/contact/{id}
 ```
 
-For tangible assets, query by owner:
+**⚠ Endpoint-choice warning** — For TangibleAsset / Liability / InsurancePolicy,
+two forms exist per entity:
+- `/{entity}/by-individual/{id}`, `/by-household/{id}`, `/by-legal-entity/{id}` — read
+  the direct FK column only; **does NOT traverse entity relationships**. An asset owned
+  only via an OWNERSHIP relationship (no FK set) is invisible to these endpoints.
+- `/{entity}/by-owner/{ENTITY_TYPE}/{id}` — traverses the entity-relationship graph.
+  Returns a strict superset of the FK-only endpoint.
+
+**Always use `/by-owner/{TYPE}/{id}` for Phase 1 discovery.** The narrower endpoints
+exist for backwards compatibility but have produced false-negative results in past
+onboarding runs (gap analysis, 2026-04-22). Until the backend unifies them, use:
+
 ```
 GET /api/v1/tangible-asset/by-owner/INDIVIDUAL/{individualId}
 GET /api/v1/tangible-asset/by-owner/LEGAL_ENTITY/{legalEntityId}
-```
+GET /api/v1/tangible-asset/by-owner/HOUSEHOLD/{householdId}
 
-For liabilities (query by individual/household):
-```
-GET /api/v1/liability/by-individual/{individualId}
-GET /api/v1/liability/by-household/{householdId}
-```
+GET /api/v1/liability/by-owner/INDIVIDUAL/{individualId}
+GET /api/v1/liability/by-owner/HOUSEHOLD/{householdId}
 
-For insurance policies (query by individual/household/legal entity):
-```
-GET /api/v1/insurance-policy/by-individual/{individualId}
-GET /api/v1/insurance-policy/by-household/{householdId}
-GET /api/v1/insurance-policy/by-legal-entity/{legalEntityId}
+GET /api/v1/insurance-policy/by-owner/INDIVIDUAL/{individualId}
+GET /api/v1/insurance-policy/by-owner/LEGAL_ENTITY/{legalEntityId}
+GET /api/v1/insurance-policy/by-owner/HOUSEHOLD/{householdId}
 ```
 
 Store all of this as the **"Altitude Universe"** — the complete current state of the
@@ -2511,13 +2517,22 @@ Write a persistent state file after every Phase 6/7 action to enable incremental
 
 **On rerun behavior:**
 - Before Phase 1: Check if `run_state.json` exists. If yes, load it and ask the user:
-  "Previous run found (dated {runDate}). Options: (A) Resume — skip already-created entities,
-  only create missing ones + retry failed uploads. (B) Force rerun — re-extract all documents
-  and recreate everything. (C) Upload only — skip entity creation, just upload remaining documents."
+  "Previous run found (dated {runDate}, status={status}). Options:
+  **(A) Resume** — skip already-created entities, only create missing ones + retry failed uploads.
+  **(B) Force rerun** — re-extract all documents and recreate everything.
+  **(C) Upload only** — skip entity creation, just upload remaining documents.
+  **(D) Gap analysis** — no destructive actions; re-query Altitude, diff against the last
+  `run_state.json`, report any entities that got orphaned / relationships that got deleted /
+  fields that got cleared / enum constraints that were added since the last run. Output:
+  `altitude_review/rerun_analysis_{YYYY-MM-DD}.md`. No writes until you approve individual
+  gap fixes."
 - **Resume mode**: For each entity in the state file with status CREATED, skip creation.
   For documents with status UPLOADED, skip upload. For FAILED documents, retry.
 - **Force mode**: Delete the state file and start fresh.
 - **Upload only**: Skip Phases 1-6, only run Phase 7 using entity IDs from the state file.
+- **Gap analysis mode**: Default when `status=COMPLETE`. Performs Phase 1 (re-query) +
+  targeted diff against saved state, writes `rerun_analysis_{date}.md` listing fixable
+  gaps with per-gap approval.
 
 Update the state file after EVERY successful API call (not just at the end). This way, if the
 run is interrupted mid-way, the next run can resume from where it stopped.
@@ -3993,11 +4008,91 @@ POST /api/v1/document/{trustAgreementDocId}/associations?entityType=INDIVIDUAL&e
     lease schedule, or insurance policy lists a leased vehicle, leased aircraft, leased
     watercraft, or any leased tangible item, create a TangibleAsset for it. Do NOT ask the
     user "is this leased?" as if that's a disqualifier. Leased assets belong to the client's
-    effective holdings and the liability side is tracked via a companion Liability (lease
-    payable). Set `acquisitionType: "LEASE"` on the TangibleAsset and note lessor details
-    in the asset description. Create an accompanying Liability with
+    effective holdings. Set `acquisitionType: "LEASE"` on the TangibleAsset (merged in PR
+    #199 on 2026-04-22) and prefix `name` with `"(Leased) "` so the lease status is
+    obvious in every UI. Record lessor, monthly payment, lease term, expiration, and
+    mileage allowance in `description`. Create a companion Liability with
     `liabilityType: "AUTO_LOAN"` (for vehicles), `"AIRCRAFT_LOAN"`, `"BOAT_LOAN"`, or
-    `"PERSONAL_LOAN"` and record the lease term + remaining payments.
+    `"PERSONAL_LOAN"` so the obligation rolls up correctly.
+
+52. **TangibleAsset POST must set `individualId` or `legalEntityId` FK.** The
+    `entity_relationship` OWNERSHIP row alone is NOT sufficient for
+    `/tangible-asset/by-household/{id}` and `/by-individual/{id}` query endpoints — they
+    read the FK column, not the relationship graph. Assets created without the FK become
+    invisible in the household detail UI and Household.totalTangibleAssetValue stays null.
+
+    Always pick the primary owner (single IND or LE) and set it on the POST:
+    ```
+    POST /api/v1/tangible-asset/real-property
+    {"name": "...", "category": "REAL_PROPERTY", "assetType": "PRIMARY_RESIDENCE",
+     "currentValue": 5000000, "individualId": "<primary owner UUID>"}
+    ```
+    - Joint spousal ownership → FK = primary G1 spouse, relationship = other spouse at 50%
+    - Single-member LLC-owned property → FK = legalEntityId of the LLC
+    - Trust-owned → FK = legalEntityId of the trust
+    - If you already need `/by-owner/{TYPE}/{id}` results (relationship-traversing
+      endpoint, more complete), use that form instead of `/by-individual/` or
+      `/by-household/`. See Phase 1.3 note.
+
+53. **Corporate trustees, trust companies, and fiduciary firms are LegalEntities — NOT
+    Contacts.** Before POSTing any Contact, run the candidate name through the
+    corporate-pattern regex:
+
+    ```python
+    CORP_PATTERN = re.compile(
+        r"\b(LLC|LLP|LP|Inc|Corporation|Corp|Company|Co\.|Trust Company|Trust Co"
+        r"|Bank|N\.A\.|FSB|Services|Group|Holdings|Partners|Associates"
+        r"|Capital|Management|Advisors|Fiduciary|Agents?)\b", re.IGNORECASE)
+    ```
+
+    If matched, OR the name has no clear first/last structure (single run > 3 words with
+    no comma), escalate to LegalEntity with `entityType=TRUST_COMPANY` (or `OTHER` if
+    the enum doesn't include TRUST_COMPANY). Wire TRUSTEE as an LE→LE relationship, not
+    IND→LE. Common anti-pattern: a corporate trustee saved as a Contact with
+    `firstName="Some Trust"`, `lastName="Company of Delaware"` — obviously not a real
+    person. The corporate-pattern regex catches this on "Trust Company".
+
+54. **Every TRUST LegalEntity needs these detail fields (commonly missed).** Parallel to
+    Rule 33 for LLCs.
+
+    **Top-level fields** — PATCH via `/api/v1/legal-entity/{id}`:
+    - `jurisdiction` — full state name (e.g., `"Delaware"`) — NOT the same as
+      `incorporationState` (which is the 2-letter code)
+    - `addressPrincipal` — trust situs, typically the corporate trustee's address
+    - `registrationNumber` — drafting-firm document reference; commonly embedded in
+      filename as `(243129930.1)` or in the trust cover page
+
+    **Trust governance fields** — nested under `trust.*` but the regular `/legal-entity/{id}`
+    PATCH does NOT propagate them (null-safe merge only runs on the dedicated endpoint).
+    **Use the trust-governance endpoint**: `PATCH /api/v1/legal-entity/{id}/trust` with
+    merge-patch JSON:
+    ```
+    PATCH /api/v1/legal-entity/{id}/trust
+    Content-Type: application/merge-patch+json
+    {
+      "isGrantor": true,          // grantor trust for income tax purposes (§671-679)
+      "isRevocable": false,       // most irrevocable trusts after formation
+      "isRestatement": false,
+      "governingLaw": "Delaware", // state whose law governs
+      "situs": "Delaware",        // where the trust is administered (may differ)
+      "hasSpendthriftProvision": true,
+      "gstExemptionStatus": "ALLOCATED" | "NOT_ALLOCATED" | "PARTIAL",
+      "trustPurpose": "...",
+      "perpetuitiesPeriod": "..."
+    }
+    ```
+
+    **DO NOT use `taxClassification`** on the trust to record grantor-trust status —
+    that field is a W-9-style classification enum (`[OTHER, LLC, PARTNERSHIP, S_CORPORATION,
+    C_CORPORATION, RETIREMENT_PLAN, TRUST_ESTATE, INDIVIDUAL_SOLE_PROPRIETOR_OR_SINGLE_MEMBER_LLC,
+    LLC_PARTNERSHIP, LLC_C_CORPORATION, LLC_S_CORPORATION]`) and does not contain
+    `GRANTOR_TRUST`. Use `trust.isGrantor: true` instead.
+
+    **Grantor-trust detection heuristics** (from the trust memo or agreement):
+    - "grantor trust for income tax purposes" → `isGrantor: true`
+    - §671-679 references, IDGT, "intentionally defective grantor trust" → `isGrantor: true`
+    - "non-grantor trust", §678 → `isGrantor: false`
+    - GST-exempt dynasty trust alone does NOT imply grantor status — orthogonal
 
 ---
 
