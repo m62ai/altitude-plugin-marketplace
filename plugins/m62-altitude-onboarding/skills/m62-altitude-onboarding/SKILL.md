@@ -81,6 +81,70 @@ Rule of thumb before PATCHing:
    supplementalAttributeValues, Altitude-side metadata)
 3. If you must PATCH a synced field, leave a note in the review flagging the sync conflict risk
 
+## Auto-HISTORICAL SPOUSE when divorce signals are present
+
+If any file in the folder matches the Divorce / post-divorce life-event signals (MSA,
+Judgment, schedule of assets, FL-150, protective-order stipulation, "divorce decree", etc.),
+the SPOUSE relationship MUST be created HISTORICAL, not current:
+
+```json
+{
+  "relationshipType": "SPOUSE",
+  "sourceEntityType": "INDIVIDUAL", "sourceEntityId": "<clientA>",
+  "targetEntityType": "INDIVIDUAL", "targetEntityId": "<clientB>",
+  "effectiveTo": "<decree date | stipulation date | best available divorce-milestone date>",
+  "role": "Former spouse (divorced <date> per <source doc>)"
+}
+```
+
+**Priority for `effectiveTo`**:
+1. Final MSA / Judgment of Dissolution date (if in folder)
+2. Court-filed stipulation date (e.g. "Stip re Protective Order [F.MM.DD.YY]")
+3. Date of earliest divorce filing visible in the folder
+4. If none available, create the SPOUSE WITHOUT `effectiveTo` but flag in Open Questions
+   "No divorce decree date found — SPOUSE marked current until MSA is produced"
+
+**DO NOT** create the SPOUSE as current with `role: "Spouse (separation pending divorce)"` —
+the frontend renders it as "married" regardless of role. Use `effectiveTo` to make it
+HISTORICAL. If unknown, either omit the relationship entirely or flag the date gap.
+
+**Caveat — field-nulling limitation**: Spring merge-patch ignores null values on
+`entity-relationship` PATCH, so setting `effectiveFrom` to null after creation does NOT
+work. Always set `effectiveFrom` correctly (or OMIT it) AT CREATION time. For SPOUSE where
+the marriage date is unknown, omit `effectiveFrom` at POST time rather than defaulting to
+"today".
+
+## Always create PARENT/CHILD edges for household children
+
+The Household→Individual OWNERSHIP relationship (skill default) establishes MEMBERSHIP but
+NOT family structure. The frontend's family tree, estate plan chart, and beneficiary
+flowchart ALL depend on `PARENT` (and inverse `CHILD`) edges. After creating the Household
+OWNERSHIP edges, also create:
+
+For each minor-or-adult child in the household with at least one identified parent:
+```json
+{
+  "relationshipType": "PARENT",
+  "sourceEntityType": "INDIVIDUAL", "sourceEntityId": "<parent-individual>",
+  "targetEntityType": "INDIVIDUAL", "targetEntityId": "<child-individual>",
+  "effectiveFrom": "<child's DOB>",
+  "role": "Biological parent"  // or "Adoptive parent", "Step-parent"
+}
+```
+
+**Cardinality**: PARENT has `maxCardinality: 2` on the target — a child can have max 2
+PARENT edges. Create one per identified biological/legal parent. If only one parent is
+identified (e.g. the non-client parent is unknown or deceased), create just the one edge.
+
+**Include the ex-spouse as a parent**: In post-divorce cases where the ex-spouse is the
+children's other parent, the ex-spouse needs to be an Individual (not just a Contact) to
+serve as the PARENT source. Always create the ex-spouse as an Individual with HISTORICAL
+SPOUSE, THEN create PARENT edges from BOTH parents to each child.
+
+**Inverse CHILD edges**: the `EntityRelationshipType` enum maps `PARENT ↔ CHILD` as inverse
+reciprocals (see `getInverseType()`). Depending on the backend version, creating PARENT may
+or may not auto-create CHILD. Verify after creation; if missing, create CHILD explicitly.
+
 ## Firm users are NOT Contacts — check before creating
 
 Advisors, analysts, COOs, client-service staff, and any other employee of the firm that
