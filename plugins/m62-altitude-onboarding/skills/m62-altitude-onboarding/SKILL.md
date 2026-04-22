@@ -81,6 +81,51 @@ Rule of thumb before PATCHing:
    supplementalAttributeValues, Altitude-side metadata)
 3. If you must PATCH a synced field, leave a note in the review flagging the sync conflict risk
 
+## Firm users are NOT Contacts — check before creating
+
+Advisors, analysts, COOs, client-service staff, and any other employee of the firm that
+owns this household are already system Users and will be attached to the household via its
+**FirmTeam** membership (separate admin flow). Do NOT create them as per-household Contacts.
+
+**Mandatory precheck — before POSTing ANY Contact:**
+
+```bash
+# Get the firm's users once at the start of the run and cache them
+curl -s "${BASE}/user?firmId=${FIRM_ID}&size=200" -H "X-API-Key: ${API_KEY}" \
+  | jq -r '(.content // .)[] | "\(.email // .login)\t\(.firstName) \(.lastName)"' \
+  > altitude_review/firm_users.tsv
+```
+
+Then for every Contact candidate, block creation if ANY of these match:
+- The candidate's email is in the firm users list (exact match)
+- The candidate's email domain matches the firm's domain (e.g. `@veritawealth.com`, `@m62.ai`)
+- The candidate's full name (first+last, case-insensitive) matches a firm user
+
+If matched, record in `altitude_review/firm_users_skipped.md` (name + why) and skip Contact
+creation entirely. They are NOT the client's relationship — they are the firm serving the
+client. The FirmTeam admin flow handles attachment to the household.
+
+**Who SHOULD be a Contact:**
+- External professionals: outside attorneys, outside CPAs, insurance agents at external
+  brokerages, prior-firm advisors (e.g. pre-transition), corporate trustees from other
+  companies (e.g. San Pasqual Fiduciary Trust Company)
+- Family members and personal contacts (healthcare agents, successor trustees, guardians,
+  executors who are individuals)
+- Vendors / service providers (property managers, household staff when recorded as Contacts,
+  marina managers, etc.)
+
+**Who should NOT be a Contact (belongs on FirmTeam instead):**
+- The firm's lead advisor, co-advisor, junior advisors, analysts, planners
+- Firm operations (COO, CTO, compliance officer, head of ops)
+- Firm client-service team (client-service associates, administrative staff)
+- Firm interns
+- **Any email ending in the firm's domain**
+
+Real example: the Comolli onboarding run created Christine Leong Connors, Matt Kirby,
+Autumn Anderson, Sean Rumrill, and Kelly Coffey (all `@veritawealth.com`) as Contacts +
+ADVISOR relationships. They belong on the Comolli Family Household's FirmTeam, not as
+per-household Contacts. All 5 were deleted from prod as cleanup.
+
 ## Prerequisites
 
 ### Required Tools
