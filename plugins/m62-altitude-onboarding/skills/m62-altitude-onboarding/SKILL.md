@@ -1665,7 +1665,8 @@ For each document, extract:
 - Regulatory: accreditedInvestorStatus, isPoliticallyExposedPerson
 - Beneficiary: transferOnDeath beneficiaries
 - Lifecycle: dateOfDeath, lifecycleStatus
-- Profession: occupation, employer
+- Profession: occupation, employerName (DTO field is `employerName`, NOT `employer` —
+  PATCHing `{employer: "..."}` is silently dropped), jobTitle
 
 **Legal Entities:**
 - Core: legalName, entityType, formationDate, jurisdiction, incorporationState, incorporationCountry
@@ -4669,7 +4670,7 @@ Write file tracker to: {folder}/altitude_review/file_tracker_batch_{N}.md
 ## What to Extract (per file)
 For EACH file, append one JSONL line to your cache with:
 - file: relative path
-- entities.individuals: [{name, dob, ssn, gender, address, email, phone, occupation, employer}]
+- entities.individuals: [{name, dob, ssn, gender, address, email, phone, occupation, employerName, jobTitle}]
 - entities.legalEntities: [{name, type, ein, formationDate, jurisdiction, state, managementType}]
 - entities.accounts: [{name, accountNumber, custodian, accountCategory, subCategory}]
 - entities.tangibleAssets: [{name, category, assetType, address, value, serialOrIdentifier}]
