@@ -145,6 +145,50 @@ SPOUSE, THEN create PARENT edges from BOTH parents to each child.
 reciprocals (see `getInverseType()`). Depending on the backend version, creating PARENT may
 or may not auto-create CHILD. Verify after creation; if missing, create CHILD explicitly.
 
+## Vendor firms and institutions are Contacts, NOT LegalEntities
+
+**Rule**: A `LegalEntity` in Altitude represents an entity the household has an **ownership,
+beneficial, fiduciary (as grantor/trustee/beneficiary), or membership** interest in —
+trusts they created, LLCs they own, partnerships they're a partner in, corporations they
+hold shares of. Everything else is a Contact, even if it is technically a corporation in
+the real world.
+
+**Do NOT create a LegalEntity for**:
+- **Corporate trustees / executor firms** providing fiduciary service (e.g. fiduciary trust
+  companies, professional executor services). Create the company as a Contact with
+  `jobTitle: "Corporate Trustee"` or `biography: "<company name>"`; use an individual
+  officer's Contact if a specific person is named in the trust/will.
+- **Schools / universities** the client or their children attend. Create as a Contact with
+  `jobTitle: "School"` or similar, or just note in Individual's supplemental attributes.
+- **Custodian banks** (Schwab, Fidelity, Merrill, Wells Fargo, etc.) — these are modeled
+  separately as `Custodian` entities on accounts. Never a LegalEntity.
+- **Law firms, accounting firms, advisory firms** whose individual professionals we've
+  already created as Contacts. The firm name lives on the Contact's `biography`.
+- **Investment fund vehicles** the client indirectly holds via a carry/side-fund interest
+  (see "Fund-entity flood" — aggregate at the parent trust, don't create per-fund entities).
+- **Government agencies, courts, tax authorities, registrars** mentioned in documents.
+- **Vendors** (property management companies, insurance brokerages, auction houses, galleries,
+  etc.) — Contact with biography identifying the firm.
+
+**DO create a LegalEntity for**:
+- Trusts the household is the grantor/beneficiary/trustee of
+- LLCs / LPs / partnerships the household owns or is a member/partner of
+- Corporations the household holds shares in (if material and tracked at entity level)
+- DAFs and private foundations the household funded
+- Operating companies the household controls
+- Holdco entities in the household's ownership chain
+
+**If in doubt, ask**: "Does the household have an ownership, fiduciary, or beneficial
+interest in this entity, OR is it just providing a service?" Services → Contact. Interest
+→ LegalEntity.
+
+Example miss: a recent onboarding created "San Pasqual Fiduciary Trust Company" (a
+corporate trustee providing fiduciary service) as a LegalEntity with EXECUTOR and
+SUCCESSOR_TRUSTEE relationships pointing to it. Correct model: San Pasqual is a Contact
+(the individual officer or the company with `jobTitle: "Corporate Trustee"`), and the
+EXECUTOR / SUCCESSOR_TRUSTEE relationships originate from the Contact using the
+CONTACT→INDIVIDUAL / CONTACT→LEGAL_ENTITY validator rules.
+
 ## Firm users are NOT Contacts — check before creating
 
 Advisors, analysts, COOs, client-service staff, and any other employee of the firm that
@@ -746,6 +790,7 @@ to find specific endpoints or schema definitions.
 ## Workflow Overview
 
 ```
+Phase 0.5: External Sources    → Load firm-CRM / advisor-DB / custodian-API records as authoritative data
 Phase 1:   Query Altitude       → Find existing household + its full entity universe
 Phase 2:   Scan Documents       → Classify ALL files, create read-tracking checklist
 Phase 3:   Extract Entities     → PARALLEL agents read files, write extraction caches
@@ -830,6 +875,171 @@ Agent(
 
 Launch ALL extraction agents in a **single message** so they run in parallel.
 Do NOT launch them sequentially — that defeats the purpose.
+
+---
+
+## Phase 0.5: External-Source Preload (pluggable, run BEFORE Phase 1)
+
+Many firms maintain authoritative client data **outside** the household document folder:
+CRM exports, Salesforce / HubSpot databases, internal wealth-platform APIs, custodian
+data feeds, partner-firm shared drives, or household-spreadsheet templates. Fields in
+these sources (DOB, SSN, email, phone, billing rates, outside-advisor rosters) are often
+**more complete and more canonical** than what lives in discovery-folder documents —
+they're the firm's system of record.
+
+Loading these BEFORE Phase 1 lets the skill treat their fields as authoritative
+extraction records (with `asOfDate = source timestamp`), so Phase 4's latest-date-wins
+resolution naturally favors them over stale PDFs.
+
+### Rule — always check for external sources first
+
+Before starting Phase 1, ask or auto-detect:
+
+> Are there any firm-side authoritative data sources for this household that I should
+> load before reading documents? Examples: CRM exports, Salesforce queries, an internal
+> platform API, shared-drive spreadsheets maintained by the advisor team, custodian
+> direct feeds, or a household intake spreadsheet.
+
+If the user has one, connect it. If they don't, proceed directly to Phase 1.
+
+### Source adapter interface
+
+**External sources are pluggable — never hard-code "CSV" as the only shape.** Implement
+a thin adapter per source type. Each adapter must produce the same shape so downstream
+phases don't care where the data came from:
+
+```python
+# altitude_external_source.py — base protocol
+from typing import Protocol, Iterable
+from dataclasses import dataclass
+
+@dataclass
+class ExternalRecord:
+    source_name: str          # "verita-crm", "salesforce", "advisor-platform-api", ...
+    record_type: str          # "household" | "individual" | "contact" | "billing" | "entity" | "service_partner" | ...
+    household_key: str        # normalized household identifier (name, external id, etc.)
+    fields: dict              # flat dict of field -> value
+    as_of_date: str           # ISO date — used for latest-date-wins
+    provenance: dict          # {"file": "...", "row": 42, "url": "...", "query": "..."} — auditable
+
+class ExternalSource(Protocol):
+    def detect(self, household_folder: str, config: dict) -> bool: ...
+    def load(self, household_folder: str, config: dict) -> Iterable[ExternalRecord]: ...
+```
+
+### Adapter catalog — known source types
+
+| Source type | Example | Detection | Auth |
+|---|---|---|---|
+| **File-based CSV export** | Verita's `/Partner Share - Altitude/CRM/*.csv`, firm-drive "Client Masters" | Walk up from the household folder looking for `../../CRM/*.csv` or a configured `crm_paths`; hydrate files first (Step 2.0) | Filesystem ACL |
+| **File-based spreadsheet intake** | Household onboarding worksheet (`Client Information Sheet.xlsx`) | Exists inside the household folder at `Onboarding/*.xlsx` with recognized tab names | Filesystem |
+| **Firm internal API** | A `GET /crm/households/{name}` against the firm's platform | Config provides `crm_api_base` + `crm_api_key` | Bearer / API key |
+| **Salesforce / HubSpot** | SOQL/REST query for matching Household account | Config provides OAuth tokens | OAuth |
+| **Custodian direct feed** | Schwab/Fidelity client master, Addepar client export | Config provides custodian credentials | OAuth / API key |
+| **Database (Postgres / BigQuery / etc.)** | Firm's internal client DB | Config provides connection string; query by last name | DSN / service account |
+| **Another Altitude tenant** (partner-firm handoff) | Partner firm's cross-firm household export | Config provides source tenant + API key | API key |
+
+Implementation strategy:
+
+1. **Start with what you have**. For Verita today that's CSV. Implement
+   `VeritaCrmCsvSource` (4 CSVs: Client_Households_Export, Connections_Export,
+   Leads_Export, Service_Partners_Export).
+2. **Make the interface source-agnostic from day one** so adding `VeritaApiSource` or
+   `SalesforceSource` tomorrow doesn't require rewiring Phase 4.
+3. **Cache provenance aggressively** — `ExternalRecord.provenance` should let Phase 5
+   reviewers trace every field back to row 42 of that CSV or GET call XYZ.
+
+### Field-mapping contract
+
+Every adapter outputs normalized field names matching Altitude's DTO vocabulary, NOT the
+external source's column names. This keeps Phase 4 simple — it doesn't need to know
+that CRM calls SSN "Tax ID" and Salesforce calls it "tax_identifier". The adapter does
+that translation.
+
+Example — a Verita CRM Client_Households_Export row maps to:
+
+```python
+ExternalRecord(
+    source_name="verita-crm",
+    record_type="individual",
+    household_key="Levine",
+    fields={
+        "firstName": "Adam", "lastName": "Levine",
+        "dateOfBirth": "1979-03-18",
+        "ssn": "620109754",                  # 9 digits, dashes stripped
+        "email": "fauxlife@icloud.com",
+        "phoneNumberPrimary": "8054525852",  # digits only
+        "occupation": "Executive",
+        "employerName": None,                # CRM says "Self-employed" — map to null, not a string
+        "gender": None,                      # blank in CRM, will fill from DL in docs
+    },
+    as_of_date="2026-04-22",                 # CRM export date (mtime of source file)
+    provenance={"source": "Client_Households_Export.csv", "row": 1,
+                "path": "/Partner Share - Altitude/CRM/Client_Households_Export.csv"},
+)
+```
+
+### Merging external records into the extraction cache
+
+Phase 3's extraction cache (`extraction_cache.jsonl`) accepts one JSON line per
+**document**. External records are conceptually similar — one line per **external row
+or record**. Add them to the same cache with a synthetic "file" key so the rest of the
+pipeline treats them uniformly:
+
+```jsonl
+{"file": "[external:verita-crm] Client_Households_Export.csv row 1", "readAt": "2026-04-22T12:00Z", "fileNumber": -1, "asOfDate": "2026-04-22", "entities": {"individuals": [{"name": "Adam Levine", "dob": "1979-03-18", "ssn": "620109754", "_source_kind": "external_crm"}]}}
+{"file": "[external:verita-crm] Service_Partners_Export.csv row 3", "readAt": "2026-04-22T12:00Z", "fileNumber": -2, "asOfDate": "2026-04-22", "contacts": [{"firstName": "Chris", "lastName": "Maguire", "jobTitle": "Manager", "biography": "Full Stop Management", "_source_kind": "external_crm"}]}
+```
+
+Negative `fileNumber` values mark external records so Phase 3M can filter/count them
+separately from document extractions. `asOfDate` drives latest-date-wins (Rule 40).
+
+### Billing, fees, team assignments
+
+CRM / external sources are usually the **only** place where household-level billing
+terms and firm-team assignments live — they don't appear in trust agreements or tax
+returns. Always map these fields if the external source has them:
+
+- `Household.billing.*` (feeStructure, feePercent, minimumFee, frequency, method)
+- `Household.firmTeam` (AL Team, CP Team — FirmTeam assignment, NOT Contacts)
+- Outside professionals roster (Service Partners) — these become Contacts via the same
+  cross-doc dedup rules as document-sourced Contacts
+
+### Security constraints
+
+External sources commonly contain unredacted SSN, SIN, DOB, and billing data. Treat
+with same discipline as Rule 9 (sensitive data):
+
+1. Never log raw SSN or tax IDs — only the last 4 on trace logs.
+2. Write external-source findings to `altitude_review/sensitive_data.json` if the source
+   returned anything `critical` severity.
+3. Memory-only for OAuth tokens / DSNs — the skill's auth helper (`altitude_auth`) is
+   NOT the right place for firm-DB credentials; use separate `.altitude/external_sources/`
+   config, same `chmod 600` rules.
+
+### Phase 5 review additions
+
+When external sources contributed, the review must have a dedicated section:
+
+```markdown
+## External-Source Contributions
+
+Loaded before Phase 1:
+- `verita-crm` (CSV): 4 files, 12 records (1 household, 1 individual, 5 contacts, 5 connections, 1 billing)
+- (if present) `verita-api` (REST): 1 household query, 8 field updates
+
+### Fields contributed by external sources (will be queued as auto-fills or latest-date-wins)
+
+| Entity | Field | External Value | Source | asOfDate |
+|--------|-------|---------------|--------|----------|
+| Adam Levine (Individual) | dateOfBirth | 1979-03-18 | verita-crm / Client_Households_Export.csv row 1 | 2026-04-22 |
+| Adam Levine (Individual) | ssn | ***-**-9754 | verita-crm / Client_Households_Export.csv row 1 | 2026-04-22 |
+| Levine Family (Household) | billing.feeStructure | AUM_BASED | verita-crm / Client_Households_Export.csv row 1 | 2026-04-22 |
+| Chris Maguire (new Contact) | — | — | verita-crm / Service_Partners_Export.csv row 1 | 2026-04-22 |
+```
+
+This gives the RM a clear audit trail showing which fields came from firm-internal
+records vs discovery documents.
 
 ---
 
@@ -990,9 +1200,32 @@ two forms exist per entity:
 - `/{entity}/by-owner/{ENTITY_TYPE}/{id}` — traverses the entity-relationship graph.
   Returns a strict superset of the FK-only endpoint.
 
-**Always use `/by-owner/{TYPE}/{id}` for Phase 1 discovery.** The narrower endpoints
-exist for backwards compatibility but have produced false-negative results in past
-onboarding runs (gap analysis, 2026-04-22). Until the backend unifies them, use:
+**Availability matrix (verify at run-time via `OPTIONS` probe or by-individual fallback):**
+
+| Entity | `/by-owner/{TYPE}/{id}` | `/by-individual` | `/by-household` | `/by-legal-entity` |
+|---|---|---|---|---|
+| tangible-asset | ✅ (since launch) | — | ❌ (use /by-owner/HOUSEHOLD) | — |
+| liability | ✅ (PR "backend consistency", 2026-04-23) | ✅ | ✅ | ✅ |
+| insurance-policy | ✅ (PR "backend consistency", 2026-04-23) | ✅ | ✅ | ✅ |
+
+**Always use `/by-owner/{TYPE}/{id}` for Phase 1 discovery** after the 2026-04-23 PR is
+deployed to your target environment. On older builds (pre-PR), the endpoint returns 404
+for `liability` and `insurance-policy` — fall back to the three narrower endpoints. Code
+defensively with an error-shape-aware parser:
+
+```python
+def items(resp):
+    if isinstance(resp, dict) and resp.get("status", 0) >= 400:
+        raise RuntimeError(f"API error: HTTP {resp['status']} — {resp.get('detail', resp)}")
+    if isinstance(resp, list): return resp
+    if isinstance(resp, dict) and "content" in resp: return resp["content"]
+    return []
+```
+
+The skill's legacy `len(resp)` / `resp.get('content', resp)` patterns will silently
+interpret a 404 JSON body (`{"status":404, "detail":..., ...}`) as a page of 7 items
+(the dict's key count) — this was observed on the Levine run 2026-04-23. Always guard
+on `status >= 400` first.
 
 ```
 GET /api/v1/tangible-asset/by-owner/INDIVIDUAL/{individualId}
@@ -2540,6 +2773,35 @@ state to allow resuming if needed.
 - Status: [EXISTS / NEW]
 - Altitude ID: {id or "will create"}
 
+## Fast-Path Summary (read this first)
+
+A one-line-per-entity executive summary so reviewers can skim before diving into field
+tables. Populate as follows:
+
+**Entity state classifications:**
+- **SHELL** — Altitude has the entity by name only; all/most PII fields null.
+  Example: an advisor created the household + primary Individual ahead of onboarding.
+  Implication: nearly everything queued here is a safe FILL, no conflict risk.
+- **POPULATED** — Altitude has meaningful data; extraction adds incremental fills / conflicts.
+- **NEW** — Entity doesn't exist in Altitude; will be POSTed.
+- **SYNCED** — Externally synced (Addepar, Orion, custodian); core fields read-only
+  (see "Addepar / External Sync Discrepancies" section below for what the skill will skip).
+
+| Entity | Altitude State | Fills | Conflicts | Stale | Auto-PATCH Safe? |
+|--------|----------------|-------|-----------|-------|------------------|
+| Adam Levine (Individual) | **SHELL** | 27 | 0 | 0 | ✅ Yes — zero risk |
+| Levine Family Trust (LegalEntity) | NEW | — | — | — | POST |
+| DPG Trust Brokerage (Account) | SYNCED | 2 (tags only) | 0 | 0 | Metadata-only PATCH |
+| Adam's 2020 Restated Trust (LegalEntity) | POPULATED | 4 | 2 | 1 | ⚠ Needs review |
+| Chris Maguire (Contact) | NEW | — | — | — | POST |
+
+**"Auto-PATCH Safe"** is `✅` when: all diffs are FILLs (no conflicts, no stale Altitude
+values, no immutable-field changes). A `SHELL` entity almost always qualifies. Flag any
+entity with conflicts as `⚠ Needs review` and include the full diff below.
+
+**Zero-risk bulk approve**: reviewers should be able to approve all `✅ Yes` rows in one
+action without reading the detail tables — the detail tables are for the `⚠` rows only.
+
 ## Matched Entities (will update)
 
 ### Individual: {Name} (Altitude ID: {id})
@@ -3324,6 +3586,60 @@ via the `role` field.
 | CFO | OFFICER | "Chief Financial Officer" | |
 | COO | OFFICER | "Chief Operating Officer" | |
 
+**Entertainment-industry relationship remaps** (new first-class enums shipped
+2026-04-23; on pre-PR environments, fall back to the legacy mapping). These are
+distinct from the generic ADVISOR / ACCOUNTANT / ATTORNEY roles — a music
+business manager is NOT a CPA, a personal manager is NOT a generic advisor, and
+treating them as such loses industry-specific commission structures and
+fiduciary-duty differences.
+
+| Document-described type | Altitude API (preferred) | Legacy fallback | `role` field example | Notes |
+|---|---|---|---|---|
+| Talent agent / booking agent (CAA / WME / UTA) | `TALENT_AGENT` | `ADVISOR` | "Talent Agent — {agency}" | 10% music, 10% film commission |
+| Personal manager (Full Stop / Azoff / Brillstein) | `PERSONAL_MANAGER` | `ADVISOR` | "Personal Manager — {firm}" | 10-20% commission |
+| Business manager (NKSB / Provident / WG&S) | `BUSINESS_MANAGER` | `ACCOUNTANT` | "Business Manager — {firm}" | **NOT a CPA** — handles bill-pay, bookkeeping, insurance, budget |
+| Tour manager | `TOUR_MANAGER` | `ADVISOR` | "Tour Manager" | Logistics / road operations |
+| Publicist (PMK·BNC / ID / Slate) | `PUBLICIST` | `ADVISOR` | "Publicist — {firm}" | Flat retainer |
+| Record-label A&R / label services contact | `RECORD_LABEL_CONTACT` | `ADVISOR` | "A&R — {label}" | Single point of contact at label |
+| Producer / collaborator | `PRODUCER_COLLABORATOR` | `ADVISOR` | "Producer — {project}" | Creative, not fiduciary |
+| Band member / group partner | `BAND_MEMBER` | `PARTNER` | "Band Member — {band}" | Link Individual→LE(Touring LLC) |
+| Co-writer / co-composer | `CO_WRITER` | `PARTNER` | "Co-Writer — {song/catalog}" | Usually per-song splits |
+| Sync licensing agent | `SYNC_LICENSING_AGENT` | `ADVISOR` | "Sync Agent — {firm}" | Film/TV/ad licensing |
+
+**Entertainment-industry LegalEntityType remaps** (new first-class enums shipped
+2026-04-23 in same PR; pre-PR environments fall back to `CORPORATION` / `LLC` /
+`PARTNERSHIP` + description).
+
+| Document-described entity | Altitude API (preferred) | Legacy fallback | Notes |
+|---|---|---|---|
+| Loan-out corporation ("Adam Levine Productions Inc.", "Smith Inc.", "Touring, Inc.") | `LOAN_OUT_CORPORATION` | `CORPORATION` | Detect by 1120/1120S + W-2 to the Individual; standard actor/musician tax structure |
+| Talent agency (CAA, WME, UTA, Gersh, ICM) | `TALENT_AGENCY` | `CORPORATION` | |
+| Management company (Full Stop, Azoff Cos., Brillstein, 3 Arts) | `MANAGEMENT_COMPANY` | `CORPORATION` / `LLC` | |
+| Record label (UMG, Sony, Warner, Atlantic, Interscope) | `RECORD_LABEL` | `CORPORATION` | |
+| Music/book publishing company (Sony/ATV, UMPG, Warner Chappell) | `PUBLISHING_COMPANY` | `CORPORATION` | |
+| Production company (Plan B, Happy Madison, Bad Robot; personal LLCs) | `PRODUCTION_COMPANY` | `LLC` / `CORPORATION` | |
+| Touring LLC / LP (holds ticketing, crew payroll, tour gear) | `TOURING_LLC` | `LLC` / `LIMITED_PARTNERSHIP` | |
+| Merchandise company (brand licensing, D2C merch) | `MERCH_COMPANY` | `LLC` / `CORPORATION` | |
+
+**Fallback strategy**: If your target environment is on a pre-2026-04-23 build,
+sending the new enum value returns HTTP 400. Wrap POSTs with a try/fallback:
+
+```python
+def post_with_enum_fallback(url, body, preferred_enum_field, preferred_val, legacy_val, role_note):
+    body[preferred_enum_field] = preferred_val
+    resp = requests.post(url, json=body, headers=headers())
+    if resp.status_code == 400 and preferred_val in resp.text:
+        body[preferred_enum_field] = legacy_val
+        # Preserve the intended role in description/role/notes
+        if "role" in body: body["role"] = f"{role_note} (new enum pending deploy)"
+        else: body.setdefault("description", "") + f"\n[ONBOARDING] Preferred: {preferred_val}"
+        resp = requests.post(url, json=body, headers=headers())
+    return resp
+```
+
+Record each fallback in `run_state.enum_mappings` so the RM can do a one-shot
+post-deploy PATCH to promote legacy-mapped entities to the new enum.
+
 **Account `subCategory` remaps** (account POSTs with document-described values that Altitude rejects):
 
 | Document-described | Altitude API | Notes |
@@ -3406,11 +3722,36 @@ Direction matters: the household is the SOURCE, the individual is the TARGET.
 by generation (G1 = oldest generation, G2 = their children, G3 = grandchildren), not by age.
 An adult child (age 25) is still G2. A minor grandchild is G3.
 
-- **ALL members get percentage = 100**.** The household "owns" 100% of each member. This is
+- **ALL members get percentage = 100**. The household "owns" 100% of each member. This is
   what drives the valuation rollup — each member's account values roll up fully to the
   household. Do NOT use 50/50 for couples or 0 for children.
 - **isPrimary**: Set to true for the first G1 member only.
 - Use generational roles (G1/G2/G3) in the `role` field for display purposes only.
+
+> **⚠ Why 100% each (not split shares) — READ THIS, the rule is counterintuitive.**
+>
+> First-time readers consistently flag "100% per member" as a bug: surely two spouses
+> at 100% each is 200% ownership? In every *other* Altitude relationship (IND→LE,
+> IND→ACCT), `percentage` on OWNERSHIP means **fractional economic interest** and must
+> sum to ≤ 100% across owners. Household-Individual OWNERSHIP is the **one exception**
+> where `percentage` encodes **attribution weight** instead.
+>
+> The rollup engine computes `Household.netWorth = Σ (member.netWorth × memberPercentage / 100)`.
+> - If you set each spouse to 50%, the household shows half the family's true net worth.
+> - If you set children to 0% (intuitive, since they're not economic owners), their
+>   UTMA / custodial / beneficiary-interest accounts never roll up and the household
+>   dashboard underreports.
+> - Setting every member to 100% makes the sum equal the **full family** wealth — which
+>   is what the household view is supposed to display.
+>
+> Think of it as "which members contribute fully to the household rollup?" not "what
+> fraction of the member's net worth does the household own?". For cases where a
+> member should NOT contribute fully (e.g. an adult child living at home whose own
+> holdings shouldn't inflate the parents' household dashboard), create them as a
+> separate household rather than fractional membership.
+>
+> Future readers scanning this code for the first time ALWAYS mistake this for a bug.
+> Do not "fix" it to 50/50.
 
 Examples:
 ```
@@ -3569,6 +3910,28 @@ Then upload with `contentType=TXT` and `documentSubType=CORRESPONDENCE` only if 
 target entity type is `ACCOUNT_FINANCIAL`, `TANGIBLE_ASSET`, `INSURANCE_POLICY`, or
 `LIABILITY`. For `INDIVIDUAL` or `LEGAL_ENTITY` targets use `documentSubType=OTHER` —
 their enums do NOT include `CORRESPONDENCE` (per api.json 2026-04-22).
+
+## WARNING — Push-agent enum pitfalls (verified on Levine run 2026-04-23)
+
+When the push agent processes `document_uploads.json`, it MUST use the EXACT
+enum values per the tables in this section. Common mistakes observed on the
+Levine 2026-04-23 production run (7 documents required post-push PATCHes):
+
+| Wrong value used | Error | Correct value |
+|---|---|---|
+| `GOVERNMENT_ID` | 400 | `DRIVERS_LICENSE` / `PASSPORT` / `NATIONAL_ID` / `STATE_ID` — pick the specific type |
+| `TAX_RETURN_1040` | 400 | `FORM_1040` |
+| `ACCOUNT_STATEMENT` on `/individual/` | 400 (not in IndividualDocumentSubType) | `BANK_STATEMENT` / `INVESTMENT_STATEMENT` — OR route the upload to `/account-financial/{id}/document` instead |
+| `ACCOUNT_STATEMENT` on `/account-financial/` | 400 (not in AccountFinancialDocumentSubType) | `BROKERAGE_STATEMENT` / `CUSTODIAL_STATEMENT` / `BANK_STATEMENT` — pick by custodian type |
+| `CORRESPONDENCE` on `/individual/` or `/legal-entity/` | 400 (legitimately not in enum) | Fall back to `OTHER` |
+| `ENGAGEMENT_LETTER` (anywhere) | 400 (no such enum exists) | `OTHER` |
+| Trust agreements left as `OTHER` | silent (accepted) | `TRUST_AGREEMENT` / `TRUST_AMENDMENTS` / `REVOCABLE_TRUST_DOCUMENT` — always classify trust docs |
+
+Before falling back to `OTHER`, consult the per-entity enum table below — on
+the Levine run, ~70% of `OTHER` usage was for document types that DID have a
+specific enum, but under a different name. Always pick the most specific valid
+value from the target entity's enum; only use `OTHER` after confirming no
+option fits.
 
 ### documentSubType — intelligent selection (NEVER default to OTHER)
 
@@ -4212,6 +4575,17 @@ for a reference example (Cummings Family handoff).
     generational roles (G1/G2/G3) in the `role` field for display, `isPrimary: true` on the
     first G1 member only.
 
+    **Why 100% per member is NOT a bug** — this is the single most misread rule in the
+    skill. Household-Individual OWNERSHIP `percentage` encodes **attribution weight**
+    into the rollup, NOT fractional economic ownership (unlike every OTHER OWNERSHIP
+    edge). The rollup is `Household.netWorth = Σ (member.netWorth × memberPct/100)`.
+    Setting spouses to 50/50 halves the household's visible wealth; setting children
+    to 0 hides their custodial/UTMA holdings entirely. 100% each = the full family
+    rolls up. For cases where a member shouldn't fully contribute (adult child
+    living at home), use a separate household, not fractional membership. Full
+    rationale lives inline in Phase 6.3's OWNERSHIP section — read it once and the
+    rule stops looking like a bug.
+
 23. **Create ALL insurance policies — no deprioritization.** Every policy in the insurance
     summary must be created, regardless of size. A $462/yr golf cart policy and a $605/yr
     cyber policy are just as important as a $10M umbrella. The skill extracts them — create them.
@@ -4523,6 +4897,34 @@ for a reference example (Cummings Family handoff).
 
     Only if all three resolve toward "yes LegalEntity" do you POST the LegalEntity.
 
+    **Corporate-pattern regex for DETECTION only** — useful as a first-pass trigger to
+    identify non-natural-person names, which then MUST run through the decision table
+    above (they do NOT automatically become LegalEntity — that was the old wrong rule):
+    ```python
+    CORP_PATTERN = re.compile(
+        r"\b(LLC|LLP|LP|Inc|Corporation|Corp|Company|Co\.|Trust Company|Trust Co"
+        r"|Bank|N\.A\.|FSB|Services|Group|Holdings|Partners|Associates"
+        r"|Capital|Management|Advisors|Fiduciary|Agents?)\b", re.IGNORECASE)
+    ```
+
+    **Orphan-LE cleanup heuristic** — periodically sweep a household's LEs for orphans
+    (LEs with zero active relationships — typically created under the old wrong rule
+    and never wired up):
+    ```python
+    for le in household_les:
+        rels_to = get(f"/entity-relationship/to/LEGAL_ENTITY/{le.id}")
+        rels_from = get(f"/entity-relationship/from/LEGAL_ENTITY/{le.id}")
+        active = [r for r in rels_to + rels_from if not r.effectiveTo]
+        if not active:
+            print(f"ORPHAN CANDIDATE: {le.legalName} — candidate for soft-delete")
+    ```
+
+    **Real-world example from Levine 2026-04-23**: 15 external-firm LEs (clubs, schools,
+    payroll processors, aviation vendors, insurance brokers, management firms, labels,
+    drafting law firms) were auto-created under the old pattern-match rule. Zero
+    relationships attached. All had to be retroactively soft-deleted. The new
+    family-controlled-only test + orphan-LE sweep would have prevented all 15.
+
 54. **Every TRUST LegalEntity needs these detail fields (commonly missed).** Parallel to
     Rule 33 for LLCs.
 
@@ -4656,6 +5058,55 @@ for a reference example (Cummings Family handoff).
     treat as weak negative signal (grantor likely unmarried at drafting time). Always
     surface as an Open Question — never auto-create a SPOUSE relationship on inference
     alone.
+
+58. **EVERY Liability + InsurancePolicy POST needs a paired OWNERSHIP relationship POST.**
+    (Companion to Rule 52 for TangibleAsset.) Creating a Liability or InsurancePolicy
+    entity without an OWNERSHIP edge to an owner means the record is invisible to
+    `/by-household/{id}`, `/by-individual/{id}`, and `/by-owner/{type}/{id}` queries.
+    Rule 52 covers the TangibleAsset FK column (`individualId` / `legalEntityId`); this
+    rule covers Liability and InsurancePolicy which do NOT have an equivalent FK — they
+    rely ENTIRELY on relationship-graph traversal.
+
+    **On the Levine 2026-04-23 production run**, 9 of 12 liabilities and 10 of 11
+    insurance policies were created as orphans. Required post-cleanup: **9 OWNERSHIP
+    edges for liabilities + 14 edges for insurance policies (10 OWNERSHIP + 4 INSURED) =
+    23 relationship POSTs** to make the records visible. by-household count went
+    2→11 (liabilities) and 0→5 (insurance) after the cleanup.
+
+    **Mandatory rule**: For every Liability/InsurancePolicy in `create_payloads.json`,
+    ALSO add an entry to `relationships_to_create.json`:
+
+    ```json
+    {
+      "sourceEntityType": "INDIVIDUAL" | "LEGAL_ENTITY",
+      "sourceEntityId": "<owner UUID>",
+      "targetEntityType": "LIABILITY" | "INSURANCE_POLICY",
+      "targetEntityId": "<entity UUID>",
+      "relationshipType": "OWNERSHIP",
+      "percentage": 100
+    }
+    ```
+
+    **Owner-selection heuristics** (verified on Levine run):
+    - Mortgage / home insurance (homeowners, flood) → owner = trust that holds the home
+      (e.g. Adam Levine Living Trust) OR the primary individual if no trust ownership
+    - Auto loan / auto insurance → owner = individual whose name is on the title
+    - Personal credit cards → owner = individual
+    - Business credit cards (Amex Centurion corporate) → owner = the touring/loan-out LE
+    - Life insurance → OWNERSHIP = ILIT trust (if policy is trust-owned) or individual;
+      ALSO add INSURED relationship from the insured individual to the policy
+    - Disability insurance → OWNERSHIP + INSURED both from the insured individual
+    - Commercial / E&O / umbrella for a business → owner = the business LegalEntity
+
+    For InsurancePolicy, the INSURED edge is separate from OWNERSHIP. When the owner
+    and insured are different (e.g. ILIT-owned life insurance on the grantor), create
+    BOTH edges — the OWNERSHIP edge drives rollup visibility, the INSURED edge drives
+    "policies on this person" queries.
+
+    **Self-audit before Phase 6 execution**: for every Liability/InsurancePolicy slug
+    in `create_payloads.json`, grep `relationships_to_create.json` for a matching
+    target-slug OWNERSHIP entry. If missing, FAIL the push and add the edge before
+    retrying.
 
 ---
 
