@@ -5148,33 +5148,79 @@ for a reference example (Cummings Family handoff).
 
     ### Decision matrix — when to emit OWNERSHIP alongside GRANTOR
 
-    **Irrevocable trusts are NOT owned by the grantor** — they're completed gifts and
-    belong outside the household's rollup. This matters: several "Irrevocable Trust"
-    entities in Verita (Patel, G&S GST, Comolli Descendants, Comolli Exempt) should
-    remain unlinked.
+    **Two kinds of OWNERSHIP edges exist — economic vs. visibility.** Altitude's rollup
+    traversal walks OWNERSHIP edges only. If an irrevocable trust has no OWNERSHIP edge
+    from anything in the household, `/by-owner/HOUSEHOLD/{id}` cannot reach the trust,
+    its beneficiaries, or any assets it holds — the trust + everything inside it is
+    invisible from the household page even though the family's advisor is clearly
+    tracking it.
 
-    | Trust type | GRANTOR | OWNERSHIP 100%? | Rationale |
+    To resolve this without misstating estate inclusion:
+
+    | Edge type | Source → Target | Percentage | Means |
     |---|---|---|---|
-    | Revocable living trust (X Living Trust) | ✅ | ✅ YES | Grantor retains control + IRC §671 ownership |
-    | Joint revocable trust (married couple) | ✅ (each) | ✅ YES — split 50/50 or per contribution | Each grantor owns their contributed share |
-    | Revocable trust sub-trusts during grantor's life (Marital, Children's, Residuary) | ✅ | ✅ YES | Still revocable; part of grantor's estate |
-    | GRAT (Grantor Retained Annuity Trust) | ✅ | ⚠️ PARTIAL — annuity interest only | Defer; Open Question |
-    | IDGT (Intentionally Defective Grantor Trust) | ✅ | ❌ NO | Completed gift; income tax only to grantor |
-    | ILIT (Irrevocable Life Insurance Trust) | ✅ | ❌ NO | Completed gift; outside estate |
-    | GST / Dynasty / Perpetual Trust | ✅ | ❌ NO | Completed gift; multi-generational |
-    | Irrevocable "Exempt" / "Nonexempt" sub-trusts | ✅ | ❌ NO | Completed gifts at funding |
-    | QPRT (Qualified Personal Residence Trust) | ✅ | ⚠️ TERM ONLY | OWNERSHIP during term, none after |
-    | CRT / CRAT / CRUT / CLT | ✅ | ⚠️ income interest only | Defer; Open Question |
-    | Grantor DECEASED | historical | retire OWNERSHIP if was revocable | Revocable becomes irrevocable at death |
+    | **Economic OWNERSHIP** | Individual → Trust | **100%** (or per-contribution split) | Grantor retains IRC §671 ownership; trust value rolls into grantor's net worth |
+    | **Visibility OWNERSHIP** | **HOUSEHOLD** → Trust | **0%** | Trust is reachable from `/by-owner/HOUSEHOLD/{id}` but value does NOT roll into household net worth (`0 × value = 0`). `role` field documents: "Visibility only — irrevocable trust, outside household estate" |
 
-    **Detection heuristics** during extraction:
-    - `trust.isRevocable == true` → definitive. Emit OWNERSHIP.
-    - `trust.isRevocable == false` → definitive. GRANTOR only.
-    - `isRevocable == null` AND filename/name contains "Revocable" / "Living Trust" → assume revocable; emit OWNERSHIP; flag confirmation.
-    - `isRevocable == null` AND name contains "Irrevocable" / "GST" / "ILIT" / "Exempt" / "Dynasty" / "Defective" / "GRAT" / "QPRT" / "CRT" / "CRUT" / "CLAT" / "CRAT" / "Descendants Trust" → assume irrevocable; GRANTOR only; flag confirmation.
+    The HOUSEHOLD (not the grantor Individual) is the source of the visibility edge,
+    which makes the semantic clean: the *household's advisor* administers the trust;
+    the *grantor* does not economically own it.
+
+    **Updated matrix** — every trust connected to the household gets at least a
+    visibility OWNERSHIP edge from HOUSEHOLD; revocable trusts get BOTH the visibility
+    edge AND an economic edge from the grantor Individual:
+
+    | Trust type | Individual → trust GRANTOR | Individual → trust OWNERSHIP (economic) | HOUSEHOLD → trust OWNERSHIP (visibility) | Rationale |
+    |---|---|---|---|---|
+    | Revocable living trust (X Living Trust) | ✅ | ✅ 100% | ✅ 0% | Grantor retains control + IRC §671. Visibility edge for graph traversal; economic edge for rollup. Double-count guard: rollup should prefer the Individual→trust 100% edge over HOUSEHOLD→trust 0% — value rolls up through the Individual's household membership. |
+    | Joint revocable trust | ✅ each | ✅ each (50/50 or per contrib) | ✅ 0% | Same pattern, per-grantor split |
+    | Revocable sub-trusts during grantor's life | ✅ | ✅ 100% | ✅ 0% | Same |
+    | GRAT (Grantor Retained Annuity Trust) | ✅ | ⚠️ annuity interest % | ✅ 0% | Economic edge percentage reflects retained annuity share; visibility edge ensures post-annuity remainder is still trackable |
+    | IDGT (Intentionally Defective Grantor Trust) | ✅ | ❌ NO | ✅ **0%** | Completed gift. Visibility-only — NOT in grantor's estate. `role: "Visibility only — IDGT, completed gift"` |
+    | ILIT (Irrevocable Life Insurance Trust) | ✅ | ❌ NO | ✅ **0%** | Completed gift. Visibility-only. `role: "Visibility only — ILIT, outside estate"` |
+    | GST / Dynasty / Perpetual Trust | ✅ | ❌ NO | ✅ **0%** | Completed gift, multi-gen. Visibility-only. `role: "Visibility only — GST/Dynasty trust"` |
+    | Irrevocable Exempt / Nonexempt sub-trusts | ✅ | ❌ NO | ✅ **0%** | Completed gifts at funding. Visibility-only. |
+    | QPRT (Qualified Personal Residence Trust) | ✅ | ⚠️ term-interest % | ✅ 0% | Economic edge with retained-term percentage; visibility edge ensures post-term residence is still trackable |
+    | CRT / CRAT / CRUT / CLT | ✅ | ⚠️ income-interest % | ✅ 0% | Economic edge for income share; visibility edge for charity-remainder tracking |
+    | Grantor DECEASED (formerly revocable) | historical | retire Individual→trust OWNERSHIP at death | ✅ 0% retained | Revocable becomes irrevocable at death; visibility edge still applies until the trust is fully administered |
+
+    **This REVERSES the earlier "several irrevocable trusts in Verita should remain
+    unlinked" guidance**: Patel, G&S GST, Comolli Descendants, Comolli Exempt all need
+    HOUSEHOLD → LegalEntity OWNERSHIP 0% visibility edges. They remain outside estate
+    rollup (0% × trust value = 0) but become reachable from the household page.
+
+    **Detection heuristics** during extraction (unchanged, plus visibility rule):
+    - `trust.isRevocable == true` → definitive. Emit Individual→trust OWNERSHIP 100% + HOUSEHOLD→trust OWNERSHIP 0%.
+    - `trust.isRevocable == false` → definitive. GRANTOR only on Individual edge; HOUSEHOLD→trust OWNERSHIP 0% for visibility.
+    - `isRevocable == null` AND filename/name contains "Revocable" / "Living Trust" → assume revocable; emit both economic + visibility; flag confirmation.
+    - `isRevocable == null` AND name contains "Irrevocable" / "GST" / "ILIT" / "Exempt" / "Dynasty" / "Defective" / "GRAT" / "QPRT" / "CRT" / "CRUT" / "CLAT" / "CRAT" / "Descendants Trust" → assume irrevocable; HOUSEHOLD→trust OWNERSHIP 0% visibility only; flag confirmation.
     - Document text with "revocable by grantor at any time" / "power of revocation" → revocable.
     - Document text with "irrevocable" + "no power of revocation" → irrevocable.
-    - Ambiguous → GRANTOR only (safer default) + Open Question.
+    - Ambiguous → GRANTOR only on Individual edge + HOUSEHOLD→trust OWNERSHIP 0% + Open Question.
+
+    **Visibility edge POST example** (apply in addition to any Individual-source edges):
+
+    ```json
+    // HOUSEHOLD → irrevocable trust — visibility only, not in estate
+    {
+      "sourceEntityType": "HOUSEHOLD",
+      "sourceEntityId": "<household UUID>",
+      "targetEntityType": "LEGAL_ENTITY",
+      "targetEntityId": "<irrevocable trust UUID>",
+      "relationshipType": "OWNERSHIP",
+      "percentage": 0,
+      "isPrimary": false,
+      "role": "Visibility only — irrevocable trust, outside household estate",
+      "effectiveFrom": "<trust execution or funding date>"
+    }
+    ```
+
+    **Individuals inside irrevocable trusts** (beneficiaries, trust protectors, trustees
+    who are not otherwise household members) need the same treatment if they should be
+    reachable from the household: `HOUSEHOLD → INDIVIDUAL OWNERSHIP 0%` with
+    `role: "Visibility only — trust beneficiary (not household member)"`. Do NOT use
+    100% — that would (a) claim economic ownership of another human being, and
+    (b) incorrectly roll their assets into this household if they have their own.
 
     ### Also applies to client-owned operating LLCs
 
@@ -5188,53 +5234,119 @@ for a reference example (Cummings Family handoff).
     Golden City Padel, Hen House, Fort Point Beer, Promised Land**. All need
     retrofit OWNERSHIP edges.
 
-    ### Third-party / shared entities — do NOT emit OWNERSHIP
+    ### Third-party / shared entities — still no OWNERSHIP
 
-    Null `parentHouseholdId` is semantically correct for:
-    - Entities genuinely held by multiple client households (shared investment vehicle, co-invest LP)
-    - External corporate fiduciaries serving many clients' trusts (Bryn Mawr Trust Co. of Delaware, City National Bank, San Pasqual Fiduciary Trust Company)
+    The visibility-only rule applies to entities the HOUSEHOLD'S advisor tracks.
+    Entities outside that scope still get no OWNERSHIP edge (neither economic nor
+    visibility):
+    - Entities genuinely held by multiple unrelated client households with no single primary advisor (truly shared co-invest vehicles across multiple firms)
+    - External corporate fiduciaries serving many clients' trusts (Bryn Mawr Trust Co. of Delaware, City National Bank, San Pasqual Fiduciary Trust Company) — model as Contact per Rule 53
     - Investment funds clients subscribe to (Leadout Capital I/II, Avenue Sports Opportunities) — client owns their LP interest edge, fund itself has no single household owner
-    - Charitable beneficiary entities (Teen Impact Fund at Children's Hospital)
+    - Charitable beneficiary entities (Teen Impact Fund at Children's Hospital) — model as Contact per Rule 53
 
     In those cases ownership is expressed only through the LP-interest / subscription
     edge, never via parentHouseholdId.
 
+    **Distinction**: "irrevocable trust the grantor established" (visibility edge applies)
+    vs. "investment fund many people subscribe to" (no edge). The former is administered
+    under this household's engagement; the latter isn't.
+
     ### Phase 3.7 self-audit addition
 
-    For every LegalEntity in `extraction_cache` where the decision matrix says
-    "OWNERSHIP YES", verify that BOTH a GRANTOR edge AND an OWNERSHIP edge to the
-    same grantor exist in `relationships_to_create.json`. If only GRANTOR exists and
-    the trust is revocable → FAIL the audit. This is the bug class that produced
-    orphan trusts on Comolli / Chen-Park / Garcia / Hamilton / Boro / Stein.
+    For every LegalEntity in `extraction_cache`, verify:
+
+    1. **Economic-ownership coverage** — if the decision matrix says "Individual→trust
+       OWNERSHIP YES" (revocable trusts + client-owned LLCs), both a GRANTOR/MEMBER
+       edge AND an OWNERSHIP edge from the same source Individual exist in
+       `relationships_to_create.json`. If only GRANTOR/MEMBER exists → FAIL.
+
+    2. **Visibility coverage** — every trust/LE connected to the household (through any
+       relationship: GRANTOR, MEMBER, TRUSTEE, BENEFICIARY, etc.) has either an
+       economic OWNERSHIP edge OR a HOUSEHOLD→LE OWNERSHIP 0% visibility edge in
+       `relationships_to_create.json`. If the LE has only non-OWNERSHIP edges AND no
+       household visibility edge → the LE will be invisible from `/by-owner/HOUSEHOLD`
+       after push. FAIL.
+
+    This is the bug class that produced orphan trusts on Comolli / Chen-Park / Garcia
+    / Hamilton / Boro / Stein — some from missing economic ownership, others from
+    missing visibility edges on irrevocable trusts.
 
     ### Retrofit sweep for pre-Rule 60 onboarded households
 
-    For households onboarded before this rule shipped, run a one-shot retrofit:
+    For households onboarded before this rule shipped, run a one-shot retrofit.
+    Two classes of edges to add:
+
+    (1) **Economic OWNERSHIP** — Individual→trust 100% for revocable trusts and
+        Individual→LE 100% for client-owned operating LLCs (rollup correctness).
+    (2) **Visibility OWNERSHIP** — HOUSEHOLD→trust 0% for irrevocable trusts
+        administered under this household's engagement (graph reachability).
 
     ```python
     # orphan_ownership_retrofit.py
     #
     # For every LegalEntity with parentHouseholdId=null that has an active
-    # GRANTOR or MEMBER/MANAGING_MEMBER relationship from a client Individual,
-    # classify against Rule 60's decision matrix. Emit OWNERSHIP 100% for
-    # revocable-trust + client-owned-LLC types; leave irrevocable trusts,
-    # corporate fiduciaries, shared funds, and charitable recipients as null.
+    # relationship tying it to the household (GRANTOR, MEMBER/MANAGING_MEMBER,
+    # TRUSTEE, BENEFICIARY from a household Individual), classify against
+    # Rule 60's decision matrix and emit the appropriate edges.
     for le in list_legal_entities(firmId, parentHouseholdId=null):
         rels = get_to_legal_entity_relationships(le.id)
+        household_id = resolve_household_for_le(le, rels)  # via grantor's household
+        if not household_id:
+            continue  # genuinely orphan or third-party
+
         grantor = find_first(rels, type="GRANTOR", source_type="INDIVIDUAL")
         member  = find_first(rels, type="MEMBER",  source_type="INDIVIDUAL") \
                or find_first(rels, type="MANAGING_MEMBER", source_type="INDIVIDUAL")
         source = grantor or member
-        if not source: continue  # genuinely orphan or third-party
         classification = classify_entity(le, source)
-        if classification in ("REVOCABLE_TRUST", "OPERATING_LLC_CLIENT_OWNED"):
-            emit_ownership_edge(source=source, target=le, pct=100,
-                                role=f"Grantor (revocable trust)" if grantor else "Member (LLC)")
+
+        if classification in ("REVOCABLE_TRUST", "OPERATING_LLC_CLIENT_OWNED") and source:
+            # Economic edge: Individual → LE 100%
+            emit_ownership_edge(
+                source_type="INDIVIDUAL", source_id=source.id,
+                target_type="LEGAL_ENTITY", target_id=le.id,
+                pct=100,
+                role=("Grantor (revocable trust — IRC §671)" if grantor else "Member (LLC)"),
+            )
+            # Visibility edge also, so household page surfaces it consistently
+            emit_ownership_edge(
+                source_type="HOUSEHOLD", source_id=household_id,
+                target_type="LEGAL_ENTITY", target_id=le.id,
+                pct=0,
+                role="Visibility — revocable/operating entity (rollup via Individual edge above)",
+            )
+        elif classification in ("IRREVOCABLE_TRUST", "IDGT", "ILIT", "GST", "DYNASTY",
+                                "IRREVOCABLE_EXEMPT", "IRREVOCABLE_NONEXEMPT"):
+            # Visibility-only — no economic ownership (completed gift)
+            emit_ownership_edge(
+                source_type="HOUSEHOLD", source_id=household_id,
+                target_type="LEGAL_ENTITY", target_id=le.id,
+                pct=0,
+                role=f"Visibility only — {classification.lower().replace('_', ' ')}, outside household estate",
+            )
+        elif classification in ("GRAT", "QPRT", "CRT", "CRUT", "CRAT", "CLAT"):
+            # Partial economic + visibility. Flag for human confirmation of pct.
+            emit_open_question(
+                question=f"{le.legalName} ({classification}) — what is the grantor's "
+                         "retained economic percentage? Defaulting to HOUSEHOLD→LE 0% "
+                         "visibility only pending confirmation.",
+            )
+            emit_ownership_edge(
+                source_type="HOUSEHOLD", source_id=household_id,
+                target_type="LEGAL_ENTITY", target_id=le.id,
+                pct=0,
+                role=f"Visibility only — {classification}, retained-interest % pending confirmation",
+            )
     ```
 
-    Operator confirms each candidate unless the name is unambiguous ("Revocable" /
-    "Living Trust" → auto-approve; "Irrevocable" / "Dynasty" / "GST" / "ILIT" →
-    auto-decline).
+    Operator confirms each candidate. Auto-approve heuristics:
+    - Names containing "Revocable" / "Living Trust" → emit BOTH economic 100% + visibility 0%
+    - Names containing "Irrevocable" / "Dynasty" / "GST" / "ILIT" / "IDGT" / "Exempt" →
+      emit visibility 0% only
+    - Names containing "GRAT" / "QPRT" / "CRT" / "CRUT" / "CRAT" / "CLAT" →
+      emit visibility 0% + Open Question on retained-interest percentage
+    - Third-party / shared / external-fiduciary / subscribed-fund / charitable-recipient
+      → no edge (Rule 53 applies — they're Contacts, not LegalEntities)
 
 ---
 
