@@ -2936,9 +2936,9 @@ Address structure fields:
 Process in order: Household → Individuals → Legal Entities → Accounts → Contacts → Tangible Assets (via subtype endpoints) → Insurance Policies → Liabilities. Then create all relationships, then PATCH estate planning.
 
 **⚠ DO NOT include `notes` on a PATCH/POST body for Individual, LegalEntity,
-TangibleAsset, Liability, InsurancePolicy, or AccountFinancial.** That field is a
-`Set<NoteDto>`, not a string — passing a string returns 400 "Cannot deserialize value
-of type `HashSet<…NoteDto>`". Notes are created via the separate child endpoint:
+TangibleAsset, Liability, InsurancePolicy, AccountFinancial, or Document.** That field
+is a `Set<NoteDto>`, not a string — passing a string returns 400 "Cannot deserialize
+value of type `HashSet<…NoteDto>`". Notes are created via the separate child endpoint:
 
 ```
 POST /api/v1/individual/{id}/notes
@@ -2947,6 +2947,7 @@ POST /api/v1/tangible-asset/{id}/notes
 POST /api/v1/liability/{id}/notes
 POST /api/v1/insurance-policy/{id}/notes
 POST /api/v1/account-financial/{id}/notes
+POST /api/v1/document/{id}/notes
 Content-Type: application/json
 X-API-Key: {api_key}
 
@@ -2956,6 +2957,17 @@ X-API-Key: {api_key}
 The DTO's **required field is `noteText`** — **NOT** `note` or `text`. Missing/wrong
 field name returns 400 `"noteText: must not be null"`. This was a repeat pitfall on
 Lamond (2026-04-22) — every early POST with `{"note": …}` failed silently.
+
+**⚠ Household and Contact do NOT support `/notes`.** `POST /api/v1/household/{id}/notes`
+returns **HTTP 404** (no such endpoint per `api.json` 2026-04-23). Same for Contact. For
+household-level metadata that doesn't belong on a member entity, use one of:
+- **Supplemental attributes** — `POST /api/v1/household/{id}/attributes` (Household + Contact
+  both support `/attributes`). This is the canonical place for household-level facts.
+- **Reroute to the primary individual's `/notes`** — prefix the noteText with
+  `(Household-level CRM metadata)` or similar so future readers understand the scope.
+
+This was hit on the Lamond CRM update (2026-04-23): a `/household/{id}/notes` POST returned
+404 silently in a script, then succeeded when redirected to the primary individual.
 
 If an API call fails, log it, save state, and ask user to retry or continue with others.
 
@@ -4363,12 +4375,31 @@ for a reference example (Cummings Family handoff).
     See `references/document_type_patterns.md` Generic-Template Detection.
 
 48. **Populate Household.billing from the engagement agreement.** The fee structure maps
-    directly:
-    - Flat annual fee: `{"feeStructure": "FLAT", "flatFee": 400000, "billingFrequency": "QUARTERLY", "billingMethod": "IN_ARREARS", "agreementDate": "2025-07-08", "effectiveDate": "2025-07-08"}`
-    - Tiered AUM: `{"feeStructure": "TIERED", "feeScheduleId": "...", "billingFrequency": "QUARTERLY", "billingMethod": "IN_ARREARS"}`
-    - Flat AUM %: `{"feeStructure": "FLAT_PERCENT", "feePercent": 0.75, "minimumFee": 25000, ...}`
+    directly. **Use the EXACT enum values per `api.json`**:
+    `feeStructure ∈ {FLAT_FEE, AUM_BASED, TIERED, PERFORMANCE_BASED, HOURLY, HYBRID, NONE}`,
+    `billingFrequency ∈ {MONTHLY, QUARTERLY, SEMI_ANNUALLY, ANNUALLY}`,
+    `billingMethod ∈ {IN_ADVANCE, IN_ARREARS}`. Common patterns:
+    - Flat annual fee: `{"feeStructure": "FLAT_FEE", "flatFee": 400000, "billingFrequency": "QUARTERLY", "billingMethod": "IN_ARREARS", "agreementDate": "2025-07-08", "effectiveDate": "2025-07-08"}`
+    - Single-rate AUM (% basis): `{"feeStructure": "AUM_BASED", "feePercent": 0.0075, "minimumFee": 25000, "billingFrequency": "QUARTERLY", "billingMethod": "IN_ARREARS"}` — `feePercent` is a DECIMAL (0.0075 = 75 bps).
+    - True tiered (multi-bracket): `{"feeStructure": "TIERED", "feeScheduleId": "<uuid>", "billingFrequency": "QUARTERLY", "billingMethod": "IN_ARREARS"}` — requires a separate FeeSchedule entity.
     Always record `agreementDate` (execution) and `effectiveDate` (first billing period
     start) — they may differ.
+
+    **⚠ `feePercent` is silently dropped when `feeStructure=TIERED`.** The PATCH returns
+    200, but inspecting the entity afterwards shows `feePercent: null`. The server expects
+    tiered structures to carry their rates inside a FeeSchedule (referenced via
+    `feeScheduleId`), not inline. If you have a "tiered with minimum + flat first-tier rate"
+    description (e.g. "$150k minimum; 65bps for first $100M") and don't yet have a
+    FeeSchedule to attach, **store as `AUM_BASED` with `feePercent` + `minimumFee`** and
+    add a `notes` line: "Should migrate to TIERED with a fee schedule when one is created".
+    This was hit on the Lamond CRM update (2026-04-23) — TIERED looked correct but quietly
+    lost the 65bps figure.
+
+    **PATCH-merge gotcha**: `billing` is a nested object. PATCHing `billing` REPLACES the
+    whole object — fields you don't include come back as null. If you previously set
+    `notes` and now PATCH `billing` with `{feePercent: ..., minimumFee: ...}` only, the
+    earlier `notes` are wiped. Either include all desired fields in every PATCH, or read
+    the current `billing` first and merge in your changes before sending.
 
 49. **Blank onboarding sheets are not failures.** If `Client Onboarding Information.docx`
     exists but contains only field labels with no filled values, don't abort. Cross-document
