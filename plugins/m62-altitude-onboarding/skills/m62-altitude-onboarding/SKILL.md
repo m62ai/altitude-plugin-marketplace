@@ -3876,6 +3876,102 @@ POST /api/v1/document/{trustAgreementDocId}/associations?entityType=INDIVIDUAL&e
 
 ---
 
+## Phase 8: Advisor Open-Items Packet (REQUIRED final output)
+
+After Phase 7 completes, produce a single `.docx` handoff for the Relationship Manager
+listing what's still needed to complete the onboarding. This is the primary artifact the
+RM uses to close the loop with the client. Without it, the onboarding is not done.
+
+### Output file
+Path: `{household_folder}/{Household Name} - RM Open Items {YYYY-MM-DD}.docx`
+
+(Same folder as the source documents — the RM already has it open.)
+
+### Required sections (in this order)
+
+**1. Header block** (plain paragraphs)
+- Title: `{Household Name} — Open Items for Relationship Manager`
+- `Household: {name}   Date: {Month DD, YYYY}   Firm: {firm name}   Prepared by: Altitude Onboarding System`
+
+**2. "Data Needed to Complete Entity Records" — table**
+One row per entity created in Altitude with missing required/important fields that the
+client or an external source still has to provide. Columns:
+`# | Item | Entity in Altitude | What's Missing | Priority`
+
+Priority is **High / Medium / Low**:
+- **High** = blocks a compliance/regulatory milestone (CIP/KYC, expiring ID, missing SSN for a beneficiary, insurance with no policy number but $10M+ death benefit, tax filing deadline)
+- **Medium** = blocks valuation accuracy or a planned transaction (account balance missing on a 7-figure account, mortgage terms missing)
+- **Low** = nice-to-have (granular details that don't change planning — minor holdings, LLC membership breakdown for a small partnership)
+
+Generate rows directly from the placeholder values / nulls on created entities. Every
+field you left blank during Phase 6 because the source docs didn't have it → row here.
+
+**3. "Questions Requiring Client/Advisor Input" — table**
+Free-text questions that aren't just missing fields. Columns:
+`# | Question | Why It Matters`
+
+Populate from `altitude_review/open_questions.json` (Phase 5 output). Plus any ambiguity
+or conflict flagged during Phase 4 (e.g. two different birth dates across documents for
+the same person, unclear ownership structure).
+
+**4. "No Action Required (FYI)" — bullet list**
+Things the RM should KNOW but doesn't need to act on. Examples:
+- Construction / renovation in progress (dollar amounts)
+- Leased vs owned signals (e.g. vehicle is leased)
+- Marriage / death / move-date facts
+- Minor doc exceptions (expired passport card not used as primary ID, etc.)
+- Cross-references ("This household shares a joint account with the {other} household")
+
+**5. "Onboarding Completion Summary" — table**
+Columns: `Category | Count | Details`. Rows:
+- Documents read — total count + "All files in discovery folder processed (zero skipped)" or explicit skip count with reason
+- Documents uploaded — created in Altitude (minus duplicates/ref-only)
+- Individuals — count + names (new + updated)
+- Legal Entities — count + names
+- Accounts — count + names
+- Contacts — count + breakdown (e.g. "12 professionals + 11 extended family")
+- Tangible Assets — count + names
+- Liabilities — count + names
+- Insurance Policies — count + status
+- Relationships — total count (can be approximate — "70+")
+
+### Generation recipe
+
+Use python-docx:
+```python
+from docx import Document
+from docx.shared import Pt
+doc = Document()
+# title, header paragraphs, then tables with .add_table(rows=1, cols=N)
+# table.style = 'Table Grid'
+# Iterate over altitude_review/open_items.json (new file) to populate tables
+doc.save(f"{household_folder}/{household_name} - RM Open Items {today}.docx")
+```
+
+Source `open_items.json` from: `altitude_review/run_state.json` (what got created, with
+what fields blank) + `altitude_review/open_questions.json` (free-text asks) + the
+extraction cache (cross-reference any "flagged" notes).
+
+### Rules for the packet
+
+1. **Never include PII in the filename** beyond the household name (no SSNs, DOBs, addresses).
+2. **Write in the RM's voice**: terse, action-oriented, no "I" or "the agent" references.
+   The RM will forward this to other Verita team members or even to the client.
+3. **Group by priority in the Data Needed table** — Highs at the top, Lows at the bottom.
+   Within the same priority, group by entity type for scannability.
+4. **Every row in "Data Needed" must reference an entity that EXISTS in Altitude** — link
+   it by entity name, not UUID. If the entity was never created (e.g. deferred account),
+   surface it in "Questions" instead.
+5. **Never fabricate**: if a field is truly unknown AND there's no open-ended question to
+   ask, omit the row. Don't pad the packet.
+
+### Example
+
+See `/Users/williash/Library/CloudStorage/OneDrive-SharedLibraries-Verita/Partner Share - Altitude/Discovery/Cummings/Cummings Family - RM Open Items 2026-04-21.docx`
+for a reference example (Cummings Family handoff).
+
+---
+
 ## Important Rules
 
 1. **NEVER create entities without checking Altitude first.** Always query the household
