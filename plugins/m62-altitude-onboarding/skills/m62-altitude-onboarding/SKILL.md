@@ -4520,6 +4520,51 @@ for a reference example (Cummings Family handoff).
       firm biography; the corporate trustee relationship is by institution, not by
       individual human)
 
+57. **Class-of-people references without names → Open Questions, not silent drops.**
+    Trust agreements, estate plans, and beneficiary clauses routinely reference *classes*
+    of real people without listing names — "your parents", "your brother's wife", "any
+    child of SEAN's", "all spouses of your descendants", "surviving spouses". Rule #15
+    ("Every named person is an entity") only fires on NAMED people, so these unnamed
+    class references get silently dropped — losing real family structure that belongs
+    in Altitude.
+
+    During Phase 3 extraction, scan every legal instrument for these class phrases and
+    emit each as an Open Question:
+
+    | Phrase in document | Inferred entity | Open Question to raise |
+    |---|---|---|
+    | "your parents" / "the survivor of them" | 2 Individuals (Lee's mom + dad) | Names of Lee's parents. Both living? |
+    | "your brother" / "your sister" (named elsewhere) | Confirm as Individual | (already captured via name) |
+    | "your brother's wife" / "his spouse" | 1 Individual (sibling's spouse) | Name of [sibling]'s spouse. Verita client? |
+    | "any child of [Name]'s" / "[Name]'s descendants" | N Individuals | Does [Name] have children? Names, ages, DOBs? |
+    | "your future descendants" (contrasted with "any living child of yours") | Signal Lee has NO current children | Confirm Lee has no children today. |
+    | "your children" / "your descendants" (without "future") | ≥1 Individual (Lee's kids) | Names, ages, DOBs of Lee's children. |
+    | "your spouse" / "your surviving spouse" | 1 Individual (Lee's spouse) | Name, DOB, is she/he a Verita client? |
+    | "all spouses of your descendants" | Flag for future | Mark class — create as descendants are added |
+    | "any issue" / "lineal descendants" | Signal descendants treated as a class | Confirm class membership list at time of drafting |
+
+    **How to detect**: regex for these phrasing patterns in trust/estate instruments.
+    Lawyers use these phrases precisely because the class is well-defined in the document
+    but needs the list populated by the client. When you see the phrase, the client
+    already knows the answer — the skill just needs to ask.
+
+    **What NOT to do**: do NOT guess names, do NOT create placeholder Individuals with
+    "Unknown" names, do NOT drop the reference silently. The Open Question is the
+    correct artifact — it surfaces the gap to the RM who can fill it during review.
+
+    **Phase 3.7 self-audit addition**: for every trust instrument in the extraction
+    cache, verify that the open_questions.json has at least one entry per unnamed-class
+    phrase in the document. If the trust mentions "your parents" but there's no
+    parent-related question, that's a silent drop — add the question.
+
+    Spousal-status inference rule: if a trust's fiduciary-exclusion clause explicitly
+    names the GRANTOR'S SPOUSE alongside other classes ("your spouse, your descendants'
+    spouses, your brother's wife"), treat as weak positive signal that the grantor is
+    married. If the clause excludes others' spouses but NOT the grantor's own spouse,
+    treat as weak negative signal (grantor likely unmarried at drafting time). Always
+    surface as an Open Question — never auto-create a SPOUSE relationship on inference
+    alone.
+
 ---
 
 ## Running the Skill
