@@ -2221,6 +2221,7 @@ to validate that source→target combinations are allowed:
 | TRUSTEE | Trust agreements | IND→LE | No | Unidirectional |
 | SUCCESSOR_TRUSTEE | Trust agreements | IND→LE | No | Unidirectional |
 | GRANTOR | Trust agreements | IND→LE | No | Unidirectional |
+| OWNERSHIP (revocable trust) | Trust agreements (grantor → revocable trust) | IND→LE | Yes (100%) | Unidirectional. **MANDATORY alongside GRANTOR when trust is revocable** — see Rule 60 |
 | BENEFICIARY | Trust agreements, TOD forms, will | IND→LE, IND→ACCT | Optional | Unidirectional |
 | SPOUSE | Marriage certificates, onboarding sheets | IND→IND | No | Symmetric |
 | PARENT | Onboarding sheets | IND→IND | No | Unidirectional |
@@ -4445,23 +4446,82 @@ for a reference example (Cummings Family handoff).
       endpoint, more complete), use that form instead of `/by-individual/` or
       `/by-household/`. See Phase 1.3 note.
 
-53. **Corporate trustees, trust companies, and fiduciary firms are LegalEntities — NOT
-    Contacts.** Before POSTing any Contact, run the candidate name through the
-    corporate-pattern regex:
+53. **LegalEntity = family-controlled ONLY. Everything else is a Contact (or not
+    created at all).** Before POSTing a LegalEntity, answer this one question:
 
-    ```python
-    CORP_PATTERN = re.compile(
-        r"\b(LLC|LLP|LP|Inc|Corporation|Corp|Company|Co\.|Trust Company|Trust Co"
-        r"|Bank|N\.A\.|FSB|Services|Group|Holdings|Partners|Associates"
-        r"|Capital|Management|Advisors|Fiduciary|Agents?)\b", re.IGNORECASE)
-    ```
+    > "Does the household own this, control this, serve as grantor of this, or hold a
+    > direct beneficial interest in this as a controlled entity?"
 
-    If matched, OR the name has no clear first/last structure (single run > 3 words with
-    no comma), escalate to LegalEntity with `entityType=TRUST_COMPANY` (or `OTHER` if
-    the enum doesn't include TRUST_COMPANY). Wire TRUSTEE as an LE→LE relationship, not
-    IND→LE. Common anti-pattern: a corporate trustee saved as a Contact with
-    `firstName="Some Trust"`, `lastName="Company of Delaware"` — obviously not a real
-    person. The corporate-pattern regex catches this on "Trust Company".
+    If YES → LegalEntity. If NO → Contact (if there's a real relationship edge) or skip
+    entirely. Drafting attorneys, **corporate trustees**, **trust companies**, schools,
+    universities, churches, receiving charities, hospitals, employers, vendors,
+    agencies, publishers, clubs — **none of these are LegalEntities**, even when they
+    appear prominently in legal instruments.
+
+    **Why this rule exists**: past onboarding runs created LLCs for trust companies
+    (Bryn Mawr Trust Co. of Delaware, Wilmington Trust, CNB), schools, receiving
+    charities, law firms (Loeb, Venable, Fenwick), management firms, talent agencies,
+    and publishers. None of those institutions are family-owned — putting them in
+    LegalEntity pollutes the ownership hierarchy, shows them up in household rollups
+    where they have no place, and confuses the valuation graph. The previous version of
+    this rule actually instructed the skill to create LegalEntities for trust companies
+    on pattern-match ("fiduciary firms are LegalEntities — NOT Contacts") — that was
+    wrong and has been reversed per the Hnetinka 2026-04-23 review.
+
+    **Decision table** (run BEFORE deciding LegalEntity vs Contact vs skip):
+
+    | Entity type in documents | Create as | Why |
+    |---|---|---|
+    | **Client-established** trust (grantor IS the client) | **LegalEntity** | Client is grantor — they control it |
+    | **Client-owned** LLC / corp / LP / partnership | **LegalEntity** | Direct ownership edge |
+    | **Client-established** private foundation (client funded and governs) | **LegalEntity** (FOUNDATION) | Controlled by family |
+    | **Investment vehicle** client invests in (fund, LP, LLC, hedge fund) — captured individually | **LegalEntity** | Ownership edge target + K-1 origin |
+    | **Corporate trustee** named on a client's trust (Bryn Mawr, Wilmington Trust, CNB, BMTC, Northern Trust) | **Contact** — NOT LegalEntity | Household does not own them. Model the TRUSTEE relationship as CONTACT→LE. Put firm name in Contact's `lastName` field (Contact has no companyName column) and role/address in `biography`. |
+    | **Drafting law firm** that WROTE a trust/will (Loeb, Venable, Willkie, Fenwick) | **Contact** for the individual drafting attorney; firm name in biography. If no individual known → single Contact with the firm name as `lastName` + `jobTitle="Drafting attorney"` | No ownership |
+    | **Charity / non-profit** named as beneficiary of a client's trust/will (Red Cross, Stanford, Cedars-Sinai) | **Contact** — NOT LegalEntity | Household does not control the charity. Model BENEFICIARY as CONTACT→LE with role="Charitable Beneficiary" |
+    | **School / university** the family donates to or attends | **Contact** (or supplemental attribute on the student Individual) — NEVER LegalEntity | Not a family asset |
+    | **Receiving church / religious org** | **Contact** | Not family-controlled |
+    | **Hospital / healthcare provider** | **NEVER create** unless client's foundation grants to them, in which case a **Contact** on the grant record | Vendor, not family asset |
+    | **Business management firm** (NKSFB, Provident, WG&S, Azoff) | **Contact(s)** for each specific BM/manager there; firm name in biography | Service provider |
+    | **Talent agency** (CAA, WME, UTA) | **Contact** for the specific agent; firm in biography | Service provider |
+    | **Record label / Publisher** (Interscope, UMPG, Sony) | **Contact** for the specific A&R / label contact — NOT LegalEntity unless the client has ownership economics via a distinct deal entity (rare) | Service/commercial counterparty |
+    | **Insurance carrier** (MassMutual, Hagerty, Allstate, Cincinnati) | **NEVER an LE — NEVER a Contact either.** Use `InsurancePolicy.carrierName` field | That field exists exactly for this |
+    | **Insurance brokerage** (Weiser, Higginbotham, ABD) | **Contact** for the specific broker/agent; firm name in biography | Service provider |
+    | **Country club / private school / golf club / yacht club** | **NEVER create** — put membership in client's supplemental attributes or biography | Vendor relationship |
+    | **Employer** (unless the client owns it via client-owned LE) | **NEVER create** — use `Individual.employerName` field | Employer is not a family-owned entity |
+    | **Payroll processor** (Paychex, Gusto, ADP) | **NEVER** — vendor processing infra | Use Schedule H employer-EIN on the client's profile instead |
+    | **Aviation vendor** (NetJets, Flexjet, XOJet) | **NEVER** unless client has fractional ownership of a specific tail — then LegalEntity for the fractional-share LLC itself, NOT the vendor | Service provider |
+    | **Security / household service** (ASC, landscapers, cleaning) | **NEVER** — vendor | |
+    | **Custodian** (Schwab, Fidelity, CNB Securities) | **Custodian entity** (`/api/v1/custodian`), NOT LegalEntity. Existing custodians are shared-reference; look up first | Account.custodianId field |
+
+    **Corporate-as-Contact workaround**: Contact DTO has no `companyName` column (per
+    skill's Standard Document Extraction note). For an institution stored as Contact:
+    - `firstName = ""` (empty)
+    - `lastName = "<full firm legal name>"` (e.g., `"The Bryn Mawr Trust Company of Delaware"`)
+    - `biography = "<role> — <address if known> — <any additional context>"`
+    - `jobTitle = "<concrete role>"` (e.g., `"Corporate Trustee"`, `"Drafting Attorney"`, `"Charitable Beneficiary"`)
+
+    The Contact-with-firm-name-in-lastName looks unusual but is the correct model given
+    DTO constraints. Adding a `companyName` / `organizationName` field to Contact is a
+    future API improvement.
+
+    **Relationship modeling for Contact trustees**: the relationship matrix lists
+    TRUSTEE as IND→LE, but CONTACT→LE TRUSTEE is accepted by the API in practice. If
+    the POST is rejected, fall back to (a) listing the corporate trustee in the trust
+    entity's `description` or supplemental attribute, OR (b) attaching the shell
+    Contact via the trust entity's Contact list — do NOT create a LegalEntity for the
+    trust company.
+
+    **Relationship modeling for Contact charities-as-beneficiary**: use CONTACT→LE
+    BENEFICIARY with role="Charitable Beneficiary" and `percentage` set to the
+    devise/remainder share.
+
+    **Pre-POST checklist for every LegalEntity**:
+    1. Is this household the grantor / owner / controlling party of this entity? (If no → STOP, it's a Contact)
+    2. Will this entity have at least one active relationship edge pointing to / from the household's graph? (If no → skip entirely)
+    3. Can this be captured more accurately via a field (`carrierName`, `employerName`, `custodianId`) instead of an entity? (If yes → use the field)
+
+    Only if all three resolve toward "yes LegalEntity" do you POST the LegalEntity.
 
 54. **Every TRUST LegalEntity needs these detail fields (commonly missed).** Parallel to
     Rule 33 for LLCs.
