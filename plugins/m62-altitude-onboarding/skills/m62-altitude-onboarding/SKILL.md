@@ -1076,6 +1076,38 @@ Create an in-memory index for matching:
 
 Save as `{household_folder}/altitude_review/altitude_universe.json` for reference.
 
+### Step 1.6: Externally-synced-account health check (IMMEDIATE ALERT — do not defer to Phase 4.8)
+
+As soon as the universe is built, scan all accounts for broken external syncs BEFORE
+launching extraction agents. The user needs to see this up-front so they can open a
+parallel sync-health ticket while the onboarding runs.
+
+```python
+# altitude_sync_health.py
+broken = []
+for acct in universe["accounts"]:
+    ext_ids = acct.get("externalIds") or []
+    has_provider = any(e.get("provider") for e in ext_ids)
+    mv = acct.get("totalMarketValue")
+    last_synced = next((e.get("lastSyncedAt") for e in ext_ids if e.get("provider")), None)
+    if has_provider and (mv is None or float(mv) == 0 or last_synced is None):
+        broken.append({
+            "id": acct["id"], "name": acct["name"], "mv": mv,
+            "providers": [e.get("provider") for e in ext_ids],
+            "lastSyncedAt": last_synced,
+        })
+
+if broken:
+    print("⚠ WARNING — accounts with broken/zero external sync (do NOT patch these):")
+    for b in broken: print(f"  {b}")
+    # Persist to altitude_review/addepar_discrepancies_preextraction.json
+```
+
+Rule 42 (externally-synced accounts are read-only) still applies during extraction. The
+Phase 1 early alert is additive — it surfaces the problem to the operator so they can
+(a) open a sync-health ticket in parallel, and (b) expect extraction to flag the account
+as "needs investigation" rather than "broken due to onboarding script."
+
 ---
 
 ## Phase 2: Scan & Classify Documents
@@ -1304,17 +1336,31 @@ handwritten notes, high-res scans) include pages that trip this limit. The resul
    ```
    Then Read `/tmp/extracted.txt`. This is fast, safe, and avoids the image limit entirely.
 
-2. **If `pdftotext` returns mostly blank or gibberish** → the PDF is a scan. Render and OCR:
+2. **If `pdftotext` returns mostly blank or gibberish** → the PDF is a scan. Render each
+   page to a PNG first:
    ```bash
-   # Render pages 1-5 at 150 dpi (cap pages for large scans)
-   pdftoppm -r 150 -f 1 -l 5 "file.pdf" /tmp/scan_page
-   # Each page becomes /tmp/scan_page-1.png, scan_page-2.png, etc.
+   # Render pages 1-5 at 200 dpi, cap long side via -scale-to 1800 so Claude can read
+   pdftoppm -r 200 -scale-to 1800 -f 1 -l 5 "file.pdf" /tmp/scan_page -png
+   ```
+
+   Then choose the OCR path based on content type:
+
+   **2a. Handwritten content** (meeting notes, signed statements, margin annotations) →
+   **use Claude's Read tool on each PNG directly**. Claude vision handles cursive,
+   mixed-case, and arrows/margin marks fluently; tesseract does not. In practice
+   tesseract on handwriting returns word-salad ("hy borotvw , 2p 7. vf shaves") while
+   Claude transcribes the same page accurately. Skip tesseract entirely for handwriting.
+
+   **2b. Typeset scanned text** (faxed letters, older trust documents printed and
+   re-scanned, filings) → tesseract is reliable and much cheaper than vision:
+   ```bash
    for png in /tmp/scan_page-*.png; do
-     tesseract "$png" "${png%.png}" -l eng
+     tesseract "$png" "${png%.png}" -l eng --psm 6
    done
    cat /tmp/scan_page-*.txt > /tmp/extracted.txt
    ```
-   Then Read `/tmp/extracted.txt`.
+   Then Read `/tmp/extracted.txt`. If tesseract output looks garbled (low confidence,
+   nonsense words, missing punctuation), fall back to Claude Read on the PNGs.
 
 3. **Only fall back to Claude's Read tool on the raw PDF** as a last resort — and only if
    the file is **< 5 MB** (to avoid loading many high-res pages). If Read fails with the
@@ -1568,7 +1614,22 @@ for sheet in wb.sheetnames:
         print(row)
 ```
 
-- **Emails (.eml)**: Write `eml_read.py` below, then `python eml_read.py "file.eml"`. Extract entity data from the email body (e.g., account confirmations, policy updates, advisor correspondence). Process any saved attachments as their native file type.
+- **Emails (.eml)**: Write `eml_read.py` below, then `python eml_read.py "file.eml"`. Extract entity data from the email body (e.g., account confirmations, policy updates, advisor correspondence).
+
+  **⛔ Attachment rule — DO NOT mark the .eml READ until every attachment has been
+  processed as its native file type.** The .eml body is often a short cover note
+  ("Christine – attached is the draft trust, please review") while the attachments
+  contain the real data (the actual trust agreement, the signed engagement letter, the
+  K-1 schedules). Missing an attachment = missing an entity.
+
+  Required tracker handling:
+  1. Count `msg.walk()` parts with a filename. Log each as a sub-file (`5a`, `5b`, `5c`).
+  2. After saving, classify each attachment by extension and process via the same rules
+     (PDF → pdftotext → extraction; DOCX → pandoc → extraction; JPG/PNG → Claude Read).
+  3. Mark the parent .eml READ **only after** every sub-file is READ.
+  4. If `sum(attachment_sizes) > 0.5 * body_size` OR any attachment is a PDF/DOCX/XLSX
+     and the orchestrator is about to move on without processing it → HARD STOP, process
+     attachments first.
 
 ```python
 # eml_read.py — prints headers + body, saves attachments to temp dir
@@ -1753,6 +1814,38 @@ upload files with `severity=critical` unless the user explicitly overrides**.
 ### Step 3.5: Cross-Document Validation Pass
 
 After extracting from ALL documents, run these mandatory checks before proceeding to Phase 4:
+
+**-1. Duplicate-content detection (rendered-page SHA match).** Two PDFs with different file
+   hashes often contain byte-identical rendered content — a common pattern is the same
+   scanned meeting notes saved under two subfolders (e.g. `Meeting Materials/` and
+   `Trust and Estate/`). Deduplicate BEFORE entity extraction so you don't double-count
+   attributions:
+   ```bash
+   # For every pair of PDFs with identical page count within this household:
+   pdftoppm -r 100 -f 1 -l 1 "a.pdf" /tmp/a -png
+   pdftoppm -r 100 -f 1 -l 1 "b.pdf" /tmp/b -png
+   # Compare first-page PNG SHAs:
+   shasum /tmp/a-1.png /tmp/b-1.png
+   ```
+   If SHAs match → one is a duplicate. Mark the later-mtime or alphabetically-later file as
+   `status: DUPLICATE_OF(other_file)` in the tracker; still upload both files for folder
+   fidelity, but do NOT duplicate their extracted entities in the cache. This check is
+   cheap (~100ms per pair) and catches the "same meeting notes saved twice" pattern that
+   wastes extraction tokens.
+
+**-0.5. Cross-document CONTACT merge (fuller-identity-wins).** The same person often
+   appears in multiple documents with varying completeness — e.g. file #3 (handwritten
+   notes) mentions "Jessica @ Loeb" while file #5 (email signature) reveals
+   "Jessica Davis Mills, Partner, Loeb & Loeb LLP, jmills@loeb.com, +1-415-903-3236".
+   Merge rule:
+   - For each pair of extracted Contacts where name similarity ≥ 0.7 AND (firm matches
+     OR email matches OR phone matches), merge into one record.
+   - For each field, take the MOST COMPLETE value across all source documents (full name
+     over first name; email over no email; firm name over "@ Loeb" shorthand).
+   - Track ALL source documents on the merged record (e.g. `sources: ["file 3", "file 5"]`)
+     so the audit trail survives.
+   - If the merge is ambiguous (similar name but different email domains) → leave as two
+     separate Contacts and flag in open_questions.
 
 0. **⛔ CRITICAL: Latest-date-wins field resolution** — When the **same field** appears on the
    same entity in multiple documents with different values, the value from the **most recent
@@ -2633,8 +2726,15 @@ subfolders, never buried deeper):
 - `review.md` — complete human-readable review (ALL sections above)
 - `file_tracker.md` — every file with READ status and extraction summary
 - `altitude_universe.json` — initial state from Phase 1
-- `create_payloads.json` — POST requests for new entities
-- `patch_payloads.json` — PATCH requests for existing entities (if matching)
+- `create_payloads.json` — POST requests for new entities. **Write in Phase 5b (AFTER user
+  approval), NOT in initial Phase 5.** Before approval, the review.md tables are sufficient;
+  building concrete payloads prematurely causes churn when Q&A responses change the shape
+  (e.g., Q: "create Sean as standalone Individual or include in household?" directly
+  determines whether a payload references a `parentHouseholdId`). Pre-approval Phase 5
+  only needs the review.md + open_questions.json. Phase 5b runs immediately before Phase 6
+  and crystallizes the approved scope into JSON.
+- `patch_payloads.json` — PATCH requests for existing entities. **Same Phase 5b timing** as
+  create_payloads.json.
 - `relationships_to_create.json` — relationship creation plan
 - `role_replacements.json` — trustee/advisor/attorney/officer replacements (see Phase 4.7)
 - `addepar_discrepancies.json` — doc-vs-sync mismatches for synced accounts (see Phase 4.8)
@@ -2761,13 +2861,18 @@ As the final step of Phase 7, upload the `altitude_questions_{YYYY-MM-DD}.md` fi
 primary individual in Altitude (Households don't support direct document upload — see Phase 7
 note). Use these parameters:
 
+Before uploading, **rename the `.md` file to `.txt`** (or copy it) — Altitude's
+`contentType` enum does NOT include `MARKDOWN`. The only valid values are CSV, DOC, DOCX,
+GIF, HTML, JPG, JSON, MP3, MP4, PDF, PNG, PPT, PPTX, TXT, XLS, XLSX, XML, ZIP. Upload as
+`TXT` so it renders as plain text in the Altitude UI:
+
 ```
 POST /api/v1/individual/{primaryIndividualId}/document?sessionId={sessionId}&skipDuplicates=true
 createRequest:
   title: "Altitude Onboarding Q&A — {Household Name} — {YYYY-MM-DD}"
-  description: "Validation and approval questions from onboarding session on {YYYY-MM-DD}."
+  description: "Validation and approval questions from onboarding session on {YYYY-MM-DD}. Source is markdown; rendered as plain text."
   documentSubType: "OTHER"
-  contentType: "MARKDOWN"
+  contentType: "TXT"
 ```
 
 After upload, create entity associations so the document appears on both the Individual AND
@@ -3175,6 +3280,12 @@ via the `role` field.
 |---|---|---|---|
 | TRUST_PROTECTOR | TRUSTEE | "Trust Protector" | Trust agreements use this term for oversight role separate from day-to-day trustee |
 | SUCCESSOR_TRUST_PROTECTOR | TRUSTEE | "Successor Trust Protector #N" | Include priority |
+| INVESTMENT_ADVISOR (directed trust) | TRUSTEE | "Investment Advisor (directed trust)" | Delaware/SD/NV directed trusts split investment and distribution roles from admin trustee. Grantor often serves initially. |
+| SUCCESSOR_INVESTMENT_ADVISOR | TRUSTEE | "Successor Investment Advisor #N" | Include priority |
+| DISTRIBUTION_ADVISOR (directed trust) | TRUSTEE | "Distribution Advisor" | Separate from Trust Protector in some directed-trust designs |
+| ADMINISTRATIVE_TRUSTEE / DELAWARE_TRUSTEE / DIRECTED_TRUSTEE | TRUSTEE | "Administrative Trustee" / "Delaware Trustee" | Corporate trustee whose role is limited to holding the trust's legal situs and ministerial duties. Use this `role` string so downstream queries can distinguish from decision-making trustees. |
+| REMOVER (directed trust) | TRUSTEE | "Remover (non-fiduciary)" | Person with power to remove/replace fiduciaries; typically non-fiduciary. |
+| SUCCESSOR_REMOVER | TRUSTEE | "Successor Remover #N" | |
 | INVESTMENT_COMMITTEE_MEMBER | ADVISOR | "Investment Committee" | |
 | POWER_OF_APPOINTMENT_COMMITTEE_MEMBER | ADVISOR | "Power of Appointment Committee" | |
 | DISTRIBUTION_COMMITTEE_MEMBER | ADVISOR | "Distribution Committee" | |
@@ -3420,7 +3531,7 @@ PDF, PNG, PPT, PPTX, TXT, XLS, XLSX, XML, ZIP
 | `.msg` | **convert to `.eml`→`.txt`** or skip | Outlook proprietary; extract-msg library |
 | `.rtf` | **convert to `.txt`** via `textutil -convert txt` | |
 | `.heic` | **convert to `.jpg`** via `sips -s format jpeg` (macOS) or `heif-convert` | |
-| `.tif`, `.tiff` | **convert to `.pdf`** via `tiff2pdf` or reject | |
+| `.tif`, `.tiff` | **convert to `.jpg`** via `sips -s format jpeg -Z 1800 src.tiff --out dst.jpg` (macOS) or `magick src.tiff -resize 1800x1800\> dst.jpg` (cross-platform). Upload as `JPG`. **NEVER convert to PDF** — scanner output is often 50-100MB, and `tiff2pdf` preserves the original size inside a PDF wrapper, still unreadable via Claude Read (hits the 2000px dimension limit) and still rejected by the nginx 10MB upload ceiling. Resize to ≤1800px long-side so Claude can see the image AND the upload fits. | |
 
 **.eml conversion helper** (apply before upload):
 
@@ -4361,6 +4472,53 @@ for a reference example (Cummings Family handoff).
     - §671-679 references, IDGT, "intentionally defective grantor trust" → `isGrantor: true`
     - "non-grantor trust", §678 → `isGrantor: false`
     - GST-exempt dynasty trust alone does NOT imply grantor status — orthogonal
+
+55. **DRAFT vs EXECUTED legal documents — default to "wait, don't create".** Before
+    creating a LegalEntity from a trust agreement, operating agreement, articles of
+    incorporation, or partnership agreement, check these DRAFT signals:
+    - Signature blocks are blank / no countersigned copies present
+    - `formationDate` / execution date is blank or "______________, {year}"
+    - Filename contains any of: `Draft`, `DRAFT`, `Working`, `Redline`, `Blackline`,
+      `v1`, `v2`, `WIP`, `For Review`, `Pending`
+    - Cover email says "hoping to finalize…", "sending for your review", "final version
+      will follow"
+
+    If ANY signal is present → mark the extracted entity `formationStatus: DRAFT` in the
+    extraction cache. In Phase 5, list under a dedicated "Draft Instruments — Creation
+    Pending" section asking the user to (a) confirm execution and provide a signed copy,
+    or (b) explicitly authorize pre-staging with `formationDate: null` and a `[DRAFT]`
+    description prefix.
+
+    Default recommendation: DO NOT create LegalEntity for draft instruments; wait for the
+    executed version. Pre-staging is allowed ONLY with explicit user authorization — the
+    tradeoff is that once-signed-then-changed drafts produce stale entities, stale
+    relationships, and post-hoc correction work.
+
+    Same logic applies to engagement letters / client agreements for `Household.billing` —
+    do NOT populate billing fields until the agreement is executed. Extracted fee schedule
+    can still be shown in the review as "pending signed agreement."
+
+56. **Non-client family-fiduciary-beneficiary MUST be Individual, not Contact.** Examples
+    list "successor trustees" as Contacts and "family members" as Contacts, but the
+    relationship matrix requires `BENEFICIARY` to be `IND→LE` (not `CONTACT→LE`). A
+    non-client family member who is BOTH a fiduciary on a household LegalEntity AND a
+    beneficiary of that LegalEntity therefore cannot be a Contact — they must be an
+    Individual.
+
+    Use `parentHouseholdId: null` to keep them outside the household's rollup so their
+    unknown/separate wealth is not falsely attributed to the client household. If the
+    non-client is purely a fiduciary (e.g., "attorney-in-fact on Lee's POA") with no
+    beneficial interest in any household entity, Contact remains the right type.
+
+    Common examples of this pattern:
+    - Client's sibling is a beneficiary AND successor trustee of the client's trust →
+      Individual (standalone, `parentHouseholdId: null`)
+    - Client's parent is a beneficiary of client's trust + named as guardian for minors →
+      Individual (standalone)
+    - Outside attorney drafts the trust but is not a beneficiary → Contact (ATTORNEY role)
+    - Corporate trustee (e.g., Bryn Mawr Trust Co. of DE) → Contact (TRUSTEE role, with
+      firm biography; the corporate trustee relationship is by institution, not by
+      individual human)
 
 ---
 
