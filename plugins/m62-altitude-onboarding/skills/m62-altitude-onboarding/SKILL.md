@@ -5107,6 +5107,134 @@ for a reference example (Cummings Family handoff).
     in `create_payloads.json`, grep `relationships_to_create.json` for a matching
     target-slug OWNERSHIP entry. If missing, FAIL the push and add the edge before
     retrying.
+60. **⛔ REVOCABLE TRUST → grantor MUST also get an OWNERSHIP 100% edge, not just GRANTOR.**
+
+    Altitude's household/valuation rollup traversals walk **only OWNERSHIP edges**.
+    GRANTOR/TRUSTEE/BENEFICIARY edges are NOT considered ownership. If a revocable
+    trust is created with only GRANTOR/TRUSTEE/BENEFICIARY edges from the grantor
+    Individual, the trust LegalEntity becomes an **orphan from the household's
+    perspective** — `parentHouseholdId` never propagates, `/by-owner/HOUSEHOLD/{id}`
+    excludes the trust and everything it holds, and the household net-worth rollup
+    silently under-reports by the value of the trust's holdings.
+
+    This is economically correct: a grantor of a revocable trust has **full economic
+    ownership** under IRC §671 (the trust is disregarded for income tax; grantor is
+    taxed as if owning the trust assets directly). Modeling as OWNERSHIP 100% matches
+    the IRS view.
+
+    **The rule** — for every revocable trust created during onboarding, emit **TWO
+    edges** from each grantor Individual: GRANTOR (estate-planning semantic) AND
+    OWNERSHIP 100% (economic rollup semantic):
+
+    ```json
+    // GRANTOR — who established the trust
+    {
+      "sourceEntityType": "INDIVIDUAL", "sourceEntityId": "<grantor>",
+      "targetEntityType": "LEGAL_ENTITY", "targetEntityId": "<revocable trust>",
+      "relationshipType": "GRANTOR",
+      "effectiveFrom": "<trust execution date>"
+    }
+    // OWNERSHIP — economic rollup edge (REQUIRED for revocable trusts)
+    {
+      "sourceEntityType": "INDIVIDUAL", "sourceEntityId": "<grantor>",
+      "targetEntityType": "LEGAL_ENTITY", "targetEntityId": "<revocable trust>",
+      "relationshipType": "OWNERSHIP",
+      "percentage": 100,
+      "isPrimary": true,
+      "role": "Grantor (revocable trust — equivalent economic ownership per IRC §671)",
+      "effectiveFrom": "<trust execution date>"
+    }
+    ```
+
+    ### Decision matrix — when to emit OWNERSHIP alongside GRANTOR
+
+    **Irrevocable trusts are NOT owned by the grantor** — they're completed gifts and
+    belong outside the household's rollup. This matters: several "Irrevocable Trust"
+    entities in Verita (Patel, G&S GST, Comolli Descendants, Comolli Exempt) should
+    remain unlinked.
+
+    | Trust type | GRANTOR | OWNERSHIP 100%? | Rationale |
+    |---|---|---|---|
+    | Revocable living trust (X Living Trust) | ✅ | ✅ YES | Grantor retains control + IRC §671 ownership |
+    | Joint revocable trust (married couple) | ✅ (each) | ✅ YES — split 50/50 or per contribution | Each grantor owns their contributed share |
+    | Revocable trust sub-trusts during grantor's life (Marital, Children's, Residuary) | ✅ | ✅ YES | Still revocable; part of grantor's estate |
+    | GRAT (Grantor Retained Annuity Trust) | ✅ | ⚠️ PARTIAL — annuity interest only | Defer; Open Question |
+    | IDGT (Intentionally Defective Grantor Trust) | ✅ | ❌ NO | Completed gift; income tax only to grantor |
+    | ILIT (Irrevocable Life Insurance Trust) | ✅ | ❌ NO | Completed gift; outside estate |
+    | GST / Dynasty / Perpetual Trust | ✅ | ❌ NO | Completed gift; multi-generational |
+    | Irrevocable "Exempt" / "Nonexempt" sub-trusts | ✅ | ❌ NO | Completed gifts at funding |
+    | QPRT (Qualified Personal Residence Trust) | ✅ | ⚠️ TERM ONLY | OWNERSHIP during term, none after |
+    | CRT / CRAT / CRUT / CLT | ✅ | ⚠️ income interest only | Defer; Open Question |
+    | Grantor DECEASED | historical | retire OWNERSHIP if was revocable | Revocable becomes irrevocable at death |
+
+    **Detection heuristics** during extraction:
+    - `trust.isRevocable == true` → definitive. Emit OWNERSHIP.
+    - `trust.isRevocable == false` → definitive. GRANTOR only.
+    - `isRevocable == null` AND filename/name contains "Revocable" / "Living Trust" → assume revocable; emit OWNERSHIP; flag confirmation.
+    - `isRevocable == null` AND name contains "Irrevocable" / "GST" / "ILIT" / "Exempt" / "Dynasty" / "Defective" / "GRAT" / "QPRT" / "CRT" / "CRUT" / "CLAT" / "CRAT" / "Descendants Trust" → assume irrevocable; GRANTOR only; flag confirmation.
+    - Document text with "revocable by grantor at any time" / "power of revocation" → revocable.
+    - Document text with "irrevocable" + "no power of revocation" → irrevocable.
+    - Ambiguous → GRANTOR only (safer default) + Open Question.
+
+    ### Also applies to client-owned operating LLCs
+
+    Every client-owned LLC / corporation / LP needs an OWNERSHIP edge from its
+    member(s)/shareholder(s), not just MEMBER / MANAGING_MEMBER / PARTNER / OFFICER.
+    Without OWNERSHIP, the household rollup can't see the LLC's assets. MEMBER
+    captures governance; OWNERSHIP captures economic rollup. Both edges coexist.
+
+    On the Verita 2026-04-23 review, these operating LLCs were created without
+    IND→LE OWNERSHIP edges and thus orphaned: **EPQ, VerJus, CTMR, Gelateria,
+    Golden City Padel, Hen House, Fort Point Beer, Promised Land**. All need
+    retrofit OWNERSHIP edges.
+
+    ### Third-party / shared entities — do NOT emit OWNERSHIP
+
+    Null `parentHouseholdId` is semantically correct for:
+    - Entities genuinely held by multiple client households (shared investment vehicle, co-invest LP)
+    - External corporate fiduciaries serving many clients' trusts (Bryn Mawr Trust Co. of Delaware, City National Bank, San Pasqual Fiduciary Trust Company)
+    - Investment funds clients subscribe to (Leadout Capital I/II, Avenue Sports Opportunities) — client owns their LP interest edge, fund itself has no single household owner
+    - Charitable beneficiary entities (Teen Impact Fund at Children's Hospital)
+
+    In those cases ownership is expressed only through the LP-interest / subscription
+    edge, never via parentHouseholdId.
+
+    ### Phase 3.7 self-audit addition
+
+    For every LegalEntity in `extraction_cache` where the decision matrix says
+    "OWNERSHIP YES", verify that BOTH a GRANTOR edge AND an OWNERSHIP edge to the
+    same grantor exist in `relationships_to_create.json`. If only GRANTOR exists and
+    the trust is revocable → FAIL the audit. This is the bug class that produced
+    orphan trusts on Comolli / Chen-Park / Garcia / Hamilton / Boro / Stein.
+
+    ### Retrofit sweep for pre-Rule 60 onboarded households
+
+    For households onboarded before this rule shipped, run a one-shot retrofit:
+
+    ```python
+    # orphan_ownership_retrofit.py
+    #
+    # For every LegalEntity with parentHouseholdId=null that has an active
+    # GRANTOR or MEMBER/MANAGING_MEMBER relationship from a client Individual,
+    # classify against Rule 60's decision matrix. Emit OWNERSHIP 100% for
+    # revocable-trust + client-owned-LLC types; leave irrevocable trusts,
+    # corporate fiduciaries, shared funds, and charitable recipients as null.
+    for le in list_legal_entities(firmId, parentHouseholdId=null):
+        rels = get_to_legal_entity_relationships(le.id)
+        grantor = find_first(rels, type="GRANTOR", source_type="INDIVIDUAL")
+        member  = find_first(rels, type="MEMBER",  source_type="INDIVIDUAL") \
+               or find_first(rels, type="MANAGING_MEMBER", source_type="INDIVIDUAL")
+        source = grantor or member
+        if not source: continue  # genuinely orphan or third-party
+        classification = classify_entity(le, source)
+        if classification in ("REVOCABLE_TRUST", "OPERATING_LLC_CLIENT_OWNED"):
+            emit_ownership_edge(source=source, target=le, pct=100,
+                                role=f"Grantor (revocable trust)" if grantor else "Member (LLC)")
+    ```
+
+    Operator confirms each candidate unless the name is unambiguous ("Revocable" /
+    "Living Trust" → auto-approve; "Irrevocable" / "Dynasty" / "GST" / "ILIT" →
+    auto-decline).
 
 ---
 
