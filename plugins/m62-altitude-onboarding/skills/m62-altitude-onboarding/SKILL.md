@@ -5251,6 +5251,66 @@ for a reference example (Cummings Family handoff).
     vs. "investment fund many people subscribe to" (no edge). The former is administered
     under this household's engagement; the latter isn't.
 
+    ### API quirks verified on the Verita 2026-04-23 cleanup run
+
+    Three non-obvious backend behaviors that change how you must call the API:
+
+    **1. POST entity-relationship `percentage: 0` silently normalizes to 100.**
+    `EntityRelationshipService.save(dto)` had a bug that defaulted BOTH null AND zero
+    OWNERSHIP percentage to 100 (backend PR #211 fixes it to only default on null).
+    Until that fix is deployed to every environment you touch:
+    - POST with `percentage: 0` as usual (it'll be stored as 100)
+    - Immediately PATCH the same edge with `percentage: 0` — PATCH bypasses the
+      normalization and persists 0 correctly
+    - Verify with GET that stored percentage is `0.0000`
+
+    After PR #211 deploys, POST `percentage: 0` persists directly — skip the PATCH step.
+
+    **2. `parentHouseholdId` on Individual is NOT directly PATCHable.**
+    PATCH `/api/v1/individual/{id}` with `{"parentHouseholdId": "..."}` returns 200 OK
+    but silently no-ops. The field is derived from traversing HOUSEHOLD→INDIVIDUAL
+    OWNERSHIP edges, not writable.
+
+    **To parent an Individual to a household**, POST the OWNERSHIP edge:
+    ```json
+    POST /api/v1/entity-relationship
+    {
+      "sourceEntityType": "HOUSEHOLD", "sourceEntityId": "<household UUID>",
+      "targetEntityType": "INDIVIDUAL", "targetEntityId": "<individual UUID>",
+      "relationshipType": "OWNERSHIP",
+      "percentage": 100,
+      "role": "G1/G2 family member"
+    }
+    ```
+
+    `propagateParentHousehold` fires inside `save()` and updates the target's
+    `parentHouseholdId` column automatically. Verify by re-fetching the Individual —
+    `parentHouseholdId` and `owners[]` are now populated.
+
+    The same rule applies to LegalEntity's `parentHouseholdId` — derived from an inbound
+    OWNERSHIP edge, not directly PATCHable.
+
+    **3. Soft-deleting an entity with active relationship edges is BLOCKED (409).**
+    `DELETE /api/v1/legal-entity/{id}` (soft) returns `409 Entity In Use` if ANY
+    non-deleted entity_relationship row references it, even if the referenced entities
+    are themselves deleted. The deletion guard counts relationships, not entities.
+
+    Cleanup sequence for blocked soft-deletes:
+    1. Query ALL inbound AND outbound relationships via
+       `/entity-relationship/to/{TYPE}/{id}` + `/entity-relationship/from/{TYPE}/{id}`
+    2. For each relationship ID returned, call `DELETE /entity-relationship/{relId}`
+       (soft-delete the edges one at a time — this is allowed without ROLE_ADMIN)
+    3. Retry the original `DELETE /api/v1/{entity-type}/{id}` — now unblocked
+
+    `DELETE /entity-relationship/{id}/hard` requires `ROLE_ADMIN` (super-admin), NOT
+    firm-admin. API keys (`ak_live_*`) have firm-admin only, so the hard-delete path
+    returns 403. Use the soft-delete cascade above instead.
+
+    **Uniqueness caveat (Rule 21)**: soft-deleted relationships still enforce
+    `(source, target, type)` uniqueness. If you soft-delete X→Y OWNERSHIP and then POST
+    a new X→Y OWNERSHIP, you get 409. For cleanup deletes this isn't a problem (you
+    don't recreate what you deleted), but be aware if you're fixing mistaken edges.
+
     ### Phase 3.7 self-audit addition
 
     For every LegalEntity in `extraction_cache`, verify:
