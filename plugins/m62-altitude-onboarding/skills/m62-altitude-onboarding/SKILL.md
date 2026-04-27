@@ -4557,6 +4557,18 @@ for a reference example (Cummings Family handoff).
     source+target+type, you will get a 409 Conflict. Either avoid deleting relationships, or
     use the hard-delete endpoint (`DELETE /{id}/hard`) for error correction.
 
+    **Recovering a soft-deleted edge UUID** (when 409 blocks re-POST and the UUID isn't logged):
+    `?scope=ALL_TENANTS` does NOT include soft-deleted rows on `/to/` or `/from/`. Use
+    `?includeDeleted=true` instead — verified 2026-04-26 production:
+    ```
+    GET /api/v1/entity-relationship/to/LEGAL_ENTITY/{le_id}?includeDeleted=true
+    ```
+    Returns the active edges PLUS rows with `deleted: true`. Filter for the
+    `(source, target, type)` you're trying to re-POST, capture the soft-deleted UUID,
+    then `DELETE /api/v1/entity-relationship/{id}/hard` (admin JWT). Don't combine with
+    `?scope=ALL_TENANTS` — pick one based on whether you need cross-tenant or
+    deleted-row visibility.
+
 22. **Identity documents use `OTHER` subtype.** `DRIVERS_LICENSE` and `PASSPORT` subtypes are
     for IdentificationDocument entities, NOT IndividualDocument. When uploading DLs or passports
     via `/api/v1/individual/{id}/document`, use `documentSubType: "OTHER"` with a descriptive
@@ -5407,6 +5419,40 @@ for a reference example (Cummings Family handoff).
       emit visibility 0% + Open Question on retained-interest percentage
     - Third-party / shared / external-fiduciary / subscribed-fund / charitable-recipient
       → no edge (Rule 53 applies — they're Contacts, not LegalEntities)
+
+61. **Admin JWT and firm-admin API key are NOT interchangeable — entities land in the
+    auth's bound tenant.**
+
+    The two auth modes have asymmetric powers AND asymmetric tenant scopes. Picking the
+    wrong one for a write creates ghost rows invisible to firm queries.
+
+    | Auth | Read scope | Hard-delete (`/hard`) | POST/PATCH writes | New row's `tenantId` |
+    |---|---|---|---|---|
+    | **Firm-admin API key** (`X-API-Key: ak_live_...`) | Firm tenant only | **403 forbidden** | OK | Firm tenant ✓ |
+    | **Admin JWT super-admin** (`Authorization: Bearer ...`, `admin@localhost`) | Cross-tenant via `?scope=ALL_TENANTS` | **OK** | OK, but lands in admin's tenant ✗ | Admin's tenant (e.g., `036296f4-...`) |
+
+    **The trap**: POST a new edge with admin JWT → returns 201 → row created with
+    `tenantId: <admin tenant>` → invisible to firm-admin `/to/` queries → dashboard shows
+    no edge → you POST again with firm-admin → 409 conflict (because row exists in admin
+    tenant). Wasted work, plus a ghost row in the wrong tenant.
+
+    **Hybrid auth pattern** (use this for any session that needs hard-delete):
+    1. Reads + classification: firm-admin API key
+    2. Hard-delete (`/entity-relationship/{id}/hard`): admin JWT
+    3. POST/PATCH writes: firm-admin API key (so the new row's tenantId matches)
+
+    **Verification step after admin-JWT writes**: every entity created with admin JWT
+    should be GET'd via firm-admin API key. If it returns 404, the row landed in the
+    wrong tenant — hard-delete it (admin JWT) and re-POST with firm-admin API key.
+
+    **Practical implications**:
+    - Phase 6 / Phase 7 should default to firm-admin API key for ALL writes. Only
+      `find_soft_deleted_via_includeDeleted` → `hard_delete (jwt)` → `re-POST (api_key)`
+      cleanup flows need admin JWT, and they never POST with the JWT.
+    - On the recent Boro-Hamilton recovery, an admin-JWT POST landed the visibility edge
+      in the admin user's tenant, not the firm's. Firm-admin `/to/` showed 0 HH→LE
+      OWNERSHIP edges despite the 201 response. Cleanup: hard-delete the wrong-tenant
+      edge, re-POST with API key. Always verify post-write.
 
 ---
 
