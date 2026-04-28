@@ -2549,7 +2549,8 @@ actively wrong per authoritative source documents — distinct from field-level 
 > ⚠️ Soft-delete does NOT release uniqueness. If you soft-delete OWNERSHIP X→Y and POST a
 > new OWNERSHIP X→Y, you get HTTP 409. Use hard-delete or mark-historical — never
 > soft-delete-and-recreate with the same source+target+type. This is the same constraint
-> Rule 41 (Role replacements) relies on.
+> Rule 41 (Role replacements) relies on. But first apply Rule 74 disambiguation —
+> many 409s on relationship POST are live duplicates not phantoms.
 
 API recipes:
 ```bash
@@ -2906,6 +2907,166 @@ with `Content-Type: application/merge-patch+json`. This rule is distinct from
 Rule 41 (role replacement, where the role-holder changes — old edge is retired
 via `effectiveTo`, new edge is POSTed for the new holder). Use PATCH-upgrade
 ONLY when the source AND target are unchanged and only the type/percentage shifts.
+
+### Step 4.7c: Disambiguating 409 on relationship POST (Rule 74)
+
+**A 409 on `POST /api/v1/entity-relationship` does NOT automatically mean a phantom
+soft-delete is blocking the write.** The uniqueness constraint
+`(sourceEntityId, sourceEntityType, targetEntityId, targetEntityType)` is enforced
+across **both live AND soft-deleted rows**, so a 409 has three distinct causes:
+
+1. **Live duplicate** — a non-deleted row with the same shape already exists. The
+   edge is already there; nothing to do. The agent should mark this `already_present`
+   and move on.
+2. **Soft-deleted phantom** — a `deleted: true` row blocks re-POST. Genuine admin-JWT
+   hard-delete cleanup case (Rule 66 + Rule 21).
+3. **Live mismatch** — a non-deleted row exists between the same source/target but
+   with a different `relationshipType` or `percentage`. PATCH-in-place is correct
+   here (Rule 73), NOT POST.
+
+The skill MUST disambiguate before logging anything to
+`run_state.softDeletedAwaitingHardDelete[]`. Otherwise the admin-JWT cleanup
+backlog gets overcounted with cases that need no admin action.
+
+**Discovered on the Tenet admin-JWT cleanup pass**: 3 HOUSEHOLD→LegalEntity
+OWNERSHIP 0% visibility edges had been logged as `softDeletedAwaitingHardDelete`
+during a Phase 6 push. When the admin-JWT pass ran, 2 of the 3 edges were already
+present as live, non-deleted rows — the 409 was a duplicate-rejection of an edge
+that already existed, not a phantom soft-delete. Only 1 was a true phantom needing
+hard-delete.
+
+**Disambiguation step (run before logging admin-JWT cleanup):**
+
+```
+GET /api/v1/entity-relationship/from/{sourceEntityType}/{sourceEntityId}?includeDeleted=true&scope=ALL_TENANTS
+```
+
+Filter the response for rows matching `targetEntityId` AND `targetEntityType`,
+then classify:
+
+| Existing row | `deleted` | `effectiveTo` | Same `relationshipType` + `percentage`? | Classification | Action |
+|---|---|---|---|---|---|
+| Yes | `false` | `null` | Yes | `already_present` | Log to `relationship_post_results.json`; **do NOT** add to `softDeletedAwaitingHardDelete[]` |
+| Yes | `false` | `null` | No (different type or pct) | `live_mismatch_use_patch` | Apply Rule 73 — PATCH the existing edge in place; do NOT POST and do NOT log as phantom |
+| Yes | `true` | n/a | n/a | `soft_deleted_phantom` | Genuine admin-JWT cleanup. Log full UUID per Rule 66 to `softDeletedAwaitingHardDelete[]` |
+| No | n/a | n/a | n/a | unexpected — re-investigate (the 409 came from somewhere) | Surface as Open Question; do NOT auto-log as phantom |
+
+**Recipe (bash):**
+
+```bash
+SRC_TYPE="HOUSEHOLD"; SRC_ID="<source uuid>"
+TGT_TYPE="LEGAL_ENTITY"; TGT_ID="<target uuid>"
+WANTED_TYPE="OWNERSHIP"; WANTED_PCT="0"
+
+# Triggered by: POST /api/v1/entity-relationship → 409
+# Before logging to softDeletedAwaitingHardDelete[], classify the existing row.
+
+EXISTING=$(curl -s -H "X-API-Key: $KEY" \
+  "$API/api/v1/entity-relationship/from/${SRC_TYPE}/${SRC_ID}?includeDeleted=true&scope=ALL_TENANTS" \
+  | jq --arg t "$TGT_ID" --arg tt "$TGT_TYPE" \
+    '[.[] | select(.targetEntityId == $t and .targetEntityType == $tt)]')
+
+LIVE_MATCH=$(echo "$EXISTING" | jq --arg rt "$WANTED_TYPE" --arg pct "$WANTED_PCT" \
+  '[.[] | select(.deleted == false and .effectiveTo == null
+                  and .relationshipType == $rt
+                  and ((.percentage // 0) | tostring) == $pct)] | first // empty')
+
+LIVE_MISMATCH=$(echo "$EXISTING" | jq --arg rt "$WANTED_TYPE" --arg pct "$WANTED_PCT" \
+  '[.[] | select(.deleted == false and .effectiveTo == null
+                  and (.relationshipType != $rt
+                       or ((.percentage // 0) | tostring) != $pct))] | first // empty')
+
+PHANTOM=$(echo "$EXISTING" | jq '[.[] | select(.deleted == true)] | first // empty')
+
+if [ -n "$LIVE_MATCH" ]; then
+  echo "already_present — edge exists live; no action"
+  # Append to relationship_post_results.json with classification: "already_present"
+elif [ -n "$LIVE_MISMATCH" ]; then
+  echo "live_mismatch_use_patch — apply Rule 73 PATCH-in-place"
+  # Do NOT POST; do NOT log as phantom. Hand off to Rule 73 PATCH path.
+elif [ -n "$PHANTOM" ]; then
+  echo "soft_deleted_phantom — genuine admin-JWT cleanup case"
+  # Log FULL UUID per Rule 66 into run_state.softDeletedAwaitingHardDelete[]
+else
+  echo "unexpected — 409 with no matching row; surface as Open Question"
+fi
+```
+
+**Recipe (python):**
+
+```python
+def classify_relationship_post_409(api, src_type, src_id, tgt_type, tgt_id,
+                                   wanted_type, wanted_pct):
+    rows = api.get(
+        f"/api/v1/entity-relationship/from/{src_type}/{src_id}",
+        params={"includeDeleted": "true", "scope": "ALL_TENANTS"},
+    )
+    matches = [r for r in rows
+               if r["targetEntityId"] == tgt_id
+               and r["targetEntityType"] == tgt_type]
+
+    live = [r for r in matches if not r["deleted"] and r.get("effectiveTo") is None]
+    same_shape = [r for r in live
+                  if r["relationshipType"] == wanted_type
+                  and float(r.get("percentage") or 0) == float(wanted_pct)]
+    diff_shape = [r for r in live if r not in same_shape]
+    phantom = [r for r in matches if r["deleted"]]
+
+    if same_shape:
+        return ("already_present", same_shape[0])
+    if diff_shape:
+        return ("live_mismatch_use_patch", diff_shape[0])  # hand to Rule 73
+    if phantom:
+        return ("soft_deleted_phantom", phantom[0])         # log per Rule 66
+    return ("unexpected_409", None)
+```
+
+**Logging contract (`relationship_post_results.json`)** — every POST attempt that
+returns 409 SHOULD record one of these classifications, never a bare "blocked":
+
+```json
+{
+  "attempted_post": {
+    "sourceEntityType": "HOUSEHOLD", "sourceEntityId": "<uuid>",
+    "targetEntityType": "LEGAL_ENTITY", "targetEntityId": "<uuid>",
+    "relationshipType": "OWNERSHIP", "percentage": 0
+  },
+  "http_status": 409,
+  "classification": "already_present",
+  "existing_row_uuid": "<uuid>",
+  "action_taken": "none — edge already live",
+  "ts": "<iso8601>"
+}
+```
+
+**How Rule 74 fits with adjacent rules:**
+
+- **Rule 21 / Rule 66** — soft-deleted relationships still enforce uniqueness; that
+  is still true. Rule 74 does NOT contradict it; it adds the disambiguation step
+  *before* deciding the 409 is a soft-delete-induced block.
+- **Rule 66** — the FULL-UUID logging requirement still applies, but only when
+  classification is `soft_deleted_phantom`. Rule 74 prevents `already_present` and
+  `live_mismatch_use_patch` cases from ever hitting that log.
+- **Rule 73** — `live_mismatch_use_patch` is a Rule 73 PATCH-upgrade case. Rule 74
+  is the routing step that *recognizes* it as such instead of treating the 409 as
+  a phantom.
+
+#### Rule 74 — Disambiguate 409 on relationship POST: live duplicate vs phantom soft-delete
+
+A 409 on `POST /api/v1/entity-relationship` has three causes — live duplicate,
+soft-deleted phantom, or live mismatch — because the
+`(sourceEntityId, sourceEntityType, targetEntityId, targetEntityType)` uniqueness
+constraint covers BOTH live and soft-deleted rows. Before logging to
+`run_state.softDeletedAwaitingHardDelete[]`, the agent MUST GET existing rows via
+`/api/v1/entity-relationship/from/{sourceEntityType}/{sourceEntityId}?includeDeleted=true&scope=ALL_TENANTS`
+and classify the matching target row. Classify as `already_present` (live row,
+same shape — log to `relationship_post_results.json`, do nothing else),
+`live_mismatch_use_patch` (live row, different type/percentage — apply Rule 73
+PATCH-in-place), or `soft_deleted_phantom` (deleted row blocking re-POST — log
+full UUID per Rule 66 for admin-JWT hard-delete). Discovered on the Tenet
+admin-JWT cleanup: 2 of 3 "blocked" edges were already-live duplicates, not
+phantoms. Skipping this disambiguation overcounts the admin-JWT backlog and hides
+genuine PATCH-upgrade cases as fake cleanup work.
 
 ### Step 4.8: Addepar (or any externally-synced) Account Handling — READ-ONLY
 
@@ -5957,6 +6118,8 @@ for a reference example (RM handoff format).
     `(source, target, type)` uniqueness. If you soft-delete X→Y OWNERSHIP and then POST
     a new X→Y OWNERSHIP, you get 409. For cleanup deletes this isn't a problem (you
     don't recreate what you deleted), but be aware if you're fixing mistaken edges.
+    But first apply Rule 74 disambiguation — many 409s on relationship POST are
+    live duplicates not phantoms.
 
     ### Phase 3.7 self-audit addition
 
@@ -6347,7 +6510,10 @@ for a reference example (RM handoff format).
     Apply to every soft-delete: entity-relationships, LegalEntities, Individuals,
     Contacts, AccountFinancials, Liabilities, InsurancePolicies, TangibleAssets,
     Documents. Track them under `run_state.softDeletedAwaitingHardDelete[]` so a
-    nightly admin sweep can target them by full UUID.
+    nightly admin sweep can target them by full UUID. **For 409s on relationship
+    POST specifically, first apply Rule 74 disambiguation — many 409s are live
+    duplicates not phantoms, and only the `soft_deleted_phantom` classification
+    belongs in `softDeletedAwaitingHardDelete[]`.**
 
 67. **Search & merge endpoints — always pass `parentHouseholdId` AND defense-in-depth
     client-filter.**
