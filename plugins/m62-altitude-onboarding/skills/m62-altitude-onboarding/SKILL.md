@@ -4272,6 +4272,243 @@ HOUSEHOLD → Grandchild2 (OWNERSHIP, percentage: 100, role: "G3")
 Validate each relationship against the matrix in Phase 4.5 before posting. If validation fails,
 flag for user review.
 
+### Step 6.4: Post-write verification (Rule 75)
+
+**Required after every entity POST, every entity PATCH, and every relationship POST in
+Phase 6.** A persistence audit on the production fleet found **134 of 427 documents
+(31%) and 82 of 450 entities (18%)** that prior runs *claimed* to upload/create are
+actually 404 in production. The Boro-Hamilton rerun caught **28 entities with `id: null`
+in the prior `run_state`** (20 TangibleAssets + 8 AccountFinancials) plus **136 documents
+that 404'd on download**. Root cause: Step 6.2 / 6.3 only said "record the returned IDs"
+— there was no explicit response-code check, no assertion that the response body
+contained a non-null `id`, and no GET-back to confirm the row was queryable. A POST that
+returned a non-201 status, or a body without an `id`, was silently treated as success.
+
+Rule 75 closes this by mandating a three-part verify pattern on every Phase 6 write —
+exactly parallel to Rule 70's Phase 7 download-verify pattern. Together they form the
+complete write-verification system: Rule 75 covers entity + relationship creation;
+Rule 70 covers document content.
+
+#### Endpoints in scope
+
+All Phase 6 write endpoints:
+
+- `POST /api/v1/individual`
+- `POST /api/v1/legal-entity`
+- `POST /api/v1/account-financial`
+- `POST /api/v1/contact`
+- `POST /api/v1/insurance-policy`
+- `POST /api/v1/liability`
+- `POST /api/v1/tangible-asset/{subtype}` (`/real-property`, `/vehicle`, `/luxury`,
+  `/collectible`, `/other`)
+- `POST /api/v1/entity-relationship`
+- `PATCH /api/v1/{resource}/{id}` for any of the above resource types
+
+#### PASS criteria for entity POST (Step 6.2)
+
+ALL must hold:
+
+1. **`status_code == 201`** — Altitude returns 201 Created, NOT 200, on a successful
+   create. A 200 on a POST is a non-standard signal and should be treated as suspicious;
+   log and verify before continuing.
+2. Response body is valid JSON and contains a **non-null UUID** in the `id` field.
+3. **Immediate `GET /api/v1/{resource}/{id}` returns 200** with the row populated. The
+   GET-back catches eventual-consistency or partial-write cases where the POST appeared
+   to succeed but the row was not actually persisted (or was rolled back by a downstream
+   trigger).
+4. The verified UUID is stored in `run_state` — **NEVER store `id: null`**. If `id` is
+   null, treat as FAIL (see below).
+
+#### PASS criteria for entity PATCH
+
+1. **`status_code == 200`** — PATCH returns 200, not 201.
+2. Response body contains the updated entity with the patched fields reflected.
+3. (Optional but recommended for high-value fields like `parentHouseholdId`,
+   `taxId`, ownership-related fields) GET-back to confirm the patched fields stuck.
+   PATCH 200 with silent no-op is a known failure mode for derived fields — see Rule 60's
+   `parentHouseholdId` quirk.
+
+#### PASS criteria for relationship POST (Step 6.3)
+
+1. **`status_code == 201`**.
+2. Response body contains a non-null relationship `id`.
+3. Immediate `GET /api/v1/entity-relationship/{id}` returns 200.
+
+(For 409 responses on relationship POST, apply Rule 74 disambiguation FIRST — many 409s
+are live duplicates, not failures. Rule 75 verification kicks in on 2xx responses only;
+4xx/5xx flow through the dedicated 4xx/5xx handlers.)
+
+#### FAIL handling — log, do NOT auto-retry
+
+On any verification failure, append a structured entry to
+`{household_folder}/altitude_review/phase6_create_failures.jsonl` (one JSON object per
+line):
+
+```json
+{
+  "ts": "2026-04-28T14:32:11Z",
+  "operation": "POST | PATCH | relationship_POST",
+  "endpoint": "/api/v1/legal-entity",
+  "request_body_excerpt": {"legalName": "...", "entityType": "TRUST"},
+  "response_status": 200,
+  "response_body_excerpt": "{\"message\": \"...\"}",
+  "failure_reason": "non_201_status | missing_id | get_back_404 | timeout | json_parse_error"
+}
+```
+
+- **Do NOT auto-retry the same write blindly** — a retry on a write that actually
+  succeeded but returned a malformed response will create a duplicate. The skill instead
+  surfaces the failure to the user via the Phase 5/9 review.
+- **Do NOT mark the entity as CREATED in `run_state`.** The entity stays in
+  `pending_creates` (or its analog) so the user can review the failure and either
+  manually verify the row exists in Altitude (and supply the UUID) or re-run the create
+  after the underlying issue is fixed.
+- The same rule applies to relationship POSTs — log to
+  `phase6_create_failures.jsonl` with `operation: "relationship_POST"`, do not mark the
+  edge as CREATED, surface to review.
+
+#### Halt criterion — circuit breaker on systemic failures
+
+If the **Phase 6 create-failure rate exceeds ~5% of attempts** (entity POSTs +
+relationship POSTs combined, measured over a rolling window of at least 20 attempts),
+**HALT Phase 6** immediately and emit a Q-blocker. Do not continue posting against a
+backend that's silently dropping writes — that is exactly the failure mode that produced
+134 missing docs and 82 missing entities across Wave 1+2 before this rule existed. A
+healthy push has a near-zero create-failure rate; >5% indicates a backend incident, an
+auth scope issue, or a payload-shape regression that the user must investigate before
+the agent burns through more of the create plan.
+
+#### Verification recipe (Python — copy-pasteable)
+
+Python is preferred over bash here because the verify-pattern needs structured JSON
+parsing of the response body (status, `id` field, error envelope). The same shape works
+for entity POST, entity PATCH, and relationship POST — adjust expected status and
+endpoint accordingly.
+
+```python
+import json
+import requests
+from datetime import datetime, timezone
+
+BASE = "https://api.m62.live"
+HEADERS = {"X-API-Key": API_KEY, "X-Firm-Id": FIRM_ID, "Content-Type": "application/json"}
+FAILURE_LOG = f"{HOUSEHOLD_FOLDER}/altitude_review/phase6_create_failures.jsonl"
+
+
+def _log_failure(operation, endpoint, body, status, response_excerpt, reason):
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "operation": operation,
+        "endpoint": endpoint,
+        "request_body_excerpt": {k: v for k, v in (body or {}).items() if k in (
+            "legalName", "name", "firstName", "lastName", "entityType",
+            "policyNumber", "accountNumber", "relationshipType",
+            "sourceEntityId", "targetEntityId",
+        )},
+        "response_status": status,
+        "response_body_excerpt": (response_excerpt or "")[:500],
+        "failure_reason": reason,
+    }
+    with open(FAILURE_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def verified_create(endpoint, body):
+    """Phase 6 entity create with Rule 75 verification.
+
+    Returns the new UUID on full PASS, or None on any FAIL (caller MUST NOT
+    record None as an entity id in run_state).
+    """
+    try:
+        r = requests.post(f"{BASE}{endpoint}", json=body, headers=HEADERS, timeout=30)
+    except requests.RequestException as e:
+        _log_failure("POST", endpoint, body, 0, str(e), "timeout")
+        return None
+    if r.status_code != 201:
+        _log_failure("POST", endpoint, body, r.status_code, r.text, "non_201_status")
+        return None
+    try:
+        data = r.json()
+    except ValueError:
+        _log_failure("POST", endpoint, body, r.status_code, r.text, "json_parse_error")
+        return None
+    new_id = data.get("id")
+    if not new_id:
+        _log_failure("POST", endpoint, body, r.status_code, r.text, "missing_id")
+        return None
+    # GET-back to confirm queryable
+    g = requests.get(f"{BASE}{endpoint}/{new_id}", headers=HEADERS, timeout=15)
+    if g.status_code != 200:
+        _log_failure("POST", endpoint, body, g.status_code, g.text, "get_back_404")
+        return None
+    return new_id
+
+
+def verified_patch(endpoint, entity_id, body):
+    """Phase 6 entity PATCH with Rule 75 verification (expects 200, not 201)."""
+    url = f"{BASE}{endpoint}/{entity_id}"
+    try:
+        r = requests.patch(url, json=body, headers=HEADERS, timeout=30)
+    except requests.RequestException as e:
+        _log_failure("PATCH", endpoint, body, 0, str(e), "timeout")
+        return False
+    if r.status_code != 200:
+        _log_failure("PATCH", endpoint, body, r.status_code, r.text, "non_201_status")
+        return False
+    return True
+
+
+def verified_relationship(body):
+    """Phase 6 relationship POST with Rule 75 verification.
+    Apply Rule 74 disambiguation FIRST on 409s; this helper covers 2xx-or-fail."""
+    endpoint = "/api/v1/entity-relationship"
+    try:
+        r = requests.post(f"{BASE}{endpoint}", json=body, headers=HEADERS, timeout=30)
+    except requests.RequestException as e:
+        _log_failure("relationship_POST", endpoint, body, 0, str(e), "timeout")
+        return None
+    if r.status_code != 201:
+        _log_failure("relationship_POST", endpoint, body, r.status_code, r.text, "non_201_status")
+        return None
+    try:
+        rel_id = r.json().get("id")
+    except ValueError:
+        _log_failure("relationship_POST", endpoint, body, r.status_code, r.text, "json_parse_error")
+        return None
+    if not rel_id:
+        _log_failure("relationship_POST", endpoint, body, r.status_code, r.text, "missing_id")
+        return None
+    g = requests.get(f"{BASE}{endpoint}/{rel_id}", headers=HEADERS, timeout=15)
+    if g.status_code != 200:
+        _log_failure("relationship_POST", endpoint, body, g.status_code, g.text, "get_back_404")
+        return None
+    return rel_id
+```
+
+The harness around these helpers must also track running attempt + failure counts; if
+`failures / max(attempts, 1) > 0.05` after at least 20 attempts, raise the Phase 6 halt
+described above.
+
+#### Rule 75 — Phase 6 post-write verification — assert status, assert id, GET-to-verify
+
+After every entity POST (Step 6.2), entity PATCH, and relationship POST (Step 6.3) in
+Phase 6, the skill MUST: (a) assert the HTTP status — 201 for POSTs, 200 for PATCHes —
+NOT just "2xx"; (b) parse the response body and assert a non-null UUID `id` field is
+present (entity POST and relationship POST); (c) issue an immediate `GET
+/api/v1/{resource}/{id}` and confirm 200 with the row populated. Any failure logs a
+structured entry to `{household_folder}/altitude_review/phase6_create_failures.jsonl`
+with `operation`, `endpoint`, `request_body_excerpt`, `response_status`,
+`response_body_excerpt`, and `failure_reason` (`non_201_status`, `missing_id`,
+`get_back_404`, `timeout`, or `json_parse_error`). The failed entity is NOT marked
+CREATED in `run_state` — its UUID stays unset and the failure is surfaced to the
+Phase 5/9 review for user adjudication. The skill MUST NOT auto-retry the same write
+blindly (duplicate-create risk). If the create-failure rate exceeds ~5% of attempts
+(measured over ≥20 attempts), HALT Phase 6 and emit a Q-blocker — this prevents
+fleet-scale silent failures of the kind that produced 134 missing docs and 82 missing
+entities across Wave 1+2 before this rule existed. Rule 75 is the Phase 6 parallel of
+Rule 70's Phase 7 download-verify pattern; together they form a complete write-and-
+upload verification system.
+
 ---
 
 ## Phase 7: Upload Documents
@@ -5040,6 +5277,61 @@ this catches a class of bug that byte-count + content-type cannot: a response wi
 the correct size and MIME but the wrong bytes (e.g. backend serves a different
 document due to S3 key collision, race condition during write, or a content swap).
 
+> ⚠ **Compute SHA256 from the GET /content response body, NOT from
+> `DocumentDto.checksumSHA256`.** The Glickman rerun (151 docs, ALL with
+> `checksumSHA256: null` server-side — pre-checksum-feature legacy uploads) and the
+> Ramonas rerun (91 fresh uploads, ALSO `checksumSHA256: null`) revealed that the
+> backend's DTO `checksumSHA256` field is **not reliably populated** — it is null on
+> legacy docs AND on fresh uploads. **Only the on-download SHA256 of the actual bytes
+> is authoritative.** Never compare `DocumentDto.checksumSHA256` to the source SHA;
+> always compute the downloaded SHA from the `/content` response body as shown above,
+> and compare that to the source-on-disk SHA. If you happen to read
+> `DocumentDto.checksumSHA256` for any other reason (audit logging, etc.), treat its
+> null-ness as expected and DO NOT log a verification failure on that basis alone.
+
+#### Legacy pre-checksum fallback — when /content 404s but the DTO is queryable
+
+A subset of legacy documents — older firm uploads that pre-date the checksum feature
+and have since been admin-purged from S3 (or were uploaded with a now-broken upload
+session) — return **404 from `GET /api/v1/document/{id}/content`** even though
+`GET /api/v1/document/{id}` (the DTO) returns 200 with a populated `fileSize`. This is
+a pre-existing data-integrity issue, NOT a corruption introduced by the current run.
+
+**Detection + classification:**
+
+```bash
+# After /content 404, fall back to DTO probe
+DTO_HTTP=$(curl -s -o /tmp/dto_${DOC_ID}.json -w '%{http_code}' \
+  -H "X-API-Key: ${API_KEY}" -H "X-Firm-Id: ${FIRM_ID}" \
+  "${BASE}/api/v1/document/${DOC_ID}")
+
+if [[ "${HTTP_CODE}" == "404" && "${DTO_HTTP}" == "200" ]]; then
+  DTO_SIZE=$(jq -r '.fileSize // empty' /tmp/dto_${DOC_ID}.json)
+  if [[ -n "${DTO_SIZE}" && "${DTO_SIZE}" == "${SOURCE_BYTES}" ]]; then
+    echo "LEGACY_PRE_CHECKSUM — DTO present, /content purged, fileSize matches source"
+    # Log as legacy_pre_checksum_unverifiable, NOT as corruption
+  fi
+fi
+```
+
+When `/content` returns 404 BUT `GET /api/v1/document/{id}` returns 200 AND the DTO's
+`fileSize` matches the source-on-disk byte count, treat the document as
+**`LEGACY_PRE_CHECKSUM`** rather than as a corruption case. Log to
+`phase7_verification_failures.jsonl` with `failure_reason:
+"legacy_pre_checksum_unverifiable"`:
+
+```json
+{"document_id": "<uuid>", "source_path": "<path>", "uploaded_content_type": "PDF", "expected_bytes": 184320, "downloaded_bytes": null, "src_sha256": "<hex>", "downloaded_sha256": null, "http_code": 404, "dto_http_code": 200, "dto_file_size": 184320, "response_content_type": null, "failure_reason": "legacy_pre_checksum_unverifiable", "occurred_at": "YYYY-MM-DDTHH:MM:SSZ"}
+```
+
+This distinguishes the legacy-purged case (no action — pre-existing condition) from the
+metadata-shell / size-mismatch / content-corruption cases (which require user
+adjudication or backend escalation). Include the legacy bucket in the Phase 8
+open-items packet under "FYI — pre-existing data integrity" rather than as a blocking
+item. If the source-on-disk SHA matches a same-name doc in another household for the
+same firm (Glickman fell back to size + filename matching for 151 such docs), note that
+in the open-items packet but do NOT attempt to re-upload — duplicate-document risk.
+
 #### PASS criteria (ALL must hold)
 
 - `HTTP_CODE` is `200`
@@ -5100,17 +5392,26 @@ MUST `GET /api/v1/document/{id}/content` and confirm that the returned body is
 (a) non-empty, (b) byte-exact (or within ±256 bytes if and only if a future
 api.json documents server-side wrapping), (c) has a response `Content-Type`
 consistent with the upload's `contentType` enum, AND (d) has a SHA256 hash equal
-to SHA256 of the source file on disk. The SHA256 check is a 2026-04-28
-augmentation — observed during Lamond Family Wave 1 verification — and catches
-content-corruption cases (S3 key collision, write-race, content swap) where size
-and MIME are correct but the bytes returned are from a different document.
-Failures are logged to `phase7_verification_failures.jsonl` with both source and
-downloaded SHA256, the document is marked `NOT_VERIFIED` in
-`run_state.documents[]`, and the failure is surfaced in the user-facing review.
-The skill MUST NOT auto-re-upload on FAIL — duplicate-document risk outweighs the
-benefit. A run with zero documents uploaded still ends Phase 7 with a (possibly
-empty) `phase7_verification_failures.jsonl` so downstream tooling can rely on the
-file's presence.
+to SHA256 of the source file on disk. The SHA256 MUST be computed from the actual
+`/content` response body — NOT from the DTO's `checksumSHA256` field, which is
+null on every observed document (legacy AND fresh uploads per Glickman + Ramonas
+reruns) and is therefore unreliable. Only the on-download SHA256 is authoritative.
+The SHA256 check is a 2026-04-28 augmentation — observed during Lamond Family
+Wave 1 verification — and catches content-corruption cases (S3 key collision,
+write-race, content swap) where size and MIME are correct but the bytes returned
+are from a different document. Failures are logged to
+`phase7_verification_failures.jsonl` with both source and downloaded SHA256,
+the document is marked `NOT_VERIFIED` in `run_state.documents[]`, and the failure
+is surfaced in the user-facing review. The skill MUST NOT auto-re-upload on FAIL —
+duplicate-document risk outweighs the benefit. A run with zero documents uploaded
+still ends Phase 7 with a (possibly empty) `phase7_verification_failures.jsonl`
+so downstream tooling can rely on the file's presence. **Legacy fallback**: when
+`GET /content` returns 404 but `GET /api/v1/document/{id}` returns 200 with a
+`fileSize` matching the source-on-disk byte count, classify as `LEGACY_PRE_CHECKSUM`
+and log with `failure_reason: "legacy_pre_checksum_unverifiable"` rather than as a
+corruption case — these are admin-purged pre-checksum-feature uploads (a
+pre-existing condition) and belong in the Phase 8 FYI bucket, not the blocking
+review.
 
 ---
 
@@ -6033,6 +6334,98 @@ for a reference example (RM handoff format).
     **Distinction**: "irrevocable trust the grantor established" (visibility edge applies)
     vs. "investment fund many people subscribe to" (no edge). The former is administered
     under this household's engagement; the latter isn't.
+
+    ### What does NOT count as a Rule 60 gap — external fund vehicle exception
+
+    Rule 60's "OWNERSHIP gap" detection (used by retrofit sweeps and Phase 3.7 self-audit)
+    has a **false-positive case** discovered on the Glickman rerun: an external
+    third-party fund vehicle was flagged as needing a HOUSEHOLD→LE OWNERSHIP visibility
+    edge when it should NOT have one. The AQR TA Legacy Fund, LLC (registered to AQR
+    Capital Management's Greenwich, CT office) was the canonical example — the
+    household's DPG Trust holds a **1.01% MEMBER edge** representing a fund-LP
+    investment, not ownership control. The agent correctly emitted a non-blocking
+    Q-blocker rather than auto-applying a visibility edge.
+
+    **An LE is classified as `FUND_VEHICLE` (and is EXEMPT from Rule 60 OWNERSHIP-gap
+    treatment) when ALL of the following hold:**
+
+    - The LE represents an external fund vehicle managed by a third-party fund manager
+      — NOT a household-controlled LLC, FLP, or trust.
+    - A household entity (Individual, trust, or other LE) has a small **MEMBER edge**
+      (typically <5%) representing a fund-LP investment, not ownership control.
+    - The LE is registered to a non-household-controlled address (e.g. a fund manager's
+      registered office in Greenwich CT, San Francisco CA, Boston MA, etc.) — not a
+      family residence, family office, or attorney's address used by the household.
+
+    **For these LEs:**
+
+    - DO NOT POST a HOUSEHOLD → LE OWNERSHIP 0% visibility edge (would
+      misrepresent the relationship and clutter the household graph).
+    - DO NOT POST an Individual/Trust → LE OWNERSHIP 100% economic edge (the household
+      owns a fractional LP interest, not the fund itself).
+    - The MEMBER edge with the documented percentage **IS** the correct economic model
+      per Rule 53 (third-party shared entities). Leave it as the sole edge; do not
+      promote, do not augment.
+
+    **Detection logic** — when a candidate Rule 60 gap LE has `parentHouseholdId == null`,
+    apply this gate BEFORE flagging as a gap:
+
+    ```python
+    # fund_vehicle_classifier.py — applied during Phase 3.7 self-audit and any
+    # Rule 60 retrofit sweep. Returns True if the LE should be EXEMPTED from
+    # Rule 60 OWNERSHIP-gap treatment.
+
+    KNOWN_FUND_MANAGERS = {
+        # Add as encountered during onboarding — common 3rd-party fund managers
+        "AQR", "AQR CAPITAL", "VANGUARD", "FIDELITY", "BLACKROCK",
+        "BRIDGEWATER", "TWO SIGMA", "RENAISSANCE", "CITADEL",
+        "MILLENNIUM", "DE SHAW", "POINT72", "BAUPOST",
+        "BLACKSTONE", "KKR", "CARLYLE", "APOLLO", "TPG",
+        "BAIN CAPITAL", "GENERAL ATLANTIC", "SILVER LAKE",
+        # Index/ETF/mutual-fund issuers
+        "DIMENSIONAL", "DFA", "STATE STREET", "INVESCO", "PIMCO",
+    }
+
+    def is_fund_vehicle_exempt(le, inbound_edges, household_addresses):
+        """An LE is FUND_VEHICLE-exempt from Rule 60 if it's an external fund
+        manager's vehicle that the household holds a small LP interest in."""
+        if le.get("parentHouseholdId"):
+            return False  # already owned by household — Rule 60 in normal flow
+
+        # (a) Name matches a known third-party fund manager
+        name_upper = (le.get("legalName") or "").upper()
+        manager_in_name = any(m in name_upper for m in KNOWN_FUND_MANAGERS)
+
+        # (b) Registered address is NOT a household-controlled address
+        registered_addr = (le.get("addressLegal", {}) or {}).get("addressLine1", "")
+        addr_not_household = registered_addr and not any(
+            ha in registered_addr for ha in household_addresses
+        )
+
+        # (c) Inbound edge from household entity is a small MEMBER edge (<5%)
+        member_edges = [
+            e for e in inbound_edges
+            if e.get("relationshipType") == "MEMBER"
+            and (e.get("percentage") or 0) < 5
+        ]
+        small_member_edge = bool(member_edges)
+
+        # FUND_VEHICLE classification: name OR address signal, AND a small MEMBER
+        # edge corroborates the fund-LP economic model.
+        return (manager_in_name or addr_not_household) and small_member_edge
+    ```
+
+    When `is_fund_vehicle_exempt(...)` returns True, the LE is logged to
+    `altitude_review/fund_vehicle_exemptions.json` with `{le_id, le_name,
+    detection_reason, member_edge_id, member_edge_percentage}` for review-pack
+    visibility — but is NOT added to the Rule 60 retrofit queue and does NOT FAIL
+    the Phase 3.7 visibility-coverage audit. If the user disagrees with the
+    classification (e.g. the LE *is* a household-controlled vehicle that just happens
+    to share a name with a fund manager), they can override during Phase 5 review.
+
+    This exception is consistent with Rule 53's "third-party shared entities" doctrine —
+    the LP-subscription / fractional MEMBER edge is the correct economic model.
+    Rule 60 only applies to entities the household's advisor administers.
 
     ### API quirks verified on the a recent cleanup run
 
