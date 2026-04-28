@@ -182,9 +182,9 @@ the real world.
 interest in this entity, OR is it just providing a service?" Services → Contact. Interest
 → LegalEntity.
 
-Example miss: a recent onboarding created "San Pasqual Fiduciary Trust Company" (a
+Example miss: a recent onboarding created "Trust Company X" (a
 corporate trustee providing fiduciary service) as a LegalEntity with EXECUTOR and
-SUCCESSOR_TRUSTEE relationships pointing to it. Correct model: San Pasqual is a Contact
+SUCCESSOR_TRUSTEE relationships pointing to it. Correct model: Trust Company X is a Contact
 (the individual officer or the company with `jobTitle: "Corporate Trustee"`), and the
 EXECUTOR / SUCCESSOR_TRUSTEE relationships originate from the Contact using the
 CONTACT→INDIVIDUAL / CONTACT→LEGAL_ENTITY validator rules.
@@ -330,14 +330,14 @@ discriminator:
 {
   "authMode": "oauth" | "api_key" | "jwt",
   "baseUrl": "https://api.m62.live",
-  "firmName": "Wellington Advisors",
+  "firmName": "Firm A",
 
   "apiKey": "ak_live_xxxxxxxx",                    // if authMode=api_key
   "jwt": "eyJhbGciOiJIUzUxMi...",                  // if authMode=jwt (manual paste)
 
   // if authMode=oauth — populated by the OAuth flow below:
   "oauth": {
-    "clientId": "550e8400-e29b-...",
+    "clientId": "{firm-uuid}",
     "accessToken": "eyJhbGciOiJIUzUxMi...",
     "refreshToken": "k8f3...",
     "tokenType": "Bearer",
@@ -836,8 +836,8 @@ handle a subset of files and write their results to disk.
    can apply type-specific heuristics (statement period parsing, trust role extraction).
 
 **Historical precedent**:
-- Glickman (85 files) → 5 batches of 10-21 files, completed in ~9 minutes
-- Boro-Hamilton (215 files) → 8 batches of 16-37 files; the 37-file batch strained context and retried once. Cap of 25 would have prevented the retry.
+- Family X (85 files) → 5 batches of 10-21 files, completed in ~9 minutes
+- Family Y (215 files) → 8 batches of 16-37 files; the 37-file batch strained context and retried once. Cap of 25 would have prevented the retry.
 
 **Example batching for a 40-file household:**
 ```
@@ -915,7 +915,7 @@ from dataclasses import dataclass
 
 @dataclass
 class ExternalRecord:
-    source_name: str          # "verita-crm", "salesforce", "advisor-platform-api", ...
+    source_name: str          # "firm-crm", "salesforce", "advisor-platform-api", ...
     record_type: str          # "household" | "individual" | "contact" | "billing" | "entity" | "service_partner" | ...
     household_key: str        # normalized household identifier (name, external id, etc.)
     fields: dict              # flat dict of field -> value
@@ -931,7 +931,7 @@ class ExternalSource(Protocol):
 
 | Source type | Example | Detection | Auth |
 |---|---|---|---|
-| **File-based CSV export** | Verita's `/Partner Share - Altitude/CRM/*.csv`, firm-drive "Client Masters" | Walk up from the household folder looking for `../../CRM/*.csv` or a configured `crm_paths`; hydrate files first (Step 2.0) | Filesystem ACL |
+| **File-based CSV export** | Firm's `/Partner Share - Altitude/CRM/*.csv`, firm-drive "Client Masters" | Walk up from the household folder looking for `../../CRM/*.csv` or a configured `crm_paths`; hydrate files first (Step 2.0) | Filesystem ACL |
 | **File-based spreadsheet intake** | Household onboarding worksheet (`Client Information Sheet.xlsx`) | Exists inside the household folder at `Onboarding/*.xlsx` with recognized tab names | Filesystem |
 | **Firm internal API** | A `GET /crm/households/{name}` against the firm's platform | Config provides `crm_api_base` + `crm_api_key` | Bearer / API key |
 | **Salesforce / HubSpot** | SOQL/REST query for matching Household account | Config provides OAuth tokens | OAuth |
@@ -941,10 +941,10 @@ class ExternalSource(Protocol):
 
 Implementation strategy:
 
-1. **Start with what you have**. For Verita today that's CSV. Implement
-   `VeritaCrmCsvSource` (4 CSVs: Client_Households_Export, Connections_Export,
+1. **Start with what you have**. For the firm today that's CSV. Implement
+   `FirmCrmCsvSource` (4 CSVs: Client_Households_Export, Connections_Export,
    Leads_Export, Service_Partners_Export).
-2. **Make the interface source-agnostic from day one** so adding `VeritaApiSource` or
+2. **Make the interface source-agnostic from day one** so adding `FirmApiSource` or
    `SalesforceSource` tomorrow doesn't require rewiring Phase 4.
 3. **Cache provenance aggressively** — `ExternalRecord.provenance` should let Phase 5
    reviewers trace every field back to row 42 of that CSV or GET call XYZ.
@@ -956,24 +956,24 @@ external source's column names. This keeps Phase 4 simple — it doesn't need to
 that CRM calls SSN "Tax ID" and Salesforce calls it "tax_identifier". The adapter does
 that translation.
 
-Example — a Verita CRM Client_Households_Export row maps to:
+Example — a firm CRM Client_Households_Export row maps to:
 
 ```python
 ExternalRecord(
-    source_name="verita-crm",
+    source_name="firm-crm",
     record_type="individual",
-    household_key="Levine",
+    household_key="FamilyA",
     fields={
-        "firstName": "Adam", "lastName": "Levine",
-        "dateOfBirth": "1979-03-18",
-        "ssn": "620109754",                  # 9 digits, dashes stripped
-        "email": "fauxlife@icloud.com",
-        "phoneNumberPrimary": "8054525852",  # digits only
+        "firstName": "Client", "lastName": "A",
+        "dateOfBirth": "1980-01-15",
+        "ssn": "000000000",                  # 9 digits, dashes stripped
+        "email": "clienta@example.com",
+        "phoneNumberPrimary": "5555550100",  # digits only
         "occupation": "Executive",
         "employerName": None,                # CRM says "Self-employed" — map to null, not a string
         "gender": None,                      # blank in CRM, will fill from DL in docs
     },
-    as_of_date="2026-04-22",                 # CRM export date (mtime of source file)
+    as_of_date="YYYY-MM-DD",                 # CRM export date (mtime of source file)
     provenance={"source": "Client_Households_Export.csv", "row": 1,
                 "path": "/Partner Share - Altitude/CRM/Client_Households_Export.csv"},
 )
@@ -987,8 +987,8 @@ or record**. Add them to the same cache with a synthetic "file" key so the rest 
 pipeline treats them uniformly:
 
 ```jsonl
-{"file": "[external:verita-crm] Client_Households_Export.csv row 1", "readAt": "2026-04-22T12:00Z", "fileNumber": -1, "asOfDate": "2026-04-22", "entities": {"individuals": [{"name": "Adam Levine", "dob": "1979-03-18", "ssn": "620109754", "_source_kind": "external_crm"}]}}
-{"file": "[external:verita-crm] Service_Partners_Export.csv row 3", "readAt": "2026-04-22T12:00Z", "fileNumber": -2, "asOfDate": "2026-04-22", "contacts": [{"firstName": "Chris", "lastName": "Maguire", "jobTitle": "Manager", "biography": "Full Stop Management", "_source_kind": "external_crm"}]}
+{"file": "[external:firm-crm] Client_Households_Export.csv row 1", "readAt": "2026-04-22T12:00Z", "fileNumber": -1, "asOfDate": "2026-04-22", "entities": {"individuals": [{"name": "Client A", "dob": "1980-01-15", "ssn": "000000000", "_source_kind": "external_crm"}]}}
+{"file": "[external:firm-crm] Service_Partners_Export.csv row 3", "readAt": "2026-04-22T12:00Z", "fileNumber": -2, "asOfDate": "2026-04-22", "contacts": [{"firstName": "External", "lastName": "Manager", "jobTitle": "Manager", "biography": "Management Firm X", "_source_kind": "external_crm"}]}
 ```
 
 Negative `fileNumber` values mark external records so Phase 3M can filter/count them
@@ -1025,17 +1025,17 @@ When external sources contributed, the review must have a dedicated section:
 ## External-Source Contributions
 
 Loaded before Phase 1:
-- `verita-crm` (CSV): 4 files, 12 records (1 household, 1 individual, 5 contacts, 5 connections, 1 billing)
-- (if present) `verita-api` (REST): 1 household query, 8 field updates
+- `firm-crm` (CSV): 4 files, 12 records (1 household, 1 individual, 5 contacts, 5 connections, 1 billing)
+- (if present) `firm-api` (REST): 1 household query, 8 field updates
 
 ### Fields contributed by external sources (will be queued as auto-fills or latest-date-wins)
 
 | Entity | Field | External Value | Source | asOfDate |
 |--------|-------|---------------|--------|----------|
-| Adam Levine (Individual) | dateOfBirth | 1979-03-18 | verita-crm / Client_Households_Export.csv row 1 | 2026-04-22 |
-| Adam Levine (Individual) | ssn | ***-**-9754 | verita-crm / Client_Households_Export.csv row 1 | 2026-04-22 |
-| Levine Family (Household) | billing.feeStructure | AUM_BASED | verita-crm / Client_Households_Export.csv row 1 | 2026-04-22 |
-| Chris Maguire (new Contact) | — | — | verita-crm / Service_Partners_Export.csv row 1 | 2026-04-22 |
+| Client A (Individual) | dateOfBirth | 1980-01-15 | firm-crm / Client_Households_Export.csv row 1 | YYYY-MM-DD |
+| Client A (Individual) | ssn | ***-**-9754 | firm-crm / Client_Households_Export.csv row 1 | 2026-04-22 |
+| Family A (Household) | billing.feeStructure | AUM_BASED | firm-crm / Client_Households_Export.csv row 1 | 2026-04-22 |
+| External Manager (new Contact) | — | — | firm-crm / Service_Partners_Export.csv row 1 | 2026-04-22 |
 ```
 
 This gives the RM a clear audit trail showing which fields came from firm-internal
@@ -1224,7 +1224,7 @@ def items(resp):
 
 The skill's legacy `len(resp)` / `resp.get('content', resp)` patterns will silently
 interpret a 404 JSON body (`{"status":404, "detail":..., ...}`) as a page of 7 items
-(the dict's key count) — this was observed on the Levine run 2026-04-23. Always guard
+(the dict's key count) — this was observed on the recent production run. Always guard
 on `status >= 400` first.
 
 ```
@@ -1245,12 +1245,48 @@ household in Altitude. This is the baseline for comparison.
 
 ### Step 1.4: Search for accounts and contacts by name
 
-Additionally, search for any accounts and contacts by name pattern:
+Additionally, search for any accounts and contacts by name pattern. **Per Rule 67,
+all entity searches that DO support `parentHouseholdId` MUST pass it** (account search
+included). Contact search is firm-wide by design.
 
 ```
-GET /api/v1/account-financial/search?searchFor={account_name_pattern}&size=50
-GET /api/v1/contact/search?searchFor={contact_name_pattern}&size=50
+GET /api/v1/account-financial/search?searchFor={account_name_pattern}&parentHouseholdId={hh_id}&size=50
+GET /api/v1/contact/search?searchFor={contact_name_pattern}&size=50  # firm-wide; apply per-result graph filter
 ```
+
+### Step 1.4b: Rollup health check (Rule 68)
+
+`GET /api/v1/household/{id}` rollup fields (`primaryIndividualName`, `totalAccountCount`,
+`totalMarketValue`, `totalTangibleAssetValue`) may be NULL even when the household has
+populated entities — they are computed by a nightly job. Build authoritative counts
+from the per-type list endpoints scoped to `parentHouseholdId`, NOT from the
+household rollup:
+
+```python
+counts = {
+  "individuals":      total(api_get(f"/individual?parentHouseholdId={hh_id}&size=1")),
+  "legal_entities":   total(api_get(f"/legal-entity?parentHouseholdId={hh_id}&size=1")),
+  "accounts":         total(api_get(f"/account-financial?parentHouseholdId={hh_id}&size=1")),
+  "tangible_assets":  total(api_get(f"/tangible-asset?parentHouseholdId={hh_id}&size=1")),
+  "liabilities":      total(api_get(f"/liability?parentHouseholdId={hh_id}&size=1")),
+  "insurance":        total(api_get(f"/insurance-policy?parentHouseholdId={hh_id}&size=1")),
+}
+```
+
+If `/household/{id}` rollups disagree with the per-type counts, log a "rollup
+staleness" warning to surface in the Phase 5 review.
+
+### Step 1.5: Lookup-by-prior-UUID pass (only on rerun) — Rule 69
+
+If `run_state.json` exists from a prior run, before proceeding to Phase 2, GET
+every UUID in `run_state.entities.*` with `?scope=ALL_TENANTS` and classify each as:
+**(a)** found AND in current universe (expected); **(b)** found AND NOT in current
+universe (orphan since prior run — needs Phase 6 OWNERSHIP wiring); **(c)**
+soft-deleted (record in `run_state.softDeletedAwaitingHardDelete[]` per Rule 66);
+**(d)** 404 even with scope (hard-deleted — remove from run_state).
+
+This catches prior-run-created entities invisible to the standard graph traversal.
+See Rule 69 for the full classification table and recovery procedure.
 
 ### Step 1.5: Build the Altitude Universe index
 
@@ -1359,7 +1395,7 @@ before the expensive extraction runs.
 # IMPORTANT: do NOT use `dd bs=1 count=1` as the stub probe. On OneDrive/macOS
 # an attribute lookup for a 1-byte read blocks for seconds even on already-
 # hydrated files — a 3-second threshold mis-flags nearly every file as a stub
-# (16x false-positive rate observed on Lamond run, 2026-04-22).
+# (16x false-positive rate observed on recent run).
 #
 # Correct probe: attempt an actual 4 KB read through Python with a signal
 # timeout (POSIX) or a daemon thread join (Windows). Hydrated files return in
@@ -1716,8 +1752,8 @@ Example tracker format:
 ```
 | # | File | Status | Extracted |
 |---|------|--------|-----------|
-| 1 | Identification/DL.png | READ | Brett Adam, Michaela Dylan, DOBs, addresses |
-| 2 | LLC/Operating Agreement.pdf | READ | Members: Brett 60%, Michaela 40% |
+| 1 | Identification/DL.png | READ | Client B, Spouse B, DOBs, addresses |
+| 2 | LLC/Operating Agreement.pdf | READ | Members: Client B 60%, Spouse B 40% |
 | 3 | Tax/1099-INT.pdf | PENDING | |
 ```
 
@@ -1776,8 +1812,8 @@ for batch in sorted(pathlib.Path(sys.argv[1]).glob("extraction_cache_batch_*.jso
 Each line captures everything extracted from a single file:
 
 ```jsonl
-{"file": "Identification/DL.png", "readAt": "2026-03-19T22:00:00Z", "fileNumber": 1, "entities": {"individuals": [{"name": "Brett Adam Podolsky", "dob": "1988-02-19", "gender": "M", "dlNumber": "P342-061-88-059-0", "dlState": "FL", "dlExpiry": "2031-02-19", "address": "3985 NW 53rd St, Boca Raton, FL 33496"}]}, "relationships": [], "contacts": [], "accounts": [], "notes": "Both Brett and Michaela DLs on same image"}
-{"file": "LLC/Hercules/Operating Agreement.pdf", "readAt": "2026-03-19T22:01:00Z", "fileNumber": 2, "entities": {"legalEntities": [{"name": "Hercules Lender LLC", "type": "LLC", "managementType": "MEMBER_MANAGED", "opAgreementDate": "2022-09-29"}]}, "relationships": [{"source": "Brett Podolsky", "target": "Hercules Lender LLC", "type": "OWNERSHIP", "percentage": 50, "role": "Managing Member"}], "contacts": [{"name": "Jason Evans", "role": "Registered Agent", "address": "2300 NW Corporate Blvd Suite 215, Boca Raton FL 33431"}], "accounts": [], "notes": "Principal: 20352 Hacienda Ct"}
+{"file": "Identification/DL.png", "readAt": "2026-03-19T22:00:00Z", "fileNumber": 1, "entities": {"individuals": [{"name": "Client B", "dob": "1985-06-01", "gender": "M", "dlNumber": "XXXXXXXXX", "dlState": "FL", "dlExpiry": "2031-06-01", "address": "123 Main Street, City, ST 00000"}]}, "relationships": [], "contacts": [], "accounts": [], "notes": "Both Client B and Spouse B DLs on same image"}
+{"file": "LLC/OperatingLLC/Operating Agreement.pdf", "readAt": "2026-03-19T22:01:00Z", "fileNumber": 2, "entities": {"legalEntities": [{"name": "Operating LLC X1", "type": "LLC", "managementType": "MEMBER_MANAGED", "opAgreementDate": "2022-09-29"}]}, "relationships": [{"source": "Client B", "target": "Operating LLC X1", "type": "OWNERSHIP", "percentage": 50, "role": "Managing Member"}], "contacts": [{"name": "Registered Agent Name", "role": "Registered Agent", "address": "456 Agent Way, City, ST 00000"}], "accounts": [], "notes": "Principal: 123 Main Street"}
 ```
 
 **Why this matters:**
@@ -2069,13 +2105,13 @@ After extracting from ALL documents, run these mandatory checks before proceedin
 
 **-0.5. Cross-document CONTACT merge (fuller-identity-wins).** The same person often
    appears in multiple documents with varying completeness — e.g. file #3 (handwritten
-   notes) mentions "Jessica @ Loeb" while file #5 (email signature) reveals
-   "Jessica Davis Mills, Partner, Loeb & Loeb LLP, jmills@loeb.com, +1-415-903-3236".
+   notes) mentions "Jane @ Law Firm X" while file #5 (email signature) reveals
+   "Jane Doe, Partner, Law Firm X LLP, jdoe@example.com, +1-555-555-0100".
    Merge rule:
    - For each pair of extracted Contacts where name similarity ≥ 0.7 AND (firm matches
      OR email matches OR phone matches), merge into one record.
    - For each field, take the MOST COMPLETE value across all source documents (full name
-     over first name; email over no email; firm name over "@ Loeb" shorthand).
+     over first name; email over no email; firm name over "@ Law Firm X" shorthand).
    - Track ALL source documents on the merged record (e.g. `sources: ["file 3", "file 5"]`)
      so the audit trail survives.
    - If the merge is ambiguous (similar name but different email domains) → leave as two
@@ -2278,6 +2314,28 @@ Always track all source documents + their as-of dates on every field.
 
 For each merged extracted entity, attempt to match it to an existing Altitude entity.
 
+**MANDATORY household-scoped search.** Per Rule 67, every Phase 4.2 search call MUST
+pass `parentHouseholdId={current_household_id}`:
+
+```
+GET /api/v1/individual/search?searchFor={X}&parentHouseholdId={hh_id}
+GET /api/v1/legal-entity/search?searchFor={X}&parentHouseholdId={hh_id}
+GET /api/v1/account-financial/search?searchFor={X}&parentHouseholdId={hh_id}
+GET /api/v1/tangible-asset/search?searchFor={X}&parentHouseholdId={hh_id}
+GET /api/v1/liability/search?searchFor={X}&parentHouseholdId={hh_id}
+GET /api/v1/insurance-policy/search?searchFor={X}&parentHouseholdId={hh_id}
+```
+
+After every search, **client-filter results by `parentHouseholdId`** (defense-in-depth):
+skip any result whose `parentHouseholdId` points to a different household. Treat
+results with `parentHouseholdId=null` as orphan candidates — emit an Open Question
+rather than silently claiming them (see Rule 67 + Rule 60 orphan-LE triage).
+
+**Contact search is firm-wide** (`/contact/search` does not honor the filter — Contacts
+are firm-wide by design). For Contact match candidates, apply the per-result graph
+check from Rule 67 to determine "shared firm-wide Contact" vs "this household's
+exclusive Contact" before merging.
+
 **External provider IDs take precedence over every other signal.** When an Altitude entity
 has `externalIds: [{provider, externalId}]` set (common when a firm imported a hierarchy
 spreadsheet from Addepar/Orion/Schwab before onboarding), a matching external ID in the
@@ -2313,7 +2371,7 @@ accounts).
 4. firstName + lastName exact match (case-insensitive) + jobTitle match → strong match
 5. **FIRM-WIDE contact search** (do this before creating any new Contact): Query
    `GET /api/v1/contact/search?searchFor={firstName}+{lastName}&size=50` to find existing
-   Contacts across OTHER households in the same firm. A JPM banker serving Verita may
+   Contacts across OTHER households in the same firm. A JPM banker serving Firm A may
    already exist under a different household — reuse, don't duplicate. If found:
    - Add the new household as an additional client relationship on the existing Contact
      (relationship: HOUSEHOLD→CONTACT, type ADVISOR/ATTORNEY/etc.)
@@ -2322,8 +2380,8 @@ accounts).
 6. No match anywhere → candidate for new entity creation
 
 **Firm-wide dedup applies especially to**: JPM bankers, attorneys (Kirkland & Ellis,
-Venable LLP, etc.), CPAs (large firms serve multiple clients), insurance agents,
-Verita's own staff (they work across every household). These should be shared Contacts,
+large law firms, etc.), CPAs (large firms serve multiple clients), insurance agents,
+Firm A's own staff (they work across every household). These should be shared Contacts,
 not per-household duplicates.
 
 **Tangible Asset matching against Altitude:**
@@ -2553,9 +2611,9 @@ as a proxy. If truly unknown, leave `effectiveFrom` null rather than guessing.
 ```markdown
 | Source | Target | Type | Status | effectiveFrom | effectiveTo | Notes |
 |--------|--------|------|--------|--------------|-------------|-------|
-| Brett | Hercules LLC | OWNERSHIP | CURRENT | 2022-09-15 | | 50%, Managing Member |
-| Brett | Andrew Comiter | ATTORNEY | CURRENT | 2023-05-22 | | Estate planning |
-| Brett | Old CPA Firm | ACCOUNTANT | HISTORICAL | 2020-01-01 | 2023-12-31 | Replaced by Steirman |
+| Client B | Operating LLC X1 | OWNERSHIP | CURRENT | 2022-09-15 | | 50%, Managing Member |
+| Client B | External Attorney | ATTORNEY | CURRENT | 2023-05-22 | | Estate planning |
+| Client B | Old CPA Firm | ACCOUNTANT | HISTORICAL | 2020-01-01 | 2023-12-31 | Replaced by New CPA Firm |
 ```
 
 **When creating relationships via API:**
@@ -2598,7 +2656,7 @@ relationship while leaving the old one active.
 
 - Amendment/restatement documents name a DIFFERENT person in the same role as the original
   (e.g., original 2022 trust names John Smith as trustee; 2023 Second Amendment names
-  IconTrust LLC — John Smith is replaced)
+  Trust Company X — John Smith is replaced)
 - A new document explicitly states a removal/resignation ("effective 3/15/2024, Jane Doe
   resigned as Co-Trustee")
 - The **current** filing at a corporate registry lists a different officer than earlier docs
@@ -2681,7 +2739,7 @@ old one first so the new POST doesn't hit 409 Conflict.
 
    | Role | Old Holder | New Holder | Replacement Date | Source Document |
    |------|------------|------------|------------------|-----------------|
-   | Trustee of DPG Trust | John Smith (CONTACT) | IconTrust LLC (CONTACT) | 2023-12-18 | Second Amendment and Restatement of the DPG Trust (signed 12.18.23) |
+   | Trustee of DPG Trust | John Smith (CONTACT) | Trust Company X (CONTACT) | 2023-12-18 | Second Amendment and Restatement of the DPG Trust (signed 12.18.23) |
 
 **Common replacement scenarios to watch for:**
 - Trust restatement naming new trustee, successor trustee, or distribution advisor
@@ -2736,8 +2794,8 @@ value, don't PATCH but DO include in the review under a dedicated section:
 
 | Account | Field | Altitude (from Addepar) | Document Value | Source Doc | asOfDate | Likely Cause |
 |---------|-------|------------------------|----------------|------------|----------|--------------|
-| DPG Trust Schwab Brokerage | totalMarketValue | $0.00 | $12,450,210 | Glickman_David_portfolio_07-08-2025.xlsx | 2025-07-08 | Sync not running — lastSyncedAt is null |
-| DPG Trust Schwab Brokerage | name | "DPG TR BROKERAGE" | "DPG Trust Brokerage Account" | Schwab Account App (draft) | 2024-09-01 | Addepar uses a different display name — cosmetic only |
+| Trust Brokerage | totalMarketValue | $0.00 | $X | portfolio_YYYY-MM-DD.xlsx | YYYY-MM-DD | Sync not running — lastSyncedAt is null |
+| Trust Brokerage | name | "DPG TR BROKERAGE" | "DPG Trust Brokerage Account" | Schwab Account App (draft) | 2024-09-01 | Addepar uses a different display name — cosmetic only |
 ```
 
 **Zero-value sync alert** — if ANY account has an external provider AND
@@ -2789,11 +2847,11 @@ tables. Populate as follows:
 
 | Entity | Altitude State | Fills | Conflicts | Stale | Auto-PATCH Safe? |
 |--------|----------------|-------|-----------|-------|------------------|
-| Adam Levine (Individual) | **SHELL** | 27 | 0 | 0 | ✅ Yes — zero risk |
-| Levine Family Trust (LegalEntity) | NEW | — | — | — | POST |
+| Client A (Individual) | **SHELL** | 27 | 0 | 0 | ✅ Yes — zero risk |
+| Family A Trust (LegalEntity) | NEW | — | — | — | POST |
 | DPG Trust Brokerage (Account) | SYNCED | 2 (tags only) | 0 | 0 | Metadata-only PATCH |
-| Adam's 2020 Restated Trust (LegalEntity) | POPULATED | 4 | 2 | 1 | ⚠ Needs review |
-| Chris Maguire (Contact) | NEW | — | — | — | POST |
+| Client A 2020 Restated Trust (LegalEntity) | POPULATED | 4 | 2 | 1 | ⚠ Needs review |
+| External Manager (Contact) | NEW | — | — | — | POST |
 
 **"Auto-PATCH Safe"** is `✅` when: all diffs are FILLs (no conflicts, no stale Altitude
 values, no immutable-field changes). A `SHELL` entity almost always qualifies. Flag any
@@ -2808,8 +2866,8 @@ action without reading the detail tables — the detail tables are for the `⚠`
 **Auto-fill fields** (empty in Altitude → will populate):
 | Field | Extracted Value | Source Document |
 |-------|----------------|-----------------|
-| dateOfBirth | 1988-02-19 | The Whole Shebang.docx |
-| ssn | 126-74-6445 | Driver's License |
+| dateOfBirth | 1985-06-01 | The Whole Shebang.docx |
+| ssn | 000-XX-0000 | Driver's License |
 
 **Conflicting fields** (different values → YOUR DECISION):
 | Field | Altitude Value | Extracted Value | Source | Action? |
@@ -2854,17 +2912,17 @@ action without reading the detail tables — the detail tables are for the `⚠`
 ## Relationships to Create
 | Source | Target | Type | Role | Percentage |
 |--------|--------|------|------|-----------|
-| Podolsky Family (Household) | Brett Podolsky (Individual) | OWNERSHIP | Primary | 50% |
-| Podolsky Family (Household) | Michaela Podolsky (Individual) | OWNERSHIP | | 50% |
-| Brett Podolsky (Individual) | Hercules Lender LLC (LegalEntity) | OWNERSHIP | Managing Member | 50% |
-| Hercules Lender LLC (LegalEntity) | Andrew Comiter (Contact) | ATTORNEY | Estate Planning | - |
-| Hercules Lender LLC (LegalEntity) | Jason Evans (Contact) | ATTORNEY | Corporate | - |
+| Family B (Household) | Client B (Individual) | OWNERSHIP | Primary | 50% |
+| Family B (Household) | Spouse B (Individual) | OWNERSHIP | | 50% |
+| Client B (Individual) | Operating LLC X1 (LegalEntity) | OWNERSHIP | Managing Member | 50% |
+| Operating LLC X1 (LegalEntity) | External Attorney (Contact) | ATTORNEY | Estate Planning | - |
+| Operating LLC X1 (LegalEntity) | Registered Agent (Contact) | ATTORNEY | Corporate | - |
 
 ## Document Uploads
 | Document | Will Associate With | Entity Type | Entity Name | documentSubType |
 |----------|-------------------|-------------|------------|-----------------|
-| Drivers License.png | Individual | Individual | Brett Podolsky | DRIVERS_LICENSE |
-| Operating Agreement.pdf | Legal Entity | LegalEntity | Hercules Lender LLC | OPERATING_AGREEMENT |
+| Drivers License.png | Individual | Individual | Client B | DRIVERS_LICENSE |
+| Operating Agreement.pdf | Legal Entity | LegalEntity | Operating LLC X1 | OPERATING_AGREEMENT |
 | Bank Statement.pdf | Account | AccountFinancial | Chase Brokerage | ACCOUNT_STATEMENT |
 | Life Insurance Policy.pdf | Insurance Policy | InsurancePolicy | NWM Whole Life | POLICY_DECLARATION |
 | Mortgage Statement.pdf | Liability | Liability | Chase Mortgage | ACCOUNT_STATEMENT |
@@ -2880,16 +2938,16 @@ the entity it will be uploaded to and the `documentSubType` to use:
 
 | # | File | Upload To (Entity Type) | Entity Name | documentSubType | Notes |
 |---|------|------------------------|-------------|-----------------|-------|
-| 1 | DL - Brett.png | Individual | Brett Podolsky | DRIVERS_LICENSE | |
-| 2 | Operating Agreement.pdf | LegalEntity | Hercules LLC | OPERATING_AGREEMENT | |
-| 3 | Trust Agreement.pdf | LegalEntity | Brett's Trust | TRUST_AGREEMENT | |
-| 4 | Will.pdf | Individual | Brett Podolsky | OTHER | Estate planning - Will |
-| 5 | Living Will.pdf | Individual | Brett Podolsky | OTHER | Estate planning - Living Will |
-| 6 | Healthcare Surrogate.pdf | Individual | Brett Podolsky | OTHER | Healthcare directive |
-| 7 | Durable POA.pdf | Individual | Brett Podolsky | POWER_OF_ATTORNEY | |
-| 8 | W-2.pdf | Individual | Brett Podolsky | FORM_W2 | |
-| 9 | 1099-INT.pdf | Individual | Brett Podolsky | FORM_1099_INT | |
-| 10 | Warranty Deed.pdf | TangibleAsset | 3985 NW 53rd St | DEED | |
+| 1 | DL - Client B.png | Individual | Client B | DRIVERS_LICENSE | |
+| 2 | Operating Agreement.pdf | LegalEntity | Operating LLC X1 | OPERATING_AGREEMENT | |
+| 3 | Trust Agreement.pdf | LegalEntity | Client B Trust | TRUST_AGREEMENT | |
+| 4 | Will.pdf | Individual | Client B | OTHER | Estate planning - Will |
+| 5 | Living Will.pdf | Individual | Client B | OTHER | Estate planning - Living Will |
+| 6 | Healthcare Surrogate.pdf | Individual | Client B | OTHER | Healthcare directive |
+| 7 | Durable POA.pdf | Individual | Client B | POWER_OF_ATTORNEY | |
+| 8 | W-2.pdf | Individual | Client B | FORM_W2 | |
+| 9 | 1099-INT.pdf | Individual | Client B | FORM_1099_INT | |
+| 10 | Warranty Deed.pdf | TangibleAsset | 123 Main Street | DEED | |
 | 11 | Insurance Summary.pdf | InsurancePolicy | Chubb Homeowners | POLICY_DECLARATION | |
 | 12 | Payoff Statement.pdf | Liability | RCF Loan | PAYOFF_STATEMENT | |
 | ... | | | | | |
@@ -2908,11 +2966,11 @@ resolved from the documents alone and requires human input:
 
 | # | Question | Why It Matters | Blocking? |
 |---|----------|---------------|-----------|
-| 1 | Which trust owns the MassMutual life policies? ("Podolsky Family Trust" is ambiguous) | Determines OWNERSHIP relationship for insurance policies | Yes — can't create relationship |
+| 1 | Which trust owns the MassMutual life policies? ("Family B Trust" is ambiguous) | Determines OWNERSHIP relationship for insurance policies | Yes — can't create relationship |
 | 2 | Is 401 NE Mizner Blvd PH810 owned or rented? | Determines if we create a TangibleAsset | Yes — missing asset |
-| 3 | What is Michaela's business? (Michaela Podolsky Inc) | Sets occupation field | No — can leave blank |
+| 3 | What is Spouse B's business? (Spouse B Inc) | Sets occupation field | No — can leave blank |
 | 4 | CFO name for mlund@quinceandcosf.com? | Contact entity is incomplete | No — has email |
-| 5 | Correct address: 3895 or 3985 NW 53rd St? (warranty deed conflict) | Property address | Yes — data integrity |
+| 5 | Correct address: 123 Main Street vs alternate? (warranty deed conflict) | Property address | Yes — data integrity |
 ```
 
 Mark each question as **Blocking** (can't create the entity/relationship without an answer)
@@ -2932,8 +2990,8 @@ Write a persistent state file after every Phase 6/7 action to enable incremental
   "entities": {
     "household": { "id": "7ee864d1-...", "status": "CREATED" },
     "individuals": [
-      { "name": "Brett Adam Podolsky", "id": "77097747-...", "status": "CREATED" },
-      { "name": "Michaela Dylan Podolsky", "id": "197ce1e3-...", "status": "CREATED" }
+      { "name": "Client B", "id": "{uuid}", "status": "CREATED" },
+      { "name": "Spouse B", "id": "{uuid}", "status": "CREATED" }
     ],
     "legalEntities": [...],
     "contacts": [...],
@@ -2941,20 +2999,20 @@ Write a persistent state file after every Phase 6/7 action to enable incremental
     "liabilities": [...],
     "tangibleAssets": [...],
     "relationships": [
-      { "source": "Podolsky Family", "target": "Brett Podolsky", "type": "OWNERSHIP", "id": "8309344b-...", "status": "CREATED" }
+      { "source": "Family B", "target": "Client B", "type": "OWNERSHIP", "id": "{uuid}", "status": "CREATED" }
     ]
   },
   "documents": {
     "uploaded": [
-      { "file": "Identification/Drivers Licenses.png", "entityId": "77097747-...", "documentId": "abc123-...", "status": "UPLOADED" },
-      { "file": "LLC/Hercules/Operating Agreement.pdf", "entityId": "da72184b-...", "documentId": "def456-...", "status": "UPLOADED" }
+      { "file": "Identification/Drivers Licenses.png", "entityId": "{uuid}", "documentId": "abc123-...", "status": "UPLOADED" },
+      { "file": "LLC/OperatingLLC/Operating Agreement.pdf", "entityId": "{uuid}", "documentId": "def456-...", "status": "UPLOADED" }
     ],
     "failed": [
       { "file": "LLC/RCF/4th Amended Note.pdf", "error": "HTTP 500", "status": "FAILED" }
     ],
     "sessionId": "882fea65-..."
   },
-  "estatePlanningPatched": ["77097747-...", "197ce1e3-..."],
+  "estatePlanningPatched": ["{uuid}", "{uuid}"],
   "openQuestions": [...]
 }
 ```
@@ -3010,10 +3068,10 @@ subfolders, never buried deeper):
   [
     {
       "entityType": "Individual",
-      "entityName": "Seth Boro",
+      "entityName": "Client Z",
       "entityId": "e9f2...",
       "field": "addressLegal",
-      "winningValue": "429 Elizabeth St, San Francisco CA 94114",
+      "winningValue": "123 Main Street, City, ST 00000",
       "winningSource": "DPG 2022 Trust Amendment (signed 2020-04-16)",
       "winningAsOfDate": "2020-04-16",
       "losingValue": "221 Gold Mine Drive, San Francisco CA 94131",
@@ -3034,8 +3092,8 @@ subfolders, never buried deeper):
   for programmatic tracking across families. Format:
   ```json
   [
-    {"id": 1, "question": "Does client have a Will?", "category": "estate_planning", "blocking": false, "entity": "Phineas Barnes", "resolved": false, "resolution": null},
-    {"id": 2, "question": "Joanne DOB: 10/02 vs 10/21?", "category": "data_conflict", "blocking": false, "entity": "Joanne Shih", "resolved": false, "resolution": null}
+    {"id": 1, "question": "Does client have a Will?", "category": "estate_planning", "blocking": false, "entity": "Client X", "resolved": false, "resolution": null},
+    {"id": 2, "question": "Spouse DOB: 10/02 vs 10/21?", "category": "data_conflict", "blocking": false, "entity": "Spouse X", "resolved": false, "resolution": null}
   ]
   ```
   This file must ALSO be written — embedding questions only in review.md is insufficient.
@@ -3084,10 +3142,10 @@ cleanup/rebuild of the review directory.
 **Proposed answer** (skill's best guess; user can confirm with "yes" or override):
 {the skill's recommended resolution, with rationale}
 
-Example: "Use tax return SSN `614-75-8183` (authoritative) and overwrite Altitude's
+Example: "Use tax return SSN `000-XX-0000` (authoritative) and overwrite Altitude's
 invalid `140965906`. Rationale: SSA issues SSNs in ranges 001-665, 667-699, 750-772;
 140-965-906 falls outside all ranges, so it's data entry error. 2022 + 2023 1040 both
-confirm 614-75-8183."
+confirm 000-XX-0000."
 
 **User Response**: _awaiting_ | {response text — "yes" = accept proposed answer}
 **Resolved**: _pending_ | YYYY-MM-DD HH:MM
@@ -3170,11 +3228,11 @@ Content-Type: application/merge-patch+json
 X-API-Key: {api_key}
 
 {
-  "dateOfBirth": "1988-02-19",
-  "ssn": "126746445",
-  "email": "brett@example.com",
+  "dateOfBirth": "1985-06-01",
+  "ssn": "000000000",
+  "email": "clientb@example.com",
   "addressLegal": {
-    "addressLine1": "3985 NW 53rd Street",
+    "addressLine1": "123 Main Streetreet",
     "addressLine2": "Suite 200",
     "city": "Boca Raton",
     "state": "FL",
@@ -3220,7 +3278,7 @@ X-API-Key: {api_key}
 
 The DTO's **required field is `noteText`** — **NOT** `note` or `text`. Missing/wrong
 field name returns 400 `"noteText: must not be null"`. This was a repeat pitfall on
-Lamond (2026-04-22) — every early POST with `{"note": …}` failed silently.
+a recent run — every early POST with `{"note": …}` failed silently.
 
 **⚠ Household and Contact do NOT support `/notes`.** `POST /api/v1/household/{id}/notes`
 returns **HTTP 404** (no such endpoint per `api.json` 2026-04-23). Same for Contact. For
@@ -3230,7 +3288,7 @@ household-level metadata that doesn't belong on a member entity, use one of:
 - **Reroute to the primary individual's `/notes`** — prefix the noteText with
   `(Household-level CRM metadata)` or similar so future readers understand the scope.
 
-This was hit on the Lamond CRM update (2026-04-23): a `/household/{id}/notes` POST returned
+This was hit on the a recent CRM update: a `/household/{id}/notes` POST returned
 404 silently in a script, then succeeded when redirected to the primary individual.
 
 If an API call fails, log it, save state, and ask user to retry or continue with others.
@@ -3245,11 +3303,11 @@ X-API-Key: {api_key}
 Content-Type: application/json
 
 {
-  "firstName": "Brett",
-  "lastName": "Podolsky",
-  "dateOfBirth": "1988-02-19",
-  "ssn": "126746445",
-  "email": "brett@example.com",
+  "firstName": "Client",
+  "lastName": "B",
+  "dateOfBirth": "1985-06-01",
+  "ssn": "000000000",
+  "email": "clientb@example.com",
   "addressLegal": { ... }
 }
 ```
@@ -3262,13 +3320,13 @@ X-API-Key: {api_key}
 Content-Type: application/json
 
 {
-  "legalName": "Hercules Lender LLC",
+  "legalName": "Operating LLC X1",
   "entityType": "LLC",
   "formationDate": "2015-03-20",
   "jurisdiction": "FL",
   "incorporationState": "FL",
   "incorporationCountry": "UNITED_STATES",
-  "taxId": "65-1234567",
+  "taxId": "00-0000000",
   "llcManagementType": "MEMBER_MANAGED"
 }
 ```
@@ -3382,7 +3440,7 @@ X-API-Key: {api_key}
 Content-Type: application/json
 
 {
-  "name": "3985 NW 53rd St, Boca Raton, FL 33496",
+  "name": "123 Main Street, City, ST 00000",
   "category": "REAL_PROPERTY",
   "assetType": "PRIMARY_RESIDENCE",
   "description": "6833 sq ft, concrete block, built 1996",
@@ -3412,7 +3470,7 @@ POST /api/v1/tangible-asset/vehicle
 ```
 POST /api/v1/tangible-asset/luxury
 {
-  "name": "AP Royal Oak Offshore",
+  "name": "Audemars Piguet Royal Oak",
   "category": "LUXURY",
   "assetType": "WATCH",
   "serialOrIdentifier": "LH0496U",
@@ -3429,7 +3487,7 @@ After creation, add OWNERSHIP relationships (IND→TA with percentage).
 **Scheduled items from insurance policies**: If an insurance summary or collections policy
 schedules individual items (watches, jewelry, art, wine) with values, create EACH item as a
 separate TangibleAsset via the `/luxury` or `/collectible` endpoint. Include:
-- `name` — item description (e.g., "AP Royal Oak Offshore")
+- `name` — item description (e.g., "Audemars Piguet Royal Oak")
 - `serialOrIdentifier` — serial number if listed
 - `currentValue` — scheduled/appraised value
 - `isInsured: true`, `insuredValue` — same as scheduled value
@@ -3596,7 +3654,7 @@ fiduciary-duty differences.
 | Document-described type | Altitude API (preferred) | Legacy fallback | `role` field example | Notes |
 |---|---|---|---|---|
 | Talent agent / booking agent (CAA / WME / UTA) | `TALENT_AGENT` | `ADVISOR` | "Talent Agent — {agency}" | 10% music, 10% film commission |
-| Personal manager (Full Stop / Azoff / Brillstein) | `PERSONAL_MANAGER` | `ADVISOR` | "Personal Manager — {firm}" | 10-20% commission |
+| Personal manager (Management Firm X) | `PERSONAL_MANAGER` | `ADVISOR` | "Personal Manager — {firm}" | 10-20% commission |
 | Business manager (NKSB / Provident / WG&S) | `BUSINESS_MANAGER` | `ACCOUNTANT` | "Business Manager — {firm}" | **NOT a CPA** — handles bill-pay, bookkeeping, insurance, budget |
 | Tour manager | `TOUR_MANAGER` | `ADVISOR` | "Tour Manager" | Logistics / road operations |
 | Publicist (PMK·BNC / ID / Slate) | `PUBLICIST` | `ADVISOR` | "Publicist — {firm}" | Flat retainer |
@@ -3612,9 +3670,9 @@ fiduciary-duty differences.
 
 | Document-described entity | Altitude API (preferred) | Legacy fallback | Notes |
 |---|---|---|---|
-| Loan-out corporation ("Adam Levine Productions Inc.", "Smith Inc.", "Touring, Inc.") | `LOAN_OUT_CORPORATION` | `CORPORATION` | Detect by 1120/1120S + W-2 to the Individual; standard actor/musician tax structure |
+| Loan-out corporation ("Client A Loan-Out Corp", "Touring, Inc.") | `LOAN_OUT_CORPORATION` | `CORPORATION` | Detect by 1120/1120S + W-2 to the Individual; standard actor/musician tax structure |
 | Talent agency (CAA, WME, UTA, Gersh, ICM) | `TALENT_AGENCY` | `CORPORATION` | |
-| Management company (Full Stop, Azoff Cos., Brillstein, 3 Arts) | `MANAGEMENT_COMPANY` | `CORPORATION` / `LLC` | |
+| Management company (Management Firm X, Y, Z) | `MANAGEMENT_COMPANY` | `CORPORATION` / `LLC` | |
 | Record label (UMG, Sony, Warner, Atlantic, Interscope) | `RECORD_LABEL` | `CORPORATION` | |
 | Music/book publishing company (Sony/ATV, UMPG, Warner Chappell) | `PUBLISHING_COMPANY` | `CORPORATION` | |
 | Production company (Plan B, Happy Madison, Bad Robot; personal LLCs) | `PRODUCTION_COMPANY` | `LLC` / `CORPORATION` | |
@@ -3675,7 +3733,7 @@ The only accepted enum values are: `INDIVIDUAL_SOLE_PROPRIETOR_OR_SINGLE_MEMBER_
 `C_CORPORATION`, `S_CORPORATION`, `PARTNERSHIP`, `TRUST_ESTATE`, `LLC`,
 `LLC_C_CORPORATION`, `LLC_S_CORPORATION`, `LLC_PARTNERSHIP`, `RETIREMENT_PLAN`, `OTHER`.
 **`GRANTOR_TRUST` and `DISREGARDED_ENTITY` are NOT valid** — they were produced by the
-server as 400 errors on the Lamond run (2026-04-22). Apply this table before sending:
+server as 400 errors on the recent run. Apply this table before sending:
 
 | Document-described | Altitude API | Notes |
 |---|---|---|
@@ -3911,11 +3969,11 @@ target entity type is `ACCOUNT_FINANCIAL`, `TANGIBLE_ASSET`, `INSURANCE_POLICY`,
 `LIABILITY`. For `INDIVIDUAL` or `LEGAL_ENTITY` targets use `documentSubType=OTHER` —
 their enums do NOT include `CORRESPONDENCE` (per api.json 2026-04-22).
 
-## WARNING — Push-agent enum pitfalls (verified on Levine run 2026-04-23)
+## WARNING — Push-agent enum pitfalls (verified on recent production run)
 
 When the push agent processes `document_uploads.json`, it MUST use the EXACT
 enum values per the tables in this section. Common mistakes observed on the
-Levine 2026-04-23 production run (7 documents required post-push PATCHes):
+recent production run (7 documents required post-push PATCHes):
 
 | Wrong value used | Error | Correct value |
 |---|---|---|
@@ -3928,7 +3986,7 @@ Levine 2026-04-23 production run (7 documents required post-push PATCHes):
 | Trust agreements left as `OTHER` | silent (accepted) | `TRUST_AGREEMENT` / `TRUST_AMENDMENTS` / `REVOCABLE_TRUST_DOCUMENT` — always classify trust docs |
 
 Before falling back to `OTHER`, consult the per-entity enum table below — on
-the Levine run, ~70% of `OTHER` usage was for document types that DID have a
+the recent run, ~70% of `OTHER` usage was for document types that DID have a
 specific enum, but under a different name. Always pick the most specific valid
 value from the target entity's enum; only use `OTHER` after confirming no
 option fits.
@@ -4211,7 +4269,7 @@ def classify(filename: str, entity_type: str) -> str:
     # Per api.json (2026-04-22): only AccountFinancial / TangibleAsset / InsurancePolicy /
     # Liability accept CORRESPONDENCE. For Individual / LegalEntity / Fund / Order / Account,
     # fall back to OTHER — sending CORRESPONDENCE returns HTTP 400.
-    # This broke 24/62 uploads on the Lamond run before being rewritten.
+    # This broke 24/62 uploads on the a recent run before being rewritten.
     _CORR_ALLOWED = {'ACCOUNT_FINANCIAL', 'TANGIBLE_ASSET', 'INSURANCE_POLICY', 'LIABILITY'}
     if re.search(r'email|correspondence|letter\b|meeting.?notes', f):
         return 'CORRESPONDENCE' if entity_type in _CORR_ALLOWED else 'OTHER'
@@ -4273,7 +4331,7 @@ Content-Type: multipart/form-data
 Parts:
 - createRequest (application/json, required):
   {
-    "title": "Brett Podolsky - Driver's License",
+    "title": "Client B - Driver's License",
     "description": "Florida driver's license, expires 2029",
     "documentSubType": "DRIVERS_LICENSE",
     "contentType": "PNG"
@@ -4318,7 +4376,7 @@ X-API-Key: {api_key}
 - `entityType` — matches the entity: `INDIVIDUAL`, `LEGAL_ENTITY`, `ACCOUNT`, `INSURANCE_POLICY`, `TANGIBLE_ASSET`, `LIABILITY`
 - `entityId` — UUID of the parent entity
 - `associationType` — `OWNER` (the entity that owns this document)
-- `entityDisplayName` — human-readable name (e.g., "Brett Podolsky", "Hercules Lender LLC")
+- `entityDisplayName` — human-readable name (e.g., "Client B", "Operating LLC X1")
 
 **Example (shell-agnostic — pseudo-variables in braces, not `${…}` or `%…%`):**
 ```
@@ -4326,9 +4384,9 @@ X-API-Key: {api_key}
 # Then call the association endpoint:
 POST {baseUrl}/api/v1/document/abc123/associations
      ?entityType=INDIVIDUAL
-     &entityId={brettId}
+     &entityId={individualId}
      &associationType=OWNER
-     &entityDisplayName=Brett%20Podolsky
+     &entityDisplayName=Client%20B
 Headers:
   X-API-Key: {apiKey}
   X-Firm-Id: {firmId}
@@ -4444,7 +4502,7 @@ extraction cache (cross-reference any "flagged" notes).
 
 1. **Never include PII in the filename** beyond the household name (no SSNs, DOBs, addresses).
 2. **Write in the RM's voice**: terse, action-oriented, no "I" or "the agent" references.
-   The RM will forward this to other Verita team members or even to the client.
+   The RM will forward this to other firm team members or even to the client.
 3. **Group by priority in the Data Needed table** — Highs at the top, Lows at the bottom.
    Within the same priority, group by entity type for scannability.
 4. **Every row in "Data Needed" must reference an entity that EXISTS in Altitude** — link
@@ -4455,8 +4513,8 @@ extraction cache (cross-reference any "flagged" notes).
 
 ### Example
 
-See `/Users/williash/Library/CloudStorage/OneDrive-SharedLibraries-Verita/Partner Share - Altitude/Discovery/Cummings/Cummings Family - RM Open Items 2026-04-21.docx`
-for a reference example (Cummings Family handoff).
+See `<household-folder>/Family - RM Open Items YYYY-MM-DD.docx`
+for a reference example (RM handoff format).
 
 ---
 
@@ -4555,12 +4613,46 @@ for a reference example (Cummings Family handoff).
 21. **Do NOT delete and recreate entity relationships.** Soft-deleted relationships still enforce
     uniqueness constraints. If you delete a relationship and try to recreate it with the same
     source+target+type, you will get a 409 Conflict. Either avoid deleting relationships, or
-    use the hard-delete endpoint (`DELETE /{id}/hard`) for error correction.
+    use the appropriate hard-delete endpoint for error correction.
+
+    **Hard-delete patterns are INCONSISTENT across entity types — verify before use:**
+
+    | Entity type | Hard-delete pattern | Notes |
+    |---|---|---|
+    | LegalEntity | `DELETE /api/v1/legal-entity/{id}?force=true&scope=ALL_TENANTS` | Query params, NO `/hard` path. Without `scope=ALL_TENANTS` returns 404 if entity is already soft-deleted. |
+    | Entity-relationship | `DELETE /api/v1/entity-relationship/{id}/hard` | Path suffix. No query params. |
+    | Individual / Account / Contact / TA / Liability / Insurance | (verify per-entity; no documented hard-delete for most — soft-delete only) | When in doubt: `GET /api/v1/{entity}/{id}?scope=ALL_TENANTS` to confirm exists, then try one form, fall back to the other. |
+
+    **ALL hard-deletes require ROLE_ADMIN super-admin** (system tenant token via
+    `POST /api/v1/authenticate` with `admin@localhost`/`admin`). Firm-admin API keys
+    (`ak_live_*`) get **403** on every hard-delete endpoint. If your push agent is
+    running with a firm-admin key, fall back to soft-delete and log the FULL UUID
+    (see Rule 66) so a subsequent admin pass can clean up.
+
+    **Soft-deleted entity discovery (verification before hard-delete):**
+    - `GET /api/v1/legal-entity/{id}` → `404` if soft-deleted (default behavior)
+    - `GET /api/v1/legal-entity/{id}?scope=ALL_TENANTS` → `200` with full entity, including
+      soft-deleted ones — use this to verify a UUID before hard-delete.
+    - `GET /api/v1/entity-relationship/to/{TYPE}/{id}?scope=ALL_TENANTS` and `/from/...`
+      **still filter `deleted=true` even with the scope param** — `?scope=ALL_TENANTS`
+      crosses tenants but does NOT include soft-deleted rows.
+    - **`?includeDeleted=true` DOES surface soft-deleted edges** on the firm-admin `/to/`
+      endpoint (verified 2026-04-26 production). This is the recovery path for
+      soft-deleted edges blocking re-POST:
+      ```
+      GET /api/v1/entity-relationship/to/LEGAL_ENTITY/{le_id}?includeDeleted=true
+      ```
+      Returns active edges PLUS rows with `deleted: true`. Filter for the
+      `(source, target, type)` you're trying to re-POST, capture the soft-deleted
+      UUID, then `DELETE /api/v1/entity-relationship/{id}/hard` (admin JWT).
+      `?includeDeleted=true` does NOT chain with `?scope=ALL_TENANTS` — pick one based
+      on whether you need cross-tenant or just deleted-row visibility. **Always log
+      full UUIDs when soft-deleting** (Rule 66) so this lookup isn't even necessary.
 
 22. **Identity documents use `OTHER` subtype.** `DRIVERS_LICENSE` and `PASSPORT` subtypes are
     for IdentificationDocument entities, NOT IndividualDocument. When uploading DLs or passports
     via `/api/v1/individual/{id}/document`, use `documentSubType: "OTHER"` with a descriptive
-    title like "Brett Podolsky - Florida Driver's License".
+    title like "Client B - Florida Driver's License".
 
 21. **Cache JWT tokens.** Get ONE token at the start of Phase 6 and reuse it for all API calls.
     Do NOT authenticate before every request — the server has a rate limiter (~20 login attempts
@@ -4606,8 +4698,8 @@ for a reference example (Cummings Family handoff).
 
 27. **Professional relationships flow OUTWARD from the client entity.** For ADVISOR, ATTORNEY,
     ACCOUNTANT, and INSURANCE_AGENT: the client entity (Household, Individual, or LegalEntity) is
-    the SOURCE, and the Contact is the TARGET. Example: `Hercules LLC → Jason Evans (ATTORNEY)`,
-    NOT `Jason Evans → Hercules LLC`. The API accepts both directions, but outgoing from the
+    the SOURCE, and the Contact is the TARGET. Example: `Operating LLC X1 → Registered Agent (ATTORNEY)`,
+    NOT `Registered Agent → Operating LLC X1`. The API accepts both directions, but outgoing from the
     entity is the correct data model pattern used by the demo data and the UI.
 
 28. **Always cross-link insurance policies to tangible assets.** After creating both the
@@ -4668,7 +4760,7 @@ for a reference example (Cummings Family handoff).
 37. **Create family member contacts.** Extended family members named as guardians, successor
     trustees, POA agents, or beneficiaries in estate planning docs should be created as `Contact`
     entities (not full Individuals unless they become clients). Include phone, address, and a
-    `biography` noting their relationship ("Brett's father. Named as successor trustee and
+    `biography` noting their relationship ("Client B's father. Named as successor trustee and
     guardian."). Create `ADVISOR` relationship from Household → Contact with role "Family Member".
 
 38. **WINDSTORM is a valid InsurancePolicyCategory.** Use `WINDSTORM` (not `OTHER` or `HOMEOWNERS`)
@@ -4676,7 +4768,7 @@ for a reference example (Cummings Family handoff).
     in Florida and coastal areas where wind is carved out of the homeowners policy.
 
 39. **Files with special characters in filenames break curl.** Filenames containing commas,
-    parentheses with periods (e.g., `(Podolsky, B.).pdf`), or dollar signs cause curl error 26.
+    parentheses with periods (e.g., `(LastName, B.).pdf`), or dollar signs cause curl error 26.
     Copy these files to the system temp directory (use Python `tempfile.gettempdir()`) with
     clean names before uploading, then delete the temp copies after upload completes.
 
@@ -4768,7 +4860,7 @@ for a reference example (Cummings Family handoff).
     description (e.g. "$150k minimum; 65bps for first $100M") and don't yet have a
     FeeSchedule to attach, **store as `AUM_BASED` with `feePercent` + `minimumFee`** and
     add a `notes` line: "Should migrate to TIERED with a fee schedule when one is created".
-    This was hit on the Lamond CRM update (2026-04-23) — TIERED looked correct but quietly
+    This was hit on the a recent CRM update — TIERED looked correct but quietly
     lost the 65bps figure.
 
     **PATCH-merge gotcha**: `billing` is a nested object. PATCHing `billing` REPLACES the
@@ -4833,14 +4925,14 @@ for a reference example (Cummings Family handoff).
     appear prominently in legal instruments.
 
     **Why this rule exists**: past onboarding runs created LLCs for trust companies
-    (Bryn Mawr Trust Co. of Delaware, Wilmington Trust, CNB), schools, receiving
-    charities, law firms (Loeb, Venable, Fenwick), management firms, talent agencies,
+    (Trust Company X, Trust Company Y, Bank Trust Z), schools, receiving
+    charities, law firms (Law Firm X, Y, Z), management firms, talent agencies,
     and publishers. None of those institutions are family-owned — putting them in
     LegalEntity pollutes the ownership hierarchy, shows them up in household rollups
     where they have no place, and confuses the valuation graph. The previous version of
     this rule actually instructed the skill to create LegalEntities for trust companies
     on pattern-match ("fiduciary firms are LegalEntities — NOT Contacts") — that was
-    wrong and has been reversed per the Hnetinka 2026-04-23 review.
+    wrong and has been reversed per the recent review.
 
     **Decision table** (run BEFORE deciding LegalEntity vs Contact vs skip):
 
@@ -4850,17 +4942,17 @@ for a reference example (Cummings Family handoff).
     | **Client-owned** LLC / corp / LP / partnership | **LegalEntity** | Direct ownership edge |
     | **Client-established** private foundation (client funded and governs) | **LegalEntity** (FOUNDATION) | Controlled by family |
     | **Investment vehicle** client invests in (fund, LP, LLC, hedge fund) — captured individually | **LegalEntity** | Ownership edge target + K-1 origin |
-    | **Corporate trustee** named on a client's trust (Bryn Mawr, Wilmington Trust, CNB, BMTC, Northern Trust) | **Contact** — NOT LegalEntity | Household does not own them. Model the TRUSTEE relationship as CONTACT→LE. Put firm name in Contact's `lastName` field (Contact has no companyName column) and role/address in `biography`. |
-    | **Drafting law firm** that WROTE a trust/will (Loeb, Venable, Willkie, Fenwick) | **Contact** for the individual drafting attorney; firm name in biography. If no individual known → single Contact with the firm name as `lastName` + `jobTitle="Drafting attorney"` | No ownership |
+    | **Corporate trustee** named on a client's trust (Trust Company X, Trust Company Y, Bank Trust Z) | **Contact** — NOT LegalEntity | Household does not own them. Model the TRUSTEE relationship as CONTACT→LE. Put firm name in Contact's `lastName` field (Contact has no companyName column) and role/address in `biography`. |
+    | **Drafting law firm** that WROTE a trust/will (Law Firm X, Y, Z) | **Contact** for the individual drafting attorney; firm name in biography. If no individual known → single Contact with the firm name as `lastName` + `jobTitle="Drafting attorney"` | No ownership |
     | **Charity / non-profit** named as beneficiary of a client's trust/will (Red Cross, Stanford, Cedars-Sinai) | **Contact** — NOT LegalEntity | Household does not control the charity. Model BENEFICIARY as CONTACT→LE with role="Charitable Beneficiary" |
     | **School / university** the family donates to or attends | **Contact** (or supplemental attribute on the student Individual) — NEVER LegalEntity | Not a family asset |
     | **Receiving church / religious org** | **Contact** | Not family-controlled |
     | **Hospital / healthcare provider** | **NEVER create** unless client's foundation grants to them, in which case a **Contact** on the grant record | Vendor, not family asset |
-    | **Business management firm** (NKSFB, Provident, WG&S, Azoff) | **Contact(s)** for each specific BM/manager there; firm name in biography | Service provider |
+    | **Business management firm** (Business Manager Firm X, Y, Z) | **Contact(s)** for each specific BM/manager there; firm name in biography | Service provider |
     | **Talent agency** (CAA, WME, UTA) | **Contact** for the specific agent; firm in biography | Service provider |
     | **Record label / Publisher** (Interscope, UMPG, Sony) | **Contact** for the specific A&R / label contact — NOT LegalEntity unless the client has ownership economics via a distinct deal entity (rare) | Service/commercial counterparty |
     | **Insurance carrier** (MassMutual, Hagerty, Allstate, Cincinnati) | **NEVER an LE — NEVER a Contact either.** Use `InsurancePolicy.carrierName` field | That field exists exactly for this |
-    | **Insurance brokerage** (Weiser, Higginbotham, ABD) | **Contact** for the specific broker/agent; firm name in biography | Service provider |
+    | **Insurance brokerage** (Brokerage X, Y, Z) | **Contact** for the specific broker/agent; firm name in biography | Service provider |
     | **Country club / private school / golf club / yacht club** | **NEVER create** — put membership in client's supplemental attributes or biography | Vendor relationship |
     | **Employer** (unless the client owns it via client-owned LE) | **NEVER create** — use `Individual.employerName` field | Employer is not a family-owned entity |
     | **Payroll processor** (Paychex, Gusto, ADP) | **NEVER** — vendor processing infra | Use Schedule H employer-EIN on the client's profile instead |
@@ -4871,7 +4963,7 @@ for a reference example (Cummings Family handoff).
     **Corporate-as-Contact workaround**: Contact DTO has no `companyName` column (per
     skill's Standard Document Extraction note). For an institution stored as Contact:
     - `firstName = ""` (empty)
-    - `lastName = "<full firm legal name>"` (e.g., `"The Bryn Mawr Trust Company of Delaware"`)
+    - `lastName = "<full firm legal name>"` (e.g., `"Trust Company X"`)
     - `biography = "<role> — <address if known> — <any additional context>"`
     - `jobTitle = "<concrete role>"` (e.g., `"Corporate Trustee"`, `"Drafting Attorney"`, `"Charitable Beneficiary"`)
 
@@ -4919,7 +5011,7 @@ for a reference example (Cummings Family handoff).
             print(f"ORPHAN CANDIDATE: {le.legalName} — candidate for soft-delete")
     ```
 
-    **Real-world example from Levine 2026-04-23**: 15 external-firm LEs (clubs, schools,
+    **Real-world example from a recent run**: 15 external-firm LEs (clubs, schools,
     payroll processors, aviation vendors, insurance brokers, management firms, labels,
     drafting law firms) were auto-created under the old pattern-match rule. Zero
     relationships attached. All had to be retroactively soft-deleted. The new
@@ -5001,7 +5093,7 @@ for a reference example (Cummings Family handoff).
 
     Use `parentHouseholdId: null` to keep them outside the household's rollup so their
     unknown/separate wealth is not falsely attributed to the client household. If the
-    non-client is purely a fiduciary (e.g., "attorney-in-fact on Lee's POA") with no
+    non-client is purely a fiduciary (e.g., "attorney-in-fact on Client X's POA") with no
     beneficial interest in any household entity, Contact remains the right type.
 
     Common examples of this pattern:
@@ -5010,7 +5102,7 @@ for a reference example (Cummings Family handoff).
     - Client's parent is a beneficiary of client's trust + named as guardian for minors →
       Individual (standalone)
     - Outside attorney drafts the trust but is not a beneficiary → Contact (ATTORNEY role)
-    - Corporate trustee (e.g., Bryn Mawr Trust Co. of DE) → Contact (TRUSTEE role, with
+    - Corporate trustee (e.g., Trust Company X) → Contact (TRUSTEE role, with
       firm biography; the corporate trustee relationship is by institution, not by
       individual human)
 
@@ -5027,13 +5119,13 @@ for a reference example (Cummings Family handoff).
 
     | Phrase in document | Inferred entity | Open Question to raise |
     |---|---|---|
-    | "your parents" / "the survivor of them" | 2 Individuals (Lee's mom + dad) | Names of Lee's parents. Both living? |
+    | "your parents" / "the survivor of them" | 2 Individuals (Client X's mom + dad) | Names of Client X's parents. Both living? |
     | "your brother" / "your sister" (named elsewhere) | Confirm as Individual | (already captured via name) |
-    | "your brother's wife" / "his spouse" | 1 Individual (sibling's spouse) | Name of [sibling]'s spouse. Verita client? |
+    | "your brother's wife" / "his spouse" | 1 Individual (sibling's spouse) | Name of [sibling]'s spouse. firm client? |
     | "any child of [Name]'s" / "[Name]'s descendants" | N Individuals | Does [Name] have children? Names, ages, DOBs? |
-    | "your future descendants" (contrasted with "any living child of yours") | Signal Lee has NO current children | Confirm Lee has no children today. |
-    | "your children" / "your descendants" (without "future") | ≥1 Individual (Lee's kids) | Names, ages, DOBs of Lee's children. |
-    | "your spouse" / "your surviving spouse" | 1 Individual (Lee's spouse) | Name, DOB, is she/he a Verita client? |
+    | "your future descendants" (contrasted with "any living child of yours") | Signal Client X has NO current children | Confirm Client X has no children today. |
+    | "your children" / "your descendants" (without "future") | ≥1 Individual (Client X's kids) | Names, ages, DOBs of Client X's children. |
+    | "your spouse" / "your surviving spouse" | 1 Individual (Client X's spouse) | Name, DOB, is she/he a firm client? |
     | "all spouses of your descendants" | Flag for future | Mark class — create as descendants are added |
     | "any issue" / "lineal descendants" | Signal descendants treated as a class | Confirm class membership list at time of drafting |
 
@@ -5067,7 +5159,7 @@ for a reference example (Cummings Family handoff).
     rule covers Liability and InsurancePolicy which do NOT have an equivalent FK — they
     rely ENTIRELY on relationship-graph traversal.
 
-    **On the Levine 2026-04-23 production run**, 9 of 12 liabilities and 10 of 11
+    **On the recent production run**, 9 of 12 liabilities and 10 of 11
     insurance policies were created as orphans. Required post-cleanup: **9 OWNERSHIP
     edges for liabilities + 14 edges for insurance policies (10 OWNERSHIP + 4 INSURED) =
     23 relationship POSTs** to make the records visible. by-household count went
@@ -5087,9 +5179,9 @@ for a reference example (Cummings Family handoff).
     }
     ```
 
-    **Owner-selection heuristics** (verified on Levine run):
+    **Owner-selection heuristics** (verified on recent run):
     - Mortgage / home insurance (homeowners, flood) → owner = trust that holds the home
-      (e.g. Adam Levine Living Trust) OR the primary individual if no trust ownership
+      (e.g. Client A Living Trust) OR the primary individual if no trust ownership
     - Auto loan / auto insurance → owner = individual whose name is on the title
     - Personal credit cards → owner = individual
     - Business credit cards (Amex Centurion corporate) → owner = the touring/loan-out LE
@@ -5184,8 +5276,8 @@ for a reference example (Cummings Family handoff).
     | CRT / CRAT / CRUT / CLT | ✅ | ⚠️ income-interest % | ✅ 0% | Economic edge for income share; visibility edge for charity-remainder tracking |
     | Grantor DECEASED (formerly revocable) | historical | retire Individual→trust OWNERSHIP at death | ✅ 0% retained | Revocable becomes irrevocable at death; visibility edge still applies until the trust is fully administered |
 
-    **This REVERSES the earlier "several irrevocable trusts in Verita should remain
-    unlinked" guidance**: Patel, G&S GST, Comolli Descendants, Comolli Exempt all need
+    **This REVERSES the earlier "several irrevocable trusts in the firm should remain
+    unlinked" guidance**: multiple irrevocable trusts all need
     HOUSEHOLD → LegalEntity OWNERSHIP 0% visibility edges. They remain outside estate
     rollup (0% × trust value = 0) but become reachable from the household page.
 
@@ -5229,9 +5321,8 @@ for a reference example (Cummings Family handoff).
     Without OWNERSHIP, the household rollup can't see the LLC's assets. MEMBER
     captures governance; OWNERSHIP captures economic rollup. Both edges coexist.
 
-    On the Verita 2026-04-23 review, these operating LLCs were created without
-    IND→LE OWNERSHIP edges and thus orphaned: **EPQ, VerJus, CTMR, Gelateria,
-    Golden City Padel, Hen House, Fort Point Beer, Promised Land**. All need
+    On the a recent review, these operating LLCs were created without
+    IND→LE OWNERSHIP edges and thus orphaned: **Operating LLC X1, X2, X3, X4, X5, X6, X7, X8**. All need
     retrofit OWNERSHIP edges.
 
     ### Third-party / shared entities — still no OWNERSHIP
@@ -5240,8 +5331,8 @@ for a reference example (Cummings Family handoff).
     Entities outside that scope still get no OWNERSHIP edge (neither economic nor
     visibility):
     - Entities genuinely held by multiple unrelated client households with no single primary advisor (truly shared co-invest vehicles across multiple firms)
-    - External corporate fiduciaries serving many clients' trusts (Bryn Mawr Trust Co. of Delaware, City National Bank, San Pasqual Fiduciary Trust Company) — model as Contact per Rule 53
-    - Investment funds clients subscribe to (Leadout Capital I/II, Avenue Sports Opportunities) — client owns their LP interest edge, fund itself has no single household owner
+    - External corporate fiduciaries serving many clients' trusts (Trust Company X, Trust Company Y, Trust Company Z) — model as Contact per Rule 53
+    - Investment funds clients subscribe to (Generic Fund I/II) — client owns their LP interest edge, fund itself has no single household owner
     - Charitable beneficiary entities (Teen Impact Fund at Children's Hospital) — model as Contact per Rule 53
 
     In those cases ownership is expressed only through the LP-interest / subscription
@@ -5251,20 +5342,45 @@ for a reference example (Cummings Family handoff).
     vs. "investment fund many people subscribe to" (no edge). The former is administered
     under this household's engagement; the latter isn't.
 
-    ### API quirks verified on the Verita 2026-04-23 cleanup run
+    ### API quirks verified on the a recent cleanup run
 
     Three non-obvious backend behaviors that change how you must call the API:
 
-    **1. POST entity-relationship `percentage: 0` silently normalizes to 100.**
-    `EntityRelationshipService.save(dto)` had a bug that defaulted BOTH null AND zero
-    OWNERSHIP percentage to 100 (backend PR #211 fixes it to only default on null).
-    Until that fix is deployed to every environment you touch:
-    - POST with `percentage: 0` as usual (it'll be stored as 100)
-    - Immediately PATCH the same edge with `percentage: 0` — PATCH bypasses the
-      normalization and persists 0 correctly
-    - Verify with GET that stored percentage is `0.0000`
+    **1. POST entity-relationship `percentage: 0` may STILL be normalized to 100
+    even on environments where PR #211 is deployed.**
 
-    After PR #211 deploys, POST `percentage: 0` persists directly — skip the PATCH step.
+    PR #211 was meant to make `percentage: 0` persist on POST. Verified on a recent
+    push: POST with `percentage: 0` was stored as 100 anyway, but PATCH with the
+    same value succeeded — suggesting PR #211 fixed only the PATCH path, not the
+    POST path. Until this is fully resolved on the backend, ALWAYS use this
+    verify-and-patch pattern when posting any OWNERSHIP edge with `percentage: 0`
+    (typically Rule 60 visibility edges from HOUSEHOLD → irrevocable trust):
+
+    ```python
+    # post_visibility_edge.py
+    resp = api.post("/api/v1/entity-relationship", json={
+        "sourceEntityType": "HOUSEHOLD", "sourceEntityId": hh_id,
+        "targetEntityType": "LEGAL_ENTITY", "targetEntityId": le_id,
+        "relationshipType": "OWNERSHIP",
+        "percentage": 0,
+        "role": "Visibility only — irrevocable trust outside household estate",
+    })
+    rel_id = resp["id"]
+
+    # MANDATORY verify-and-patch: GET back, check, PATCH if coerced.
+    edge = api.get(f"/api/v1/entity-relationship/{rel_id}")
+    if float(edge.get("percentage") or 0) != 0.0:
+        log.warning(f"POST coerced percentage to {edge['percentage']} — patching back to 0")
+        api.patch(f"/api/v1/entity-relationship/{rel_id}", json={"percentage": 0})
+        # Re-verify
+        edge = api.get(f"/api/v1/entity-relationship/{rel_id}")
+        assert float(edge["percentage"]) == 0.0, f"Still {edge['percentage']} after patch"
+    ```
+
+    Apply this pattern in Phase 6 to every Rule 60 visibility edge POST. Once the
+    backend POST path is confirmed fixed (test: POST percentage:0 and GET returns
+    0.0 without PATCH), the patch step can be skipped — but until then, leave it
+    in to prevent silent rollup contamination.
 
     **2. `parentHouseholdId` on Individual is NOT directly PATCHable.**
     PATCH `/api/v1/individual/{id}` with `{"parentHouseholdId": "..."}` returns 200 OK
@@ -5327,8 +5443,7 @@ for a reference example (Cummings Family handoff).
        household visibility edge → the LE will be invisible from `/by-owner/HOUSEHOLD`
        after push. FAIL.
 
-    This is the bug class that produced orphan trusts on Comolli / Chen-Park / Garcia
-    / Hamilton / Boro / Stein — some from missing economic ownership, others from
+    This is the bug class that produced orphan trusts on multiple recent runs — some from missing economic ownership, others from
     missing visibility edges on irrevocable trusts.
 
     ### Retrofit sweep for pre-Rule 60 onboarded households
@@ -5344,15 +5459,20 @@ for a reference example (Cummings Family handoff).
     ```python
     # orphan_ownership_retrofit.py
     #
-    # For every LegalEntity with parentHouseholdId=null that has an active
-    # relationship tying it to the household (GRANTOR, MEMBER/MANAGING_MEMBER,
-    # TRUSTEE, BENEFICIARY from a household Individual), classify against
-    # Rule 60's decision matrix and emit the appropriate edges.
-    for le in list_legal_entities(firmId, parentHouseholdId=null):
+    # IMPORTANT: This script must be SCOPED TO THE CURRENT HOUSEHOLD ONLY.
+    # The earlier firm-wide form `for le in list_legal_entities(firmId,
+    # parentHouseholdId=null)` is BANNED — it caused mass cross-household
+    # contamination on a prior run when `resolve_household_for_le()` defaulted
+    # orphan LEs to the currently-onboarding household, mass-attributing
+    # 9 operating LLCs from another family. See "Orphan-LE triage" below for
+    # the separate, human-gated pass that handles `parentHouseholdId=null` LEs.
+    current_household_id = "<the household being onboarded>"
+
+    # For every LegalEntity already tied to the current household via
+    # parentHouseholdId, check if it needs Rule 60 economic + visibility edges.
+    for le in list_legal_entities(parentHouseholdId=current_household_id):
         rels = get_to_legal_entity_relationships(le.id)
-        household_id = resolve_household_for_le(le, rels)  # via grantor's household
-        if not household_id:
-            continue  # genuinely orphan or third-party
+        household_id = current_household_id  # SCOPED — never default elsewhere
 
         grantor = find_first(rels, type="GRANTOR", source_type="INDIVIDUAL")
         member  = find_first(rels, type="MEMBER",  source_type="INDIVIDUAL") \
@@ -5407,6 +5527,497 @@ for a reference example (Cummings Family handoff).
       emit visibility 0% + Open Question on retained-interest percentage
     - Third-party / shared / external-fiduciary / subscribed-fund / charitable-recipient
       → no edge (Rule 53 applies — they're Contacts, not LegalEntities)
+
+    ### Orphan-LE triage (SEPARATE pass, NEVER auto-emit edges)
+
+    For LEs with `parentHouseholdId=null`, run a SEPARATE pass that does NOT
+    auto-emit any edges:
+
+    ```python
+    # orphan_le_triage.py — never auto-attribute orphan LEs
+    for le in list_legal_entities(parentHouseholdId=None):
+        rels = get_to_legal_entity_relationships(le.id)
+        # Find any IND→LE GRANTOR/MEMBER/TRUSTEE/BENEFICIARY edges and check
+        # the source individual's parentHouseholdId.
+        candidate_households = set()
+        for r in rels:
+            if r.sourceEntityType == "INDIVIDUAL" and r.relationshipType in (
+                "GRANTOR", "MEMBER", "MANAGING_MEMBER", "TRUSTEE", "BENEFICIARY"
+            ):
+                ind = api_get(f"/individual/{r.sourceEntityId}")
+                if ind.get("parentHouseholdId"):
+                    candidate_households.add(ind["parentHouseholdId"])
+
+        if len(candidate_households) == 0:
+            emit_open_question(
+                question=f"LegalEntity '{le.legalName}' is orphan in firm with NO "
+                         "individual-owner edges. Is this a leftover from a prior "
+                         "mis-onboarding, or does it belong to a household? Manual "
+                         "decision required — do NOT auto-attribute.",
+            )
+        elif len(candidate_households) == 1:
+            target_hh = next(iter(candidate_households))
+            emit_open_question(
+                question=f"LegalEntity '{le.legalName}' looks like it belongs to "
+                         f"household {target_hh} (via grantor/member individual edge). "
+                         "Confirm before emitting OWNERSHIP edges.",
+            )
+        else:
+            emit_open_question(
+                question=f"LegalEntity '{le.legalName}' has individual-owner edges "
+                         f"pointing to MULTIPLE households {candidate_households}. "
+                         "Manual review required.",
+            )
+    ```
+
+    **Hard rule**: orphan LE triage NEVER emits edges automatically. Every orphan
+    requires human review. Defaulting to "currently-onboarding household" is what
+    caused the prior cross-contamination — never repeat that pattern.
+
+    **Special-case "shared investment vehicles"** (per Rule 53 / 60): funds, club
+    deals, syndicated investments where multiple unrelated households co-invest.
+    These should NEVER get a direct HH→LE edge from any single household — the
+    investment is held through individual ownership only. Examples: "Avenue Sports
+    Opportunities Fund", "Leadout Capital LP", multi-family-office subscribed
+    funds.
+
+63. **Identity documents (DL, passport, NATIONAL_ID, BIRTH_CERTIFICATE, SOCIAL_SECURITY_CARD,
+    STATE_ID) are REJECTED on `/individual/{id}/document`.** Backend hard-fails them with:
+    *"Identity document types ... cannot be used with IndividualDocument. For identity
+    documents, use IdentificationDocument instead."*
+
+    Until a documented `POST` for `IdentificationDocument` is exposed, route DLs / passports
+    through one of:
+
+    a) **Upload as `documentSubType: OTHER`** to `/individual/{id}/document` with a
+       generic title (e.g. "California Driver License"). **DO NOT put DL number, dates,
+       or any structured PII in the `description` field** (Rule 9 violation — sensitive
+       data must stay out of freeform text). The structured DL fields (number, expiration,
+       state) live on the Individual entity itself, not the document.
+
+    b) When the IdentificationDocument POST endpoint becomes available, MIGRATE these
+       docs by re-uploading and DELETE the OTHER-tagged duplicate.
+
+    Tracking: in `run_state.json`, mark identity-document uploads as
+    `subTypeWorkaround: "OTHER (identity-doc, awaiting IdentificationDocument endpoint)"`
+    so a future migration job can target them.
+
+64. **`PATCH /api/v1/document/{id}` silently DROPS `documentSubType` updates — use
+    `PATCH /api/v1/document/{id}/metadata` instead.**
+
+    The generic Document PATCH endpoint returns HTTP 200 + the document body but does
+    NOT change `documentSubType`. Verified on a recent production run: PATCH with
+    `{"documentSubType":"FINANCIAL_STATEMENT"}` returned 200 yet the GET still showed
+    `OTHER`.
+
+    **Correct endpoint** (per api.json `updateDocumentMetadata_3` operation):
+    ```
+    PATCH /api/v1/document/{id}/metadata
+    Content-Type: application/merge-patch+json
+    {"documentSubType": "<target>"}
+    ```
+    Allowed fields on this endpoint: `title`, `description`, `documentType`, `expiresAt`,
+    `tags`, `documentSubType`. Null fields are ignored (not cleared).
+
+    This affects **all post-upload re-classification** flows. If your push agent uploads
+    everything as `OTHER` and tries to fix it later via the regular PATCH, the fix
+    silently fails. Always use `/metadata`.
+
+65. **`FINANCIAL_STATEMENT` is the catch-all for cash-flow / spending / GL / aggregate
+    financial analysis docs on Individual.** `IndividualDocumentSubType` doesn't have
+    granular enums for "Cash Flow Projection" / "Spending Report" / "General Ledger" /
+    "Asset Allocation", but `FINANCIAL_STATEMENT` covers the bucket. Use it for:
+    - Cash flow projections (annual / quarterly / monthly)
+    - Spending reports / expense detail spreadsheets
+    - General Ledger reports (when attached to Individual rather than the Loan-Out LE)
+    - Asset Allocation / Net Worth Master spreadsheets (NET_WORTH_STATEMENT also valid
+      for net-worth-specific docs)
+    - House Expense Comparison
+    - Real Estate Investment summaries (when not a deed/title)
+    - Credit-card transaction extracts (Amex, Citi, etc.) — **though these would be more
+      correctly attached to the corresponding Liability entity; if the Liability
+      doc-upload endpoint allows, prefer that over Individual+FINANCIAL_STATEMENT**.
+
+    Documents that should stay `OTHER` because no specific enum applies:
+    - Engagement letters / advisory client agreements (no `ENGAGEMENT_LETTER` enum)
+    - Estate plan diagrams, internal advisor memos (no `ESTATE_DIAGRAM` enum)
+    - Email correspondence (CORRESPONDENCE not in IndividualDocumentSubType — see
+      Rule 9-or-document classifier table for the full enum-availability matrix)
+    - Meeting notes (no `MEETING_NOTES` enum)
+    - Q&A trail / metadata files (no specific enum)
+
+61. **Specific items in standalone documents become their own TangibleAssets — never roll
+    into category aggregates.**
+
+    When extraction finds a single watch, ring, painting, sculpture, instrument, or other
+    individually-identifiable luxury item in a standalone document (image, certificate of
+    authenticity, appraisal, scheduled-items rider), it MUST become its own
+    `TangibleAsset` with the most-specific `assetType`. Rolling it into the existing
+    category bucket (e.g. "Jewelry Collection" with `assetType=JEWELRY`) loses the
+    asset's identity, makes future appraisals impossible to attribute, and prevents the
+    image from being correctly associated.
+
+    **Detection signals during Phase 3.5 cross-doc validation**:
+    - Single image in folder showing one specific item (watch face, ring close-up,
+      painting, vehicle exterior)
+    - Certificate of authenticity for a specific named item
+    - Appraisal report citing serial number, hallmarks, or specific characteristics
+    - Insurance scheduled-items rider listing items individually with values
+
+    **assetType selection** (use the SPECIFIC value, not the category bucket):
+
+    | Detected item | category | assetType (specific) | Wrong (avoid) |
+    |---|---|---|---|
+    | Wristwatch / pocket watch | LUXURY | `WATCH` | `JEWELRY` |
+    | Ring / necklace / bracelet | LUXURY | `JEWELRY` | `LUXURY_OTHER` |
+    | Designer handbag (named model) | LUXURY | `HANDBAG` | `JEWELRY` |
+    | Painting / sculpture / drawing | COLLECTIBLE | `ART` | `COLLECTIBLE_OTHER` |
+    | Wine bottle / case (specific vintage) | COLLECTIBLE | `WINE` | `COLLECTIBLE_OTHER` |
+    | Musical instrument (named) | COLLECTIBLE | `MUSICAL_INSTRUMENT` | `OTHER` |
+    | Coin / stamp collection sub-item | COLLECTIBLE | `COINS` / `STAMPS` | `COLLECTIBLE_OTHER` |
+    | Vehicle (single VIN) | VEHICLE | `CAR` / `MOTORCYCLE` / `BOAT` / `YACHT` / `AIRCRAFT` | `LUXURY_OTHER` |
+
+    **Filename → assetType classifier addition** (extend `filename_to_subtype.py` from
+    Phase 7):
+    ```python
+    # Single-item luxury detection (drives TA creation, not just doc subType)
+    if re.search(r'rolex|patek|audemars|cartier|royal.?oak|chronograph|tourbillon|skeleton|perpetual', f, re.I):
+        return ('TA_CREATE', 'LUXURY', 'WATCH')
+    if re.search(r'hermes|birkin|kelly|chanel|louis.?vuitton', f, re.I):
+        return ('TA_CREATE', 'LUXURY', 'HANDBAG')
+    if re.search(r'painting|canvas|oil.?on|sculpture|bronze|ed\..?\d+\/\d+', f, re.I):
+        return ('TA_CREATE', 'COLLECTIBLE', 'ART')
+    ```
+
+    **Document linkage**: the source image becomes the new TA's `PRIMARY_PHOTO`
+    document upload (not `OTHER` on the Individual). Order:
+    1. Phase 4 creates the TA payload
+    2. Phase 6 POSTs the TA + OWNERSHIP edge
+    3. Phase 7 uploads the image with `documentSubType=PRIMARY_PHOTO` and association to
+       the new TA
+
+    **Surfaced by recent production run**: a single jpeg of a rose-gold skeleton perpetual
+    calendar watch was queued as `documentSubType=OTHER` on Individual, with the watch
+    rolled into the existing aggregate "Jewelry Collection" TA. Correct: create new
+    `WATCH` LUXURY TA, attach image as `PRIMARY_PHOTO`.
+
+62. **Liability-backed asset auto-creation — every secured liability without a linked TA
+    must produce a TA creation payload, NOT an Open Question.**
+
+    Rule 29 requires every secured liability to have `linkedTangibleAssetId` set. Rule 30
+    requires every vehicle on an auto policy to be a TA. Rule 52 requires the TA to have
+    proper FK + OWNERSHIP edge. The recent production run run revealed that Phase 4 was
+    deferring this to an Open Question instead of auto-generating the TA — which left
+    real assets uncreated and liabilities un-linked.
+
+    **Phase 4 must include a "liability-TA backfill" pass**:
+
+    For every Liability in the universe (existing or extracted) where:
+    - `liabilityType` is one of: `MORTGAGE`, `SECOND_MORTGAGE`, `HOME_EQUITY_LOC`,
+      `AUTO_LOAN`, `BOAT_LOAN`, `AIRCRAFT_LOAN`, `ART_LOAN`, OR
+    - `liabilityName` matches `r'\b(vehicle|auto|car|boat|aircraft|mortgage|loan|lease)\b'`
+      AND
+    - `linkedTangibleAssetId IS NULL`
+
+    Auto-generate a TA creation payload:
+
+    ```python
+    # phase4_liability_ta_backfill.py
+    for liab in universe.liabilities:
+        if liab.linkedTangibleAssetId: continue
+        if liab.liabilityType not in (MORTGAGE, AUTO_LOAN, BOAT_LOAN, AIRCRAFT_LOAN, ART_LOAN, HOME_EQUITY_LOC, SECOND_MORTGAGE):
+            continue
+
+        # Inherit owner from liability's existing OWNERSHIP edge
+        owner = get_inbound_ownership_source(liab)  # IND or LE
+
+        # Pick TA endpoint by liability type
+        endpoint = {
+            MORTGAGE: "/tangible-asset/real-property",
+            SECOND_MORTGAGE: "/tangible-asset/real-property",
+            HOME_EQUITY_LOC: "/tangible-asset/real-property",
+            AUTO_LOAN: "/tangible-asset/vehicle",
+            BOAT_LOAN: "/tangible-asset/vehicle",
+            AIRCRAFT_LOAN: "/tangible-asset/vehicle",
+            ART_LOAN: "/tangible-asset/collectible",
+        }[liab.liabilityType]
+
+        # Build payload — name from liability name, owner from inheritance
+        ta_payload = {
+            "name": derive_ta_name(liab.name),  # strip "Loan", "Mortgage", lender prefix
+            "category": derive_category(endpoint),
+            "assetType": derive_asset_type(liab.liabilityType, liab.name),
+            "individualId" if owner.type == "INDIVIDUAL" else "legalEntityId": owner.id,
+            "isInsured": True,  # default; verify against insurance schedule
+            "valuationSource": "DEALER_ESTIMATE",
+            "currentValue": None,  # value pending — open question only for VALUE
+        }
+
+        # Liability PATCH to set linkedTangibleAssetId after TA POST
+        liability_patch = {
+            "endpoint": f"/api/v1/liability/{liab.id}",
+            "method": "PATCH",
+            "body": {
+                "linkedTangibleAssetId": "<TA_UUID_AFTER_POST>",
+                "isSecured": True,
+                "collateralDescription": ta_payload["name"],
+            },
+        }
+
+        # Pre-fill OWNERSHIP edge
+        ownership_edge = {
+            "sourceEntityType": owner.type, "sourceEntityId": owner.id,
+            "targetEntityType": "TANGIBLE_ASSET", "targetSlug": ta_payload["slug"],
+            "relationshipType": "OWNERSHIP", "percentage": 100,
+        }
+
+        emit_create_payload(ta_payload, liability_patch, ownership_edge)
+    ```
+
+    **Open Question is allowed** for missing VALUE only, not for whether-to-create. The
+    asset's existence is unambiguous — a $300K Porsche loan implies a real Porsche. The
+    only thing the user needs to confirm is current market value (and any details
+    extraction couldn't determine like VIN).
+
+    **Surfaced by recent production run**: the prior run had 4 vehicle-secured liabilities
+    (Porsche 911, Range Rover, Mercedes 300SL, Toyota Sequoia lease) but ZERO
+    corresponding TangibleAssets. Phase 4 had deferred this as "OQ #6 — vehicle
+    expansion deferred". Per Rule 62, these 4 TAs should have been auto-generated as
+    create payloads on first pass.
+
+66. **Always log FULL UUIDs at soft-delete time, not prefixes.**
+
+    Soft-deleted entities and edges are not recoverable by UUID prefix or by walking
+    the relationship graph — `/entity-relationship/to/`, `/from/`, and the entity
+    `/search` endpoints filter `deleted=true` rows even with `?scope=ALL_TENANTS`. If
+    your `run_state.json` records only an 8-character UUID prefix at delete-time, a
+    subsequent admin pass cannot rebuild the full UUID to hard-delete the row.
+
+    **When the push agent falls back to soft-delete** (typically because firm-admin
+    API keys can't hard-delete per Rule 21), the agent MUST log the FULL UUID in
+    `run_state.json`, not just a prefix.
+
+    **Bad** (loses information):
+    ```json
+    {"action": "soft DELETE Client A→Operating LLC X1 OWNERSHIP dup edge 19bb6ce7", "ts": "..."}
+    ```
+
+    **Good** (recoverable later):
+    ```json
+    {
+      "action": "soft DELETE Client A→Operating LLC X1 OWNERSHIP dup edge",
+      "fullUuid": "19bb6ce7-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "entityType": "ENTITY_RELATIONSHIP",
+      "reason": "duplicate of <other-uuid>",
+      "ts": "..."
+    }
+    ```
+
+    Apply to every soft-delete: entity-relationships, LegalEntities, Individuals,
+    Contacts, AccountFinancials, Liabilities, InsurancePolicies, TangibleAssets,
+    Documents. Track them under `run_state.softDeletedAwaitingHardDelete[]` so a
+    nightly admin sweep can target them by full UUID.
+
+67. **Search & merge endpoints — always pass `parentHouseholdId` AND defense-in-depth
+    client-filter.**
+
+    The backend honors `?parentHouseholdId={uuid}` on `/individual`, `/legal-entity`,
+    `/account-financial`, `/tangible-asset`, `/liability`, `/insurance-policy`, and
+    their `/search?searchFor=X&parentHouseholdId=Y` variants (verified 2026-04-24 PM).
+    Phase 4.2 MUST pass it on every search call. Without it, firm-wide search can
+    match a same-named entity belonging to a DIFFERENT household and contaminate the
+    target household's graph (this happened on a prior run — 9 operating LLCs from
+    Family X were mass-attributed to Family Y via a Rule 60 retrofit pass).
+
+    **Required query format on every Phase 4.2 / Phase 4 search:**
+
+    ```
+    GET /api/v1/individual/search?searchFor={X}&parentHouseholdId={current_hh_id}
+    GET /api/v1/legal-entity/search?searchFor={X}&parentHouseholdId={current_hh_id}
+    GET /api/v1/account-financial/search?searchFor={X}&parentHouseholdId={current_hh_id}
+    GET /api/v1/tangible-asset/search?searchFor={X}&parentHouseholdId={current_hh_id}
+    GET /api/v1/liability/search?searchFor={X}&parentHouseholdId={current_hh_id}
+    GET /api/v1/insurance-policy/search?searchFor={X}&parentHouseholdId={current_hh_id}
+    ```
+
+    **Defense-in-depth: client-filter every result by `parentHouseholdId`.** Even with
+    the backend filter, after every search call, verify each result's
+    `parentHouseholdId` equals current household OR is null (orphan). Skip results
+    whose `parentHouseholdId` points to a DIFFERENT household:
+
+    ```python
+    candidates = api.search(f"/legal-entity/search?searchFor={name}&parentHouseholdId={hh_id}")
+    scoped = []
+    for c in candidates.get("content", []):
+        phh = c.get("parentHouseholdId")
+        if phh in (hh_id, None):
+            scoped.append(c)
+        else:
+            log.warning(f"Skipping {c['id']} — belongs to other household {phh}")
+    ```
+
+    **Orphan candidates (`parentHouseholdId: null`) need extra scrutiny.** They often
+    represent leftover mis-onboarded entities from prior runs. Rather than silently
+    claiming them, emit an Open Question: *"LegalEntity X found as orphan in firm —
+    is this the current household's entity or leftover from a different onboarding?"*
+
+    **`/contact/search` does NOT support the filter** (Contacts are firm-wide by
+    design — external attorneys/CPAs serve multiple households legitimately). After
+    the firm-wide Contact search, apply a different test:
+    - For each candidate Contact, GET `/entity-relationship/from/HOUSEHOLD/{other_hh}?scope=ALL_TENANTS`
+      for any other household whose ID appears in this Contact's relationship graph.
+    - Treat as "shared firm-wide Contact" (legitimately reusable) if attached to ≥1
+      OTHER active client household — add a new edge from the current household, do
+      NOT duplicate.
+    - Treat as "this household's exclusive Contact" if attached only to current HH or
+      no household at all.
+    - Do NOT accidentally claim or PATCH a Contact that's already serving another
+      household exclusively without checking ownership intent first.
+
+68. **`GET /household/{id}` rollup counts may be NULL — never trust them as authoritative.**
+
+    `GET /api/v1/household/{id}` may return `primaryIndividualName=None`,
+    `totalAccountCount=None`, `totalMarketValue=None`, `totalTangibleAssetValue=None`
+    even when the household has dozens of populated entities. The rollup fields are
+    computed by a nightly job, not on read; they go stale whenever:
+    - The household was just created
+    - Entities were created/edited since the last rollup tick
+    - The valuation pipeline failed for this firm
+    - The HOUSEHOLD→{INDIVIDUAL,LE,ACCOUNT} OWNERSHIP edges aren't yet wired
+      (the rollup needs the graph to traverse)
+
+    **Phase 1 must build counts from the per-type list endpoints scoped to
+    `parentHouseholdId`**, not from `/household/{id}` rollups:
+
+    ```python
+    counts = {
+      "individuals":      total(api_get(f"/individual?parentHouseholdId={hh_id}&size=1")),
+      "legal_entities":   total(api_get(f"/legal-entity?parentHouseholdId={hh_id}&size=1")),
+      "accounts":         total(api_get(f"/account-financial?parentHouseholdId={hh_id}&size=1")),
+      "tangible_assets":  total(api_get(f"/tangible-asset?parentHouseholdId={hh_id}&size=1")),
+      "liabilities":      total(api_get(f"/liability?parentHouseholdId={hh_id}&size=1")),
+      "insurance":        total(api_get(f"/insurance-policy?parentHouseholdId={hh_id}&size=1")),
+    }
+    ```
+
+    If `/household/{id}` rollups disagree with these counts (e.g., rollup says
+    `totalAccountCount=null` but the per-type query returns 15), emit a "rollup
+    health check" warning in the Phase 5 review and recommend a manual rollup
+    refresh or wait until the nightly job re-runs.
+
+69. **Phase 1.5 — rerun "lookup by prior UUID" pass before re-traversing the graph.**
+
+    When `run_state.json` exists from a prior run, after Phase 1 universe query, do
+    a "lookup by prior UUID" pass BEFORE Phase 2:
+
+    For every UUID in prior `run_state.entities.{individuals,legalEntities,accounts,
+    tangibleAssets,liabilities,insurancePolicies,contacts,documents}`, GET the entity
+    using `?scope=ALL_TENANTS` to include soft-deleted ones.
+
+    Classify each:
+    - **Found AND in current universe** → matches as expected, no flag
+    - **Found AND NOT in current universe** → entity exists but isn't reachable from
+      the household via graph traversal. This is the "orphan since prior run" class
+      (entity was created on a prior run, but its inbound OWNERSHIP edge was never
+      wired or got deleted). Flag for Phase 6 to wire OWNERSHIP edges.
+    - **Soft-deleted** (returned only with `?scope=ALL_TENANTS`) → record in
+      `run_state.softDeletedAwaitingHardDelete[]`
+    - **404 even with scope=ALL_TENANTS** → entity was hard-deleted; remove from
+      `run_state.json`
+
+    This catches the "prior-run-created entities invisible to graph traversal" class
+    of bug. On a recent run, 15 TangibleAssets existed in the DB from a prior run but
+    were invisible to graph traversal because they had no inbound OWNERSHIP edge —
+    Phase 1's standard graph walk missed them entirely. The "lookup by prior UUID"
+    pass would have flagged all 15 for Phase 6 OWNERSHIP wiring.
+
+70. **Phase 5 must produce VALIDATED, READY-TO-POST payload bodies — not scope manifests.**
+
+    `create_payloads.json` and `patch_payloads.json` written by Phase 5 must contain
+    fully-valid JSON bodies that the push agent can directly POST/PATCH without
+    interpretation. They must NOT be high-level "scope manifests" requiring a
+    "Phase 5b body generation" step before Phase 6 can run.
+
+    **Bad** (forces Phase 5b body generation):
+    ```json
+    {"action": "create LE", "name": "Operating LLC X1", "type": "LLC", "owner": "Client A"}
+    ```
+
+    **Good** (push agent POSTs directly):
+    ```json
+    {
+      "method": "POST",
+      "endpoint": "/api/v1/legal-entity",
+      "body": {
+        "legalName": "Operating LLC X1",
+        "entityType": "LLC",
+        "incorporationState": "DE",
+        "formationDate": "2022-09-29",
+        "taxClassification": "PARTNERSHIP",
+        "parentHouseholdId": "<household-uuid>"
+      },
+      "afterPost": {
+        "createOwnership": {
+          "sourceEntityType": "INDIVIDUAL",
+          "sourceEntityId": "<owner-individual-uuid>",
+          "targetEntityType": "LEGAL_ENTITY",
+          "targetSlug": "<this-LE-slug-resolved-after-post>",
+          "relationshipType": "OWNERSHIP",
+          "percentage": 100,
+          "role": "Member"
+        }
+      }
+    }
+    ```
+
+    The push agent should iterate over `create_payloads.json` and `patch_payloads.json`
+    and POST/PATCH each entry directly. If Phase 5 hand-waves the body shape, push
+    agents have to re-derive it (and may get it wrong). Surfaced by a recent run where
+    Phase 5 emitted scope-only manifests, forcing every household to need a "Phase 5b"
+    body generation pass.
+
+71. **Admin JWT and firm-admin API key are NOT interchangeable — entities land in the
+    auth's bound tenant.**
+
+    The two auth modes have asymmetric powers AND asymmetric tenant scopes. Picking the
+    wrong one for a write creates ghost rows invisible to firm queries.
+
+    | Auth | Read scope | Hard-delete (`/hard`) | POST/PATCH writes | New row's `tenantId` |
+    |---|---|---|---|---|
+    | **Firm-admin API key** (`X-API-Key: ak_live_...`) | Verita tenant only | **403 forbidden** | OK | Verita's tenant ✓ |
+    | **Admin JWT super-admin** (`Authorization: Bearer ...`, `admin@localhost`) | Cross-tenant via `?scope=ALL_TENANTS` | **OK** | OK, but lands in admin's tenant ✗ | Admin's tenant (e.g., `036296f4-...`) |
+
+    **The trap**: POST a new edge with admin JWT → returns 201 → row created with
+    `tenantId: <admin tenant>` → invisible to firm-admin `/to/` queries → dashboard shows
+    no edge → you POST again with firm-admin → 409 conflict (because row exists in admin
+    tenant). Wasted work, plus a ghost row in the wrong tenant.
+
+    **Hybrid auth pattern** (use this for any session that needs hard-delete):
+    1. Reads + classification: firm-admin API key
+    2. Hard-delete (`/entity-relationship/{id}/hard`): admin JWT
+    3. POST/PATCH writes: firm-admin API key (so the new row's tenantId matches)
+
+    **Verification step after admin-JWT writes**: every entity created with admin JWT
+    should be GET'd via firm-admin API key. If it returns 404, the row landed in the
+    wrong tenant — hard-delete it (admin JWT) and re-POST with firm-admin API key.
+
+    **Practical implications**:
+    - Phase B1 / B2 / Phase 6 / Phase 7 should default to firm-admin API key for ALL
+      writes. Only Phase B1's clean-up of soft-deleted edges (which is read-then-hard-delete)
+      needs admin JWT, and that step never POSTs.
+    - When an F1-style "admin sweep" script needs both, structure it as:
+      `find_soft_deleted_via_includeDeleted (api_key) → hard_delete (jwt) → re-POST visibility (api_key)`.
+    - On the recent Boro-Hamilton recovery, an admin-JWT POST landed the visibility edge
+      in `036296f4-...e9b8` (admin tenant), not Verita's `550e8400-...0001`. Firm-admin
+      `/to/` showed 0 HH→LE OWNERSHIP edges despite the 201 response. Cleanup: hard-delete
+      the wrong-tenant edge, re-POST with API key. Always verify post-write.
+
+---
+
+**Anonymization note**: examples in this skill use placeholder names like 'Client A',
+'Family A', 'Firm A', 'Operating LLC X1', 'Trust Company X'. They are NOT real clients.
+Any DOBs, SSNs, EINs, addresses, account numbers, or UUIDs shown in examples are
+synthetic placeholders, not real data.
 
 ---
 
