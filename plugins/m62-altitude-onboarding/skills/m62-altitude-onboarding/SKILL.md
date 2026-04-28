@@ -3214,6 +3214,127 @@ Present the review to the user and wait for approval + conflict resolution.
 
 ---
 
+## Phase 5b: Cross-Contamination Detection (Rule 71)
+
+**MANDATORY before Phase 6.** Misplaced files and Verita-style sample templates have
+been observed in real household folders (e.g. Liu folder containing Tenet bank docs;
+Ramonas folder containing a Levine balance sheet; Lamond folder containing generic
+Verita templates). Phase 6 MUST skip any file flagged as contaminated, and the user
+MUST see the findings before approving the push. Run all three checks below; do not
+short-circuit on the first hit — a single file can fail multiple checks.
+
+### Check 1: Filename / extracted-name vs household-name mismatch
+
+For every file recorded in `extraction_cache.jsonl`, compute the strong identifiers
+present:
+
+- last names extracted from the file's entities (Individual.lastName,
+  LegalEntity.legalName tokens, account-title surnames)
+- last names embedded in the filename itself (`Smith_2024_1040.pdf` → `Smith`)
+- trust / LE names referenced in the document body
+
+Compare against the household's allow-list:
+
+- the household's primary surnames (collect from current Altitude universe AND
+  `extraction_cache.jsonl` consensus — not just folder name, since folder names are
+  sometimes anglicized or abbreviated)
+- LE names already attached to the household via OWNERSHIP / TRUSTEE / GRANTOR /
+  visibility edges
+- known vendor strings (custodian names, advisor firm names — these are NOT
+  contamination, they're expected on statements)
+
+A file fails Check 1 when one of its strong identifiers is NOT on the allow-list
+AND is NOT a known vendor string. Record `type: filename_mismatch`.
+
+### Check 2: Sample / template artifact
+
+Some folders contain Verita's onboarding sample data — these files have NO real
+client information and must NEVER be extracted or uploaded. Scan filenames AND
+extracted text for any of:
+
+- `Smith / Jordan D. Smith / Alex Smith / Alpine Ridge` (Verita sample family)
+- generic placeholders: `Sample`, `Template`, `Example`, `Lorem`, `John Doe`,
+  `Jane Doe`, `Test Family`
+- filename suffixes `_template`, `_sample`, `_example`
+
+Any match → `type: template_artifact`, `suggested_action: skip`. Tag as
+"TIER 4 generic template — do not extract, do not upload" so the upload phase
+silently drops these without re-prompting the user.
+
+### Check 3: Content-vs-folder divergence
+
+For each PDF/DOCX where Phase 3 extracted a household-level identifier — account
+holder name on a statement, beneficiary list on a trust, primary-insured on a
+policy declaration — verify it agrees with the current household. Disagreement is
+recorded as `type: content_divergence`. This is the strongest contamination signal
+because it survives filename obfuscation; a `2024_Statement.pdf` whose statement
+header reads `Account holder: John Levine` in a Ramonas folder is unambiguous.
+
+### Output: `cross_contamination_findings.json`
+
+Write to `{household_folder}/altitude_review/cross_contamination_findings.json`:
+
+```json
+{
+  "household": "<name>",
+  "household_id": "<uuid>",
+  "generated_at": "YYYY-MM-DDTHH:MM:SSZ",
+  "checks_run": ["filename_mismatch", "template_artifact", "content_divergence"],
+  "findings": [
+    {
+      "file": "<path relative to household folder>",
+      "type": "filename_mismatch | template_artifact | content_divergence",
+      "evidence": "<short — e.g. 'filename contains Levine; household allow-list is Ramonas, Ramonas-Trust'>",
+      "suggested_action": "skip | move_to_<other_household> | delete",
+      "confidence": "high | medium | low"
+    }
+  ]
+}
+```
+
+Confidence guide:
+- `high` — Check 2 (template) match, OR Check 3 with multiple corroborating
+  identifiers (e.g. account number + holder name + address all wrong household)
+- `medium` — Check 1 with a clean foreign surname AND no allow-list overlap, OR
+  Check 3 with a single identifier
+- `low` — ambiguous (e.g. a shared advisor's letterhead happens to mention another
+  client's name in passing)
+
+### Fleet-level rollup (separate aggregation step)
+
+The user maintains a fleet-aggregated `Discovery/CROSS_CONTAMINATION_<date>.md` —
+the per-household JSON is the primary skill output; the markdown rollup is appended
+by a separate cross-household script that reads each family's
+`cross_contamination_findings.json`. The skill does NOT write the markdown directly,
+but it MUST emit the per-household JSON in the schema above so the rollup parses
+cleanly.
+
+### Hand-off into Phase 6
+
+- Surface every `high`-confidence finding inline in the Phase 5 review packet that
+  the user is approving. Do not silently swallow.
+- Append every finding (any confidence) to the Phase 6 skip-list:
+  `run_state.contamination_skip[]` with the file path and reason.
+- Phase 6 (entity push) and Phase 7 (document upload) MUST consult this skip-list
+  and refuse to upload or attribute any file on it. Skipping means: no document
+  POST, no entity-association call, no extraction-derived field write to entities
+  the user already owns.
+- If the user reviews the JSON and overrides a finding (e.g. "this is actually
+  ours, the surname is from a maiden-name account"), they delete the finding from
+  the JSON before approving — the skill does not auto-override.
+
+### Rule 71 — Cross-contamination detection is mandatory before Phase 6 push
+
+Every onboarding run MUST emit `cross_contamination_findings.json` and surface
+all `high`-confidence findings in the Phase 5 review before Phase 6 begins. Phase 6
+and Phase 7 MUST consult `run_state.contamination_skip[]` and silently exclude any
+listed file from entity-attribution writes and document uploads. The skill MUST
+NOT auto-move or auto-delete contaminated files — those are user decisions logged
+as `suggested_action` but executed manually. A run with zero findings still emits
+the JSON file (with `findings: []`) so the fleet rollup can confirm the check ran.
+
+---
+
 ## Phase 6: Push Updates to Altitude (Only After Approval)
 
 After the user approves and resolves all conflicts:
@@ -4285,6 +4406,101 @@ def classify(filename: str, entity_type: str) -> str:
 `altitude_review/documentSubType_unmatched.json` for follow-up improvements. The goal
 is to drive this list to zero over time.
 
+### Backend enum gap logging (Rule 72)
+
+The `documentSubType_unmatched.json` pattern above is the original instance of a
+broader requirement: any time the skill extracts a real-world value that doesn't
+fit an existing backend enum, log it as a candidate enum addition for the backend
+team rather than silently coercing or fabricating a value.
+
+#### Common enum-bound fields the skill writes to
+
+Discover the authoritative enum values via `Grep` against
+`plugins/m62-altitude-onboarding/skills/m62-altitude-onboarding/api-docs/api.json`
+under `#/components/schemas/` — the schemas of record for every enum below.
+Non-exhaustive list of fields the skill commonly writes:
+
+- `DocumentContentType` (the 18-value file-format enum on every upload)
+- per-entity `documentSubType` enums (`IndividualDocumentCreateRequestDto`,
+  `LegalEntityDocumentCreateRequestDto`,
+  `AccountFinancialDocumentCreateRequestDto`,
+  `TangibleAssetDocumentCreateRequestDto`,
+  `LiabilityDocumentCreateRequestDto`,
+  `InsurancePolicyDocumentCreateRequestDto`)
+- `Individual.gender`
+- `LegalEntity.entityType`
+- `AccountFinancial.accountType` / `accountCategory` / `subCategory`
+- `Liability.liabilityType` / `liabilityStatus`
+- `InsurancePolicy.policyType` / `policyCategory` / `policyStatus`
+- `EntityRelationshipType` (MEMBER, OWNERSHIP, TRUSTEE, BENEFICIARY, GRANTOR,
+  ADVISOR, …)
+- `BillingFeeStructure` and the fee-arrangement enums
+- `TangibleAsset.category` / `assetType`
+- `Contact.role` / `jobTitle` taxonomy where enum-typed
+
+This list is not exhaustive — the canonical source is api.json. Any field whose
+schema declares an `enum` array applies.
+
+#### When a value doesn't fit
+
+If the extracted value cannot be mapped to any existing enum option without losing
+semantic meaning:
+
+1. Pick the closest existing enum option and use it for the actual API write —
+   the run does NOT block on enum gaps.
+2. Append a structured entry to
+   `{household_folder}/altitude_review/backend_enum_gaps.json`:
+
+```json
+{
+  "household": "<name>",
+  "household_id": "<uuid>",
+  "generated_at": "YYYY-MM-DDTHH:MM:SSZ",
+  "gaps": [
+    {
+      "field_path": "AccountFinancial.accountType",
+      "extracted_value": "Donor Advised Fund",
+      "best_existing_match": "BROKERAGE",
+      "evidence_file": "Schwab_Statement_2024-12.pdf",
+      "frequency": 3,
+      "suggested_enum_addition": "DONOR_ADVISED_FUND",
+      "rationale": "DAFs have distinct tax treatment and beneficiary structure — coercing to BROKERAGE loses semantics for tax-loss-harvesting + grant tracking"
+    }
+  ]
+}
+```
+
+3. The fleet aggregator (separate tooling, not part of this skill) collates
+   per-household `backend_enum_gaps.json` files into a fleet-level
+   `BACKEND_ENUM_GAPS_<date>.md` for the backend team.
+
+#### Hard prohibitions
+
+- The skill MUST NEVER silently use the literal fallback string when an enum is
+  involved without ALSO logging the gap. Specifically: every write of
+  `documentSubType` that resolves to the fallback enum value MUST trigger a
+  `documentSubType_unmatched.json` append AND, if the underlying real-world
+  document type isn't covered by any per-entity enum across the six DTOs, a
+  `backend_enum_gaps.json` entry as well.
+- The skill MUST NEVER invent or fabricate an enum value (e.g., POSTing
+  `accountType: "DONOR_ADVISED_FUND"` when the enum doesn't include it). Coercion
+  ALWAYS picks an existing valid value; the gap goes in the JSON.
+- Use `best_existing_match` for the actual API write so the run completes.
+
+#### Rule 72 — Log unsupported enum values for backend extension
+
+Any time onboarding extracts a value that does not fit an existing backend enum,
+the skill MUST (a) coerce to the closest existing enum option for the API write,
+and (b) append a structured entry to
+`{household_folder}/altitude_review/backend_enum_gaps.json` capturing
+`field_path`, `extracted_value`, `best_existing_match`, `evidence_file`,
+`frequency`, `suggested_enum_addition`, and `rationale`. Silent coercion without
+logging is forbidden; fabricating or POSTing a non-enum value is forbidden. The
+run continues — gap-logging is non-blocking. The fleet aggregator (separate from
+this skill) collates per-household JSON into a fleet-level dated markdown report
+for the backend team. A run with zero gaps still emits the JSON file
+(with `gaps: []`) so the rollup can confirm the check ran.
+
 ### Document Association Rules
 
 Read `references/document_entity_association.md` for the complete mapping. Key rules:
@@ -4419,6 +4635,123 @@ and beneficiaries), create additional associations with `associationType=SUBJECT
 ```
 POST /api/v1/document/{trustAgreementDocId}/associations?entityType=INDIVIDUAL&entityId={trusteeId}&associationType=SUBJECT&entityDisplayName={trusteeName}
 ```
+
+### Step 7.9: Post-upload download verification (Rule 70)
+
+**Required after every successful document upload (HTTP 200/201 with a new document
+`id`).** A recently-fixed backend bug class returned 200 from the upload but stored a
+metadata-only shell with no actual S3 bytes — the document looked uploaded in the
+response payload AND in the document-list endpoint, but its content was empty. The
+skill MUST catch this by immediately downloading the file back and checking the byte
+count.
+
+#### Endpoint
+
+Use the **polymorphic content endpoint** — `GET /api/v1/document/{id}/content`. Per
+api.json, this streams the document bytes through the backend (S3 → backend → client
+passthrough; no wrappers added) with `Content-Disposition` and the S3-reported
+`Content-Type` set on the response. Tenant/firm scope is enforced. This is the right
+endpoint for size verification because it exercises the full S3-roundtrip path —
+catching cases where `fileSize` on the document row was set correctly but the S3
+object itself is empty or truncated.
+
+> An alternative `GET /api/v1/document/{id}/download-url` exists — it returns a
+> proxied URL pointing to `/document/{id}/content`. Use the URL form ONLY for very
+> large documents (>100 MB) where direct streaming through the verification call
+> would exceed memory; the verification path the skill prescribes is `/content`
+> directly.
+
+> Note: per-entity download paths (`/api/v1/individual/{individualId}/document/{documentId}/download-url`,
+> etc.) and `/api/v1/{entity}/{entityId}/document/{documentId}/download-link` are
+> **deprecated** per the api.json refresh in commit 5b439e9 — they will return 410
+> Gone after the Sunset date. Use only the polymorphic `/api/v1/document/{id}/content`
+> path here.
+
+#### Verification recipe (curl, copy-pasteable)
+
+```bash
+# Inputs: DOC_ID (returned id from upload), SOURCE_PATH (file on disk that was uploaded),
+#         EXPECTED_CONTENT_TYPE (the contentType enum value used in the upload — PDF, JPG, etc.)
+SOURCE_BYTES=$(wc -c < "${SOURCE_PATH}" | tr -d ' ')
+VERIFY_OUT=/tmp/verify_${DOC_ID}.bin
+HEADERS_OUT=/tmp/verify_${DOC_ID}.headers
+
+curl -s -o "${VERIFY_OUT}" \
+  -D "${HEADERS_OUT}" \
+  --write-out 'HTTP_CODE=%{http_code}\nSIZE_DOWNLOAD=%{size_download}\nCONTENT_TYPE=%{content_type}\n' \
+  -H "X-API-Key: ${API_KEY}" -H "X-Firm-Id: ${FIRM_ID}" \
+  "${BASE}/api/v1/document/${DOC_ID}/content"
+
+# Compare body byte count to source
+DOWNLOAD_BYTES=$(wc -c < "${VERIFY_OUT}" | tr -d ' ')
+echo "source=${SOURCE_BYTES} downloaded=${DOWNLOAD_BYTES}"
+```
+
+Use `%{size_download}` and `%{http_code}` (curl's write-out variables) so the script
+captures byte count and status without dumping bytes to the console; `-D` writes the
+response headers to a file for the `Content-Type` and `Content-Length` parse.
+
+#### PASS criteria (ALL must hold)
+
+- `HTTP_CODE` is `200`
+- `SIZE_DOWNLOAD` > 0
+- `SIZE_DOWNLOAD` equals `SOURCE_BYTES` exactly. The `/content` endpoint is a
+  passthrough and does not add wrappers, so byte-exact match is the expected
+  default. Allow ±256 bytes ONLY if a future api.json revision documents server-side
+  re-wrapping; until then, treat any drift as a FAIL.
+- response `Content-Type` (from the headers file or curl's `%{content_type}`)
+  matches the `contentType` enum value used in the upload (e.g. uploaded as `PDF` →
+  response `Content-Type` is `application/pdf`; uploaded as `JPG` → `image/jpeg`;
+  uploaded as `TXT` → `text/plain` or `text/plain; charset=...`).
+
+#### FAIL criteria (ANY triggers FAIL)
+
+- `HTTP_CODE` is 4xx or 5xx
+- `SIZE_DOWNLOAD` is 0 (metadata-shell smoking gun)
+- `SIZE_DOWNLOAD` < 50% of `SOURCE_BYTES` (likely truncated S3 object)
+- `SIZE_DOWNLOAD` differs from `SOURCE_BYTES` by more than the tolerance above
+- response `Content-Type` does not correspond to the upload's `contentType` enum
+
+#### On FAIL — log, do not retry
+
+Append a structured entry to
+`{household_folder}/altitude_review/phase7_verification_failures.jsonl` (one JSON
+object per line):
+
+```json
+{"document_id": "<uuid>", "source_path": "<path>", "uploaded_content_type": "PDF", "expected_bytes": 184320, "downloaded_bytes": 0, "http_code": 200, "response_content_type": "application/json", "failure_reason": "metadata_shell_zero_bytes", "occurred_at": "YYYY-MM-DDTHH:MM:SSZ"}
+```
+
+Mark the document `verification_status: NOT_VERIFIED` in `run_state.documents[]`.
+
+**Do NOT auto-re-upload on FAIL** — a re-upload risks creating a duplicate document
+record without resolving the underlying backend bug. Surface the failure in the
+Phase 5 review-style approval flow (or, if Phase 5 has already closed, append to
+Phase 8's open-items packet) so the user can decide between (a) manual deletion of
+the failing document_id followed by a single re-upload, or (b) escalation to the
+backend team.
+
+#### When to verify
+
+Verify EVERY document with a fresh upload response — no sampling, no skipping for
+"trusted" content types. This is cheap relative to the cost of shipping a 24-family
+fleet rerun where N% of documents are silent shells. Verification adds one
+proxied-stream GET per upload; for a 50-document household the bandwidth cost is the
+sum of the source files (which already crossed the wire on upload).
+
+#### Rule 70 — Document upload integrity — verify by download
+
+After every successful document upload (HTTP 200/201 with a new `id`), the skill
+MUST `GET /api/v1/document/{id}/content` and confirm that the returned body is
+non-empty, byte-exact (or within ±256 bytes if and only if a future api.json
+documents server-side wrapping), and has a response `Content-Type` consistent with
+the upload's `contentType` enum. Failures are logged to
+`phase7_verification_failures.jsonl`, the document is marked `NOT_VERIFIED` in
+`run_state.documents[]`, and the failure is surfaced in the user-facing review.
+The skill MUST NOT auto-re-upload on FAIL — duplicate-document risk outweighs the
+benefit. A run with zero documents uploaded still ends Phase 7 with a (possibly
+empty) `phase7_verification_failures.jsonl` so downstream tooling can rely on the
+file's presence.
 
 ---
 
