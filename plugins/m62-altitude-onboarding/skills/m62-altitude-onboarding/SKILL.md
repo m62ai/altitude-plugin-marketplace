@@ -1285,14 +1285,21 @@ into one of four buckets that map directly to the `classification` field of
 
 | # | Bucket | Lookup result | `classification` value | Recovery action |
 |---|--------|--------------|------------------------|-----------------|
-| (a) | **live_in_universe** | found AND in current universe | `live` (NOT stale — do not write to file) | none — expected steady state |
+| (a) | **live_in_universe** | found AND in current universe | `live` (NOT stale — do not write to `stale_uuids[]`; DO write to `details[]` for audit) | none — expected steady state |
 | (b) | **orphan_since_prior_run** | found AND NOT in current universe | `orphan` (NOT stale in the deletion sense — write under a separate `orphans[]` key for Phase 6 OWNERSHIP wiring) | re-wire via Phase 6 OWNERSHIP edges |
 | (c) | **soft_deleted** | returns row with `deleted: true` only when `?includeDeleted=true&scope=ALL_TENANTS` | `soft_deleted` | record in `run_state.softDeletedAwaitingHardDelete[]` per Rule 66; fleet aggregator schedules admin hard-delete |
 | (d) | **hard_deleted** | 404 even with `?scope=ALL_TENANTS&includeDeleted=true` | `hard_deleted` | remove the UUID from `run_state.entities.*` so the next run does not retry the lookup |
+| (e) | **fk_orphan** (TangibleAsset only) | found via direct GET, but both `individualId IS NULL` AND `legalEntityId IS NULL`, regardless of `parentHouseholdId` | `fk_orphan` (write under `fk_orphans[]` key — see Rule 79) | Phase 6 attempts to populate missing FK from source docs (deed/title/registration); on ambiguity, emit Q-blocker |
 
 If the lookup result is ambiguous (e.g. transient 5xx, network timeout, scope
 mismatch the skill cannot disambiguate), classify as `unknown` and surface in the
 Phase 5 review for the user — do not silently treat as hard-deleted.
+
+If `?scope=ALL_TENANTS` returns HTTP 403 (firm-admin API keys cannot use that
+scope — see Rule 69 numbered-list amendment), fall back to plain
+`GET /api/v1/{resource}/{id}` and classify on the fallback response. Only after
+both calls fail non-200 should the lookup be marked `lookup_failed_403` (NOT
+`hard_deleted`).
 
 This catches prior-run-created entities invisible to the standard graph traversal.
 
@@ -1306,8 +1313,16 @@ treated as "Step 1.5 was skipped" and triggers a rerun. Same convention as
 `cross_contamination_findings.json` (Rule 71) and `backend_enum_gaps.json`
 (Rule 72).
 
-Schema (one entry per stale — buckets (c) and (d) — UUID; bucket (a) is omitted;
-bucket (b) orphans live under `orphans[]`):
+Schema — one entry per UUID, bucketed by classification:
+
+- **`stale_uuids[]`** — buckets (c) `soft_deleted` and (d) `hard_deleted`
+- **`orphans[]`** — bucket (b) `orphan`
+- **`fk_orphans[]`** — bucket (e) `fk_orphan` (Rule 79; TangibleAsset only)
+- **`details[]`** — bucket (a) `live` audit trail (NEW; see Rule 69 amendment).
+  Required even on an all-clean rerun where `stale_uuids[]`, `orphans[]`, and
+  `fk_orphans[]` are all empty. Without it, an empty `stale_prior_uuids.json`
+  is indistinguishable from "Step 1.5 ran but found nothing" vs "Step 1.5 was
+  silently skipped" — the audit trail in `details[]` resolves the ambiguity.
 
 ```json
 {
@@ -1332,15 +1347,40 @@ bucket (b) orphans live under `orphans[]`):
       "classification": "orphan",
       "fleet_aggregator_action": "schedule_phase6_ownership_wire"
     }
+  ],
+  "fk_orphans": [
+    {
+      "uuid": "<uuid>",
+      "type": "TangibleAsset",
+      "name": "<asset name>",
+      "reason": "individualId=null && legalEntityId=null",
+      "fleet_aggregator_action": "phase6_populate_fk_from_source_docs_or_q_blocker"
+    }
+  ],
+  "details": [
+    {
+      "uuid": "<uuid>",
+      "type": "Individual|LegalEntity|AccountFinancial|TangibleAsset|Liability|InsurancePolicy|Contact|Document",
+      "name": "<entity name or basename>",
+      "lookup_result": "200_live",
+      "as_of_date": "2026-04-28T14:23:00Z"
+    }
   ]
 }
 ```
 
-Empty-result form (still required):
+Empty-result form (still required) — `details[]` is populated on a fresh run
+that found zero prior UUIDs (it will be `[]`); on a rerun, `details[]` MUST
+contain one entry per verified-live UUID even when all three stale arrays are
+empty:
 
 ```json
-{"household": "<name>", "household_id": "<uuid>", "stale_uuids": [], "orphans": []}
+{"household": "<name>", "household_id": "<uuid>", "stale_uuids": [], "orphans": [], "fk_orphans": [], "details": []}
 ```
+
+The all-clean rerun shape is `stale_uuids: []`, `orphans: []`, `fk_orphans: []`,
+and `details: [<one entry per verified-live UUID>]` — empty arrays alone are
+NOT sufficient on a rerun.
 
 `prior_label` is the key under `run_state.entities.*` that pointed to the UUID
 (e.g. `legalEntities.feedTheFuture`). `prior_run` is the prior `run_state.runId`
@@ -7063,6 +7103,16 @@ for a reference example (RM handoff format).
     GET /api/v1/insurance-policy/search?searchFor={X}&parentHouseholdId={current_hh_id}
     ```
 
+    **⚠ Search-API quirk (discovered on Hnetinka rerun) — the `.equals` suffix
+    returns HTTP 500.** The suffix form `parentHouseholdId.equals={uuid}` returns
+    HTTP 500 `not joinable` on `/api/v1/individual/search` (and the same shape on
+    other entity `/search` endpoints). Only the no-suffix form
+    `parentHouseholdId={uuid}` works. The skill MUST NEVER emit `.equals` on
+    `parentHouseholdId`. The curl recipes above are the canonical no-suffix form
+    — copy them verbatim. If a future search helper auto-appends `.equals` for
+    UUID-typed columns by convention, override that behavior on
+    `parentHouseholdId` specifically.
+
     **Defense-in-depth: client-filter every result by `parentHouseholdId`.** Even with
     the backend filter, after every search call, verify each result's
     `parentHouseholdId` equals current household OR is null (orphan). Skip results
@@ -7128,6 +7178,19 @@ for a reference example (RM handoff format).
     health check" warning in the Phase 5 review and recommend a manual rollup
     refresh or wait until the nightly job re-runs.
 
+    **⚠ Search-API quirk on TangibleAsset (discovered on Hnetinka rerun) —
+    `parentHouseholdId` filter is silently ignored.**
+    `GET /api/v1/tangible-asset/search?parentHouseholdId={uuid}` returns
+    firm-wide results regardless of the filter (verified on Hnetinka rerun). The
+    backend accepts the parameter without error but does not apply it server-side.
+    The caller MUST therefore client-side filter every result by checking
+    `parentHouseholdId` on each returned record before using the count for the
+    Rule 68 rollup health check. Without the local filter, Rule 68 will under- or
+    over-count the household's TangibleAssets and produce a false "rollup
+    healthy / unhealthy" signal. Apply the same defense-in-depth client filter
+    described in Rule 67 — keep records whose `parentHouseholdId` equals the
+    current household OR is null, drop the rest.
+
 69. **Phase 1.5 — rerun "lookup by prior UUID" pass before re-traversing the graph.**
 
     When `run_state.json` exists from a prior run, after Phase 1 universe query, do
@@ -7147,12 +7210,37 @@ for a reference example (RM handoff format).
       `run_state.softDeletedAwaitingHardDelete[]`
     - **404 even with scope=ALL_TENANTS** → entity was hard-deleted; remove from
       `run_state.json`
+    - **FK_ORPHAN** (TangibleAsset only) → entity is found via direct GET but has
+      both `individualId IS NULL` AND `legalEntityId IS NULL`, regardless of
+      `parentHouseholdId`. The standard universe walk via `/by-individual` and
+      `/by-legal-entity` will miss it because there is no FK to traverse from. Log
+      to `stale_prior_uuids.json` under a new `fk_orphans[]` key (see Step 1.5
+      schema below). Phase 6 SHOULD attempt to populate the missing FK from
+      source documents (deed, title, registration); if the source document is
+      ambiguous, emit a Q-blocker rather than guess. See Rule 79.
 
     This catches the "prior-run-created entities invisible to graph traversal" class
     of bug. On a recent run, 15 TangibleAssets existed in the DB from a prior run but
     were invisible to graph traversal because they had no inbound OWNERSHIP edge —
     Phase 1's standard graph walk missed them entirely. The "lookup by prior UUID"
     pass would have flagged all 15 for Phase 6 OWNERSHIP wiring.
+
+    **⚠ Permission quirk (discovered on Hnetinka rerun) — `?scope=ALL_TENANTS`
+    returns HTTP 403 for firm-admin API keys.** When the calling auth is a
+    firm-admin API key (`X-API-Key: ak_live_...`), `?scope=ALL_TENANTS` returns
+    HTTP 403 — only admin-JWT tokens (`ROLE_ADMIN_TENANT` or higher; see Rule 71)
+    can use this scope. The Rule 69 prior-UUID probe MUST therefore have an
+    explicit fallback branch:
+
+    1. Try `GET /api/v1/{resource}/{id}?scope=ALL_TENANTS&includeDeleted=true` first.
+    2. On HTTP 403, fall back to plain `GET /api/v1/{resource}/{id}` (firm-tenant
+       scope only) — this still detects live + soft-deleted rows in the firm's
+       own tenant, which is the common case.
+    3. If both calls fail with non-200 (and the second was not 404), log as
+       `lookup_failed_403` (or `lookup_failed_5xx`) — do NOT classify as
+       `404_genuinely_missing`, which would incorrectly flag the UUID for
+       removal from `run_state.entities.*`. A firm-admin run is the default
+       posture for the skill, so this fallback is the steady-state path.
 
 70. **Phase 5 must produce VALIDATED, READY-TO-POST payload bodies — not scope manifests.**
 
@@ -7570,6 +7658,347 @@ zero and routed all findings to `superseded` or
 counterpart to Rule 76 — Rule 76 prevents UUID rotation from being
 silently lost; Rule 77 detects it after the fact when prevention
 failed.
+
+---
+
+## Rules 78-83 — R-W1 rerun findings (Comolli + Hnetinka)
+
+The R-W1 comprehensive rerun on the Comolli and Hnetinka households produced
+six structural findings — four data-integrity issues that the skill's existing
+phases were silently letting slip past, and two rerun-state issues where prior
+runs left artifacts the agent did not know to look for. Rules 78-83 close those
+gaps. They are companion rules to Rule 28 (insurance↔TA cross-link), Rule 60
+(OWNERSHIP semantics), Rule 68 (rollup health), Rule 69 (prior-UUID lookup),
+and Rule 71 (cross-contamination) — each new rule extends the scope of an
+existing rule to a class of failure the existing rule did not catch.
+
+### Step 6.2.2: Auto-link InsurancePolicy to TangibleAsset (Rule 78)
+
+Step 6.2.1 above describes the Insurance↔TangibleAsset cross-link as a
+post-create flow that is "applied during Step 6.2.1". On the Comolli rerun,
+both real-property TangibleAssets ($25M primary residence + $5M secondary
+residence) had `isInsured: false` despite each carrying a 1:1 Chubb HOMEOWNERS
+policy that was already attached to the household. The cross-link was being
+left to the Phase 5 review for the human reviewer to flag — and on Comolli, it
+was missed there too. By the time anyone noticed, the household had shipped
+with two real-property TAs visibly marked uninsured, which the dashboard
+reads as a compliance flag.
+
+Rule 78 closes this by making the InsurancePolicy↔TangibleAsset cross-link a
+mandatory automatic Phase 6 step rather than a Phase 5 review item: whenever
+Phase 6 creates or updates an InsurancePolicy that has a non-null
+`coveredTangibleAssetId` field referencing a TA in the same household, the
+agent MUST also (a) PATCH the TA's `isInsured` field to `true` (plus the
+summary fields per Rule 28 — `primaryInsurancePolicyNumber`, `insuredValue`,
+`insuranceExpirationDate`), and (b) verify a `TangibleAssetInsurance` link
+record exists between them, POSTing one if not. Both writes go through Rule 75
+verification (assert status, assert id, GET-back).
+
+The output is `phase6_ta_insurance_links.jsonl` with one JSON object per
+linked pair — pre-existing pairs and newly-created pairs both — so the Phase
+5 review can show the human reviewer exactly which TAs are now insured and
+which were already insured. Empty file is still required when no insurance
+policies exist for the household, so downstream tooling can rely on the file's
+presence.
+
+```jsonl
+{"insurancePolicyId": "<uuid>", "tangibleAssetId": "<uuid>", "policyNumber": "<num>", "carrier": "Chubb", "isInsured_before": false, "isInsured_after": true, "tai_link_action": "POSTED|VERIFIED_EXISTING", "ts": "2026-04-28T14:32:11Z"}
+```
+
+#### Rule 78 — Phase 6 must auto-link InsurancePolicy↔TangibleAsset
+
+During Phase 6, when an InsurancePolicy entity is created or updated AND it
+has a non-null `coveredTangibleAssetId` field referencing a TA in the same
+household, the agent MUST also: (a) PATCH the TA with `isInsured: true` plus
+the Rule 28 summary fields (`primaryInsurancePolicyNumber`, `insuredValue`,
+`insuranceExpirationDate`), and (b) verify a `TangibleAssetInsurance` child
+record exists between them via `GET /api/v1/tangible-asset/{assetId}/insurance`,
+POSTing one through `POST /api/v1/tangible-asset/{assetId}/insurance` if not.
+Both writes apply Rule 75 verification (status assert, id assert, GET-back).
+The cross-link MUST NOT be deferred to Phase 5 review — by then the household
+ships with `isInsured: false` on policies whose 1:1 TA was already in the
+household. Output is `phase6_ta_insurance_links.jsonl`, one entry per linked
+pair (existing or newly-created), required even when empty. Discovered on the
+Comolli rerun where two real-property TAs had `isInsured: false` despite each
+carrying a 1:1 Chubb HOMEOWNERS policy.
+
+### Step 1.5c: Detect FK_ORPHAN TangibleAssets (Rule 79)
+
+The Rule 69 prior-UUID lookup pass classifies entities into `live`, `orphan`,
+`soft_deleted`, and `hard_deleted` buckets — but the Comolli rerun surfaced a
+fifth class that none of those buckets capture. Both real-property
+TangibleAssets had `individualId IS NULL` AND `legalEntityId IS NULL`. They
+were live in the DB. They did NOT 404. They were not soft-deleted. They had a
+populated `parentHouseholdId`. But because the standard universe walk fans out
+from individuals via `/by-individual` and from legal entities via
+`/by-legal-entity`, neither query surfaced them. They were structurally
+unreachable from the household graph until a direct GET on the prior UUID
+proved they existed.
+
+This is the FK_ORPHAN class: the row exists, the household FK is set, but
+neither the individualId nor legalEntityId FK is populated, so the standard
+graph traversal cannot find it. Distinct from Rule 69's existing `orphan`
+bucket (which is "no inbound OWNERSHIP edge" — graph-edge problem), FK_ORPHAN
+is "no outbound FK" — entity-column problem. Detection requires the prior-UUID
+direct-GET that Rule 69 already does, plus an explicit field check on the
+returned row.
+
+Rule 79 adds FK_ORPHAN to Rule 69's classification taxonomy and routes
+detected entities to a new `fk_orphans[]` key on `stale_prior_uuids.json` (see
+the Step 1.5 schema above). Phase 6 SHOULD attempt to populate the missing FK
+from source documents — deeds for real property, titles/registrations for
+vehicles, articles of incorporation for entity assets — but if the source
+document is ambiguous (e.g., a real-property deed names "John and Jane Smith
+as joint tenants" and Phase 4 has not yet decided whether the asset is
+attributable to the individual or to a joint LegalEntity), the agent MUST
+emit a Q-blocker rather than guess. Guessing FK populates a 1-of-N path on a
+graph that downstream tools treat as canonical.
+
+#### Rule 79 — Phase 1.5 classifies FK-NULL TangibleAssets as FK_ORPHAN
+
+In Step 1.5's prior-UUID lookup pass, any TangibleAsset where the direct GET
+returns 200 AND the row has both `individualId IS NULL` AND `legalEntityId IS
+NULL` (regardless of `parentHouseholdId`) MUST be classified as `fk_orphan`
+and recorded under the new `fk_orphans[]` key in `stale_prior_uuids.json`
+with `{uuid, type, name, reason: "individualId=null && legalEntityId=null",
+fleet_aggregator_action}`. Distinct from `orphan` (graph-edge missing) —
+FK_ORPHAN is entity-column missing, and the standard `/by-individual` /
+`/by-legal-entity` traversal cannot detect it. Phase 6 retrofit SHOULD
+attempt to populate the missing FK from source documents (deed, title,
+registration); on ambiguity (joint tenants where the IND vs LE attribution
+isn't yet decided) emit a Q-blocker rather than guess. Discovered on the
+Comolli rerun where two real-property TAs ($25M + $5M) had both FKs NULL
+despite a populated `parentHouseholdId`.
+
+### Step 3.7: OWNERSHIP percentage sum check (Rule 80)
+
+Phase 3.7 already runs an adversarial self-audit pass after extraction. Rule
+80 adds one specific check to that pass — and it's the most impactful new
+rule in this batch because it catches a class of structural data-integrity
+bugs that none of the other rules touch. When OWNERSHIP edges from multiple
+owners point at the same target entity, the sum of those edges' `percentage`
+fields SHOULD equal 100 (within a small tolerance for rounding). When the
+sum is materially different from 100, there is almost certainly a missing
+counterparty edge — but the OWNERSHIP graph "looks ok" entity-by-entity,
+because each individual edge is well-formed.
+
+Comolli's two real-property TangibleAssets each had Hannah Comolli at 50%
+OWNERSHIP — and no edge at all from Kevin Comolli, even though pre-divorce
+the property was held jointly. The 50%-only edge was internally consistent;
+no validation rule that looked at single edges in isolation could flag it.
+Only summing across all OWNERSHIP edges to the same target reveals the gap.
+
+Rule 80 adds a Phase 3.7 step (between extraction and entity creation): for
+every target entity that receives one or more OWNERSHIP edges, sum the
+`percentage` field across all owners. The tolerance is ±1% — joint accounts
+often round to 50/50/0 = 100 (the third party is 0%); partnership K-1s
+sometimes show 33.33 / 33.33 / 33.34 = 100; small rounding under 1% is
+acceptable. Outside ±1%, flag as `OWNERSHIP_SUM_VIOLATION` and:
+
+- Log to `ownership_sum_violations.jsonl` with `{target_entity_id,
+  target_entity_name, target_entity_type, actual_sum, expected: 100,
+  contributing_edges: [{source_id, source_name, percentage}],
+  ts}` — one entry per violating target.
+- Emit a Q-blocker for human review surfacing the missing-counterparty
+  hypothesis.
+- DO NOT halt the run. A partial-ownership write (with an open Q-blocker on
+  the gap) is better than a no-write — the Q-blocker preserves visibility
+  while letting downstream phases proceed; the human reviewer decides whether
+  to add the missing counterparty in Phase 5.
+
+Common causes the rule tells the agent to enumerate in the Q-blocker:
+
+- **Missing counterparty** (post-divorce, new owner not yet extracted, deceased
+  spouse whose interest passed through estate but the receiving entity is not
+  yet in the graph)
+- **Partnership minor partner missed** during extraction (a 1% GP membership
+  that the K-1 lists in a different table than the LP percentages)
+- **Life-estate or reversionary interests** not yet modeled (remainderman
+  interest in a life-estate trust where the remainder edge sums alongside the
+  life-tenant edge)
+- **Rounding errors > 1%** (very rare; almost always indicates a true gap, not
+  rounding)
+- **Sum > 101%** is its own signal: usually a duplicate edge created by Rule
+  73 PATCH-in-place that didn't fully retire the prior edge, or by Phase 4.7
+  role-replacement that double-counted a continuing owner.
+
+#### Rule 80 — Phase 3.7 OWNERSHIP percentage sum check
+
+In Phase 3.7, for every target entity that receives one or more OWNERSHIP
+edges across the merged extraction, sum the `percentage` field across all
+edges. Tolerance is ±1% (joint accounts round to 50/50, partnership K-1s
+sometimes 33.33/33.33/33.34, small rounding is acceptable). When the sum is
+< 99% or > 101%, flag `OWNERSHIP_SUM_VIOLATION`, log to
+`ownership_sum_violations.jsonl` with `{target_entity_id, target_entity_name,
+target_entity_type, actual_sum, expected: 100, contributing_edges, ts}`, and
+emit a Q-blocker enumerating the common causes (missing counterparty,
+partnership minor partner missed, life-estate / reversionary interests,
+duplicate-edge-from-Rule-73-not-fully-retired, post-divorce gap). DO NOT
+halt — a partial-ownership write with an open Q-blocker is better than a
+no-write; the human reviewer adjudicates in Phase 5. Discovered on the
+Comolli rerun where two real-property TAs each had Hannah at 50% but no
+Kevin edge (joint pre-divorce, divorce decree not yet processed in
+extraction). Rule 80 is the most impactful R-W1 finding because it catches
+a class of structural data-integrity gaps that pass entity-by-entity
+validation but fail when OWNERSHIP is summed.
+
+### Step 5.2: Null-rollup banner in Phase 5 review (Rule 81)
+
+Rule 68 made the household rollup fields advisory — they are computed by a
+nightly job and may be null even when the household has dozens of populated
+entities. That's correct behavior. But Phase 5's review currently has no
+signal when ALL the rollup fields are null. The reviewer can't tell whether
+the family is "new and pending the next rollup tick" vs "rollup job stuck
+for this firm" vs "actually empty (no entities)". Hnetinka's R-W1 review
+showed all-null rollups and the reviewer had to manually GET each per-type
+endpoint to disambiguate.
+
+Rule 81 adds a banner at the top of the Phase 5 review when the household
+satisfies BOTH conditions: (a) `GET /api/v1/household/{id}` returns
+`primaryIndividualName`, `totalAccountCount`, `totalMarketValue`, AND
+`totalTangibleAssetValue` ALL null, AND (b) the per-type entity counts (the
+Rule 68 client-built counts) show > 0 entities total. The banner explicitly
+distinguishes the "rollup pending" interpretation from the "rollup-job stuck"
+or "actually empty" interpretations, and cross-references Rule 68 so the
+reviewer knows the per-type counts are authoritative.
+
+The banner is informational, NOT a data-integrity blocker. It does not delay
+Phase 6 or require human acknowledgment to proceed. It exists so the reviewer
+knows to expect the dashboard to look empty until the next nightly tick.
+
+#### Rule 81 — Phase 5 review banner for null household rollups
+
+During Phase 5 review generation, if `GET /api/v1/household/{id}` shows
+`primaryIndividualName`, `totalAccountCount`, `totalMarketValue`, AND
+`totalTangibleAssetValue` ALL null, AND the Rule 68 per-type entity counts
+show > 0 entities total, emit a "rollup tick pending" banner at the top of
+the Phase 5 review with the literal text:
+
+> Note: Household rollup fields are null. Per-type entity counts indicate {N}
+> entities exist. The nightly rollup job may not have run yet. This is
+> informational, not a data integrity issue.
+
+Cross-reference Rule 68 in the banner so the reviewer knows the per-type
+counts are authoritative. The banner is informational, not blocking — Phase
+6 proceeds normally. Discovered on the Hnetinka R-W1 review where all-null
+rollups required manual per-type GETs to disambiguate "new household pending
+tick" vs "rollup-job stuck" vs "actually empty".
+
+### Step 1.5d: Carry over `run_state.skipped[]` on rerun (Rule 82)
+
+Hnetinka's R-W1 had six source files unposted from prior runs, deferred
+because of unresolved Q-blockers (Q1 and Q3 from earlier waves). The skill's
+existing `run_state.skipped[]` tracking notes that the writes were skipped,
+but the skill never explicitly says "on rerun, re-attempt the skipped writes
+IF the blocking Q-blocker is now resolved". So the skipped entries
+accumulated across reruns without ever being tried again, even after the
+blocking Q was answered.
+
+Rule 82 closes this with an explicit carry-over contract:
+
+1. **Required schema** for every entry in `run_state.skipped[]`:
+   `{uuid_or_path, reason, blocking_q_blocker_id, attemptedAt, attemptCount}`.
+   Existing entries that lack these fields MUST be backfilled at the start of
+   the rerun (set `attemptCount: 1` if unknown).
+2. **On rerun, in Phase 1.5**, iterate `run_state.skipped[]` BEFORE Phase 2:
+   - For each entry, check whether `blocking_q_blocker_id` is still in the
+     current household's open Q-blocker list (`altitude_questions_*.md`).
+   - If NOT in the open list (i.e., the Q-blocker was resolved), re-attempt
+     the write in the appropriate phase (typically Phase 6 or Phase 7 by
+     entity type) and remove the entry from `skipped[]` on success.
+   - If still in the open list, increment `attemptCount` and carry the entry
+     forward unchanged.
+3. **Escalation threshold**: when `attemptCount > 5` AND the Q-blocker is
+   still in the open list, escalate as a recurring-blocker Q to the user via
+   the Phase 5 review, separate from the regular open-question table. After
+   five reruns blocked on the same Q, the issue is no longer "pending review"
+   — it's "stuck", and the human needs to actively resolve or actively
+   abandon the write rather than passively defer.
+
+#### Rule 82 — `run_state.skipped[]` carry-over contract on rerun
+
+Every entry in `run_state.skipped[]` MUST contain `{uuid_or_path, reason,
+blocking_q_blocker_id, attemptedAt, attemptCount}` — backfill on rerun if
+the prior run produced entries without all five fields. In Phase 1.5 (after
+Rule 69's prior-UUID lookup), iterate `skipped[]`: if
+`blocking_q_blocker_id` is no longer in the current open
+`altitude_questions_*.md` list, re-attempt the write in the appropriate
+phase and remove the entry on success; if still blocked, increment
+`attemptCount` and carry forward; if `attemptCount > 5` AND still blocked,
+escalate as a recurring-blocker Q in the Phase 5 review (separate section
+from regular open questions) so the human can actively resolve or
+abandon the write rather than passively defer it. Discovered on Hnetinka
+R-W1 where six unposted source files had been carried in `skipped[]`
+across multiple reruns without re-attempt logic.
+
+### Step 1.6: Out-of-band relationship reconciliation (Rule 83)
+
+Hnetinka has a live `HOUSEHOLD → Lee OWNERSHIP 100%` relationship in
+production with no entry in `run_state.relationships[]` recording its
+creation. The skill did not create that edge — it was likely created
+out-of-band by an admin operation, a manual migration, or an earlier agent
+that did not write `run_state`. The skill has no mechanism to detect this
+class of edge, and Phase 6 has no rule about how to treat them. The risk:
+Phase 6 might inadvertently modify or delete an out-of-band edge that was
+intentionally created by a privileged operation, with no provenance in
+the agent's state to know it was deliberate.
+
+Rule 83 adds a Phase 1.6 step (after Rule 69's prior-UUID lookup, before
+Phase 2): fetch all current relationships involving entities owned by the
+household via `GET /api/v1/entity-relationship/from/HOUSEHOLD/{hh}` (and the
+firm-tenant fallback for Rule 69's 403 case). Compare each returned
+relationship against `run_state.relationships[]`. Any prod relationship
+without a matching `run_state` entry is "out-of-band" — log to
+`out_of_band_relationships.json` and treat as read-only in Phase 6.
+
+```json
+{
+  "household": "<name>",
+  "household_id": "<uuid>",
+  "out_of_band_relationships": [
+    {
+      "relationship_id": "<uuid>",
+      "source_entity_type": "HOUSEHOLD",
+      "source_entity_id": "<uuid>",
+      "target_entity_type": "INDIVIDUAL",
+      "target_entity_id": "<uuid>",
+      "relationship_type": "OWNERSHIP",
+      "percentage": 100,
+      "role": "G1",
+      "fetched_at": "2026-04-28T14:32:11Z"
+    }
+  ]
+}
+```
+
+Phase 6 MUST NOT modify out-of-band relationships unless explicitly authorized
+by the human reviewer. Phase 5 review MUST include an "out-of-band
+relationships discovered" section so the reviewer can authorize-or-dismiss
+each edge. The default posture is "leave it alone" — the edge may have been
+intentionally created by an admin operation outside the skill's workflow,
+and the skill has no way to know whether a modification would respect or
+violate the intent that produced it. Empty `out_of_band_relationships.json`
+is still required on every rerun so the fleet aggregator can rely on the
+file's presence.
+
+#### Rule 83 — Out-of-band edge reconciliation on rerun
+
+In Phase 1.6 (after Rule 69's prior-UUID lookup), fetch all current
+relationships involving entities owned by the household via
+`GET /api/v1/entity-relationship/from/HOUSEHOLD/{hh}` (apply Rule 69's
+firm-tenant fallback if the admin-scope GET 403s). Compare against
+`run_state.relationships[]`. Any relationship in production with no
+matching `run_state` entry is "out-of-band" — log to
+`out_of_band_relationships.json` with
+`{relationship_id, source_entity_type, source_entity_id, target_entity_type,
+target_entity_id, relationship_type, percentage, role, fetched_at}`. Phase 6
+MUST NOT modify out-of-band relationships unless explicitly authorized by
+the human reviewer; Phase 5 review MUST include an "out-of-band relationships
+discovered" section listing each edge for authorize-or-dismiss adjudication.
+Empty file is required on every rerun. Discovered on Hnetinka where a live
+`HH → Lee OWNERSHIP 100%` edge had no `run_state.relationships[]` provenance
+— almost certainly created by an admin operation, manual migration, or an
+earlier agent that did not write `run_state`.
 
 ---
 
