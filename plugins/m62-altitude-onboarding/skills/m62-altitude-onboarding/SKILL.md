@@ -4378,6 +4378,50 @@ ALL must hold:
 are live duplicates, not failures. Rule 75 verification kicks in on 2xx responses only;
 4xx/5xx flow through the dedicated 4xx/5xx handlers.)
 
+#### FK-path queryability check (R-W2 amendment)
+
+Basic GET-by-id verification confirms the row exists, but it does NOT confirm the row is
+discoverable via the FK paths that downstream consumers (Phase 1.3 universe walk,
+fleet aggregators, the Altitude UI's per-individual / per-household tabs) use. The R-W2
+rerun caught 5 of 5 newly-created TangibleAssets across Lim (3) and Comolli (2) that
+returned 201 + valid `id` + GET-by-id 200, yet had `individualId=null` AND
+`legalEntityId=null` AND `householdId=null`. Rule 75's three-part check PASSed; the rows
+were silently invisible to `/tangible-asset/by-individual/{ownerId}` and
+`/tangible-asset/by-household/{hhId}`. This is exactly the FK_ORPHAN class that Rule 79
+detects retrospectively — Rule 75's amendment closes the loop by catching it at
+write-time, before the row is marked CREATED in `run_state`.
+
+For entity types with FK fields — **TangibleAsset, AccountFinancial, Liability,
+InsurancePolicy** — Rule 75's PASS criteria for entity POST gain a fourth requirement:
+
+5. **FK-path queryability** — after the GET-by-id confirms the row exists, issue a
+   second GET against the FK path implied by the create payload's owner relationship,
+   and confirm the new entity's `id` appears in the returned list.
+   - If the create attached the entity to an Individual owner → `GET
+     /api/v1/{entity-type}/by-individual/{ownerId}`.
+   - If the create attached it to a LegalEntity owner → `GET
+     /api/v1/{entity-type}/by-legal-entity/{ownerId}`.
+   - For entity types that also expose `/by-household/{hhId}` (TangibleAsset,
+     AccountFinancial), additionally confirm the new id appears there when the
+     household FK is part of the create payload.
+   - If the new id does NOT appear via the FK path → log to
+     `phase6_create_failures.jsonl` with `failure_reason: "fk_path_orphan"` and emit a
+     Q-blocker recommending the agent retry the create with the FK fields explicitly
+     set (`individualId` / `legalEntityId` / `householdId` populated alongside the
+     OWNERSHIP edge, not relying on a save-hook to derive them).
+
+This is a **prevention** check that complements Rule 79's **detection**. Together they
+close the FK_ORPHAN loop — Rule 75 prevents new ones at write-time, Rule 79 detects
+existing ones during Phase 1.5 rerun-classification. Entity types without FK fields
+(Individual, LegalEntity, Contact, Household) are not subject to this fourth check —
+their three-part verification is unchanged.
+
+Apply Rule 74-style disambiguation before flagging fk_path_orphan: if the FK-path GET
+returns 4xx because of pagination / firm-tenant scope / `/by-{owner}` not implemented
+for that entity type, fall back to a direct field check on the GET-by-id response body
+(`individualId != null OR legalEntityId != null OR householdId != null`). Only flag
+`fk_path_orphan` when the row demonstrably has all three FK columns null.
+
 #### FAIL handling — log, do NOT auto-retry
 
 On any verification failure, append a structured entry to
@@ -4392,7 +4436,7 @@ line):
   "request_body_excerpt": {"legalName": "...", "entityType": "TRUST"},
   "response_status": 200,
   "response_body_excerpt": "{\"message\": \"...\"}",
-  "failure_reason": "non_201_status | missing_id | get_back_404 | timeout | json_parse_error"
+  "failure_reason": "non_201_status | missing_id | get_back_404 | fk_path_orphan | timeout | json_parse_error"
 }
 ```
 
@@ -4453,11 +4497,17 @@ def _log_failure(operation, endpoint, body, status, response_excerpt, reason):
         f.write(json.dumps(entry) + "\n")
 
 
-def verified_create(endpoint, body):
+def verified_create(endpoint, body, fk_check=None):
     """Phase 6 entity create with Rule 75 verification.
 
     Returns the new UUID on full PASS, or None on any FAIL (caller MUST NOT
     record None as an entity id in run_state).
+
+    fk_check (optional, R-W2 amendment): for entity types with FK fields
+    (TangibleAsset, AccountFinancial, Liability, InsurancePolicy), pass a dict
+    like {"path": "/api/v1/tangible-asset/by-individual", "owner_id": "<uuid>"}
+    to additionally verify FK-path queryability. If the new id does NOT appear
+    in the FK-path GET response, log fk_path_orphan and return None.
     """
     try:
         r = requests.post(f"{BASE}{endpoint}", json=body, headers=HEADERS, timeout=30)
@@ -4481,6 +4531,37 @@ def verified_create(endpoint, body):
     if g.status_code != 200:
         _log_failure("POST", endpoint, body, g.status_code, g.text, "get_back_404")
         return None
+    # FK-path queryability (R-W2 amendment). Fallback to direct FK-column check
+    # on the GET-by-id body if the /by-{owner} endpoint returns 4xx.
+    if fk_check:
+        row = g.json() if g.text else {}
+        fk_url = f"{BASE}{fk_check['path']}/{fk_check['owner_id']}"
+        try:
+            fk = requests.get(fk_url, headers=HEADERS, timeout=15)
+        except requests.RequestException:
+            fk = None
+        appeared = False
+        if fk is not None and fk.status_code == 200:
+            try:
+                items = fk.json()
+                items = items.get("content", items) if isinstance(items, dict) else items
+                appeared = any((it or {}).get("id") == new_id for it in items)
+            except ValueError:
+                appeared = False
+        if not appeared:
+            # Fallback: a non-null FK column on the GET-by-id row is sufficient
+            # evidence that the row is FK-attached and just paginated past or
+            # the /by-{owner} endpoint isn't implemented for this type.
+            fk_attached = any(row.get(k) for k in (
+                "individualId", "legalEntityId", "householdId",
+            ))
+            if not fk_attached:
+                _log_failure(
+                    "POST", endpoint, body, g.status_code,
+                    f"fk_path={fk_url} new_id_not_in_list AND row FKs all null",
+                    "fk_path_orphan",
+                )
+                return None
     return new_id
 
 
@@ -4535,11 +4616,17 @@ After every entity POST (Step 6.2), entity PATCH, and relationship POST (Step 6.
 Phase 6, the skill MUST: (a) assert the HTTP status — 201 for POSTs, 200 for PATCHes —
 NOT just "2xx"; (b) parse the response body and assert a non-null UUID `id` field is
 present (entity POST and relationship POST); (c) issue an immediate `GET
-/api/v1/{resource}/{id}` and confirm 200 with the row populated. Any failure logs a
-structured entry to `{household_folder}/altitude_review/phase6_create_failures.jsonl`
-with `operation`, `endpoint`, `request_body_excerpt`, `response_status`,
-`response_body_excerpt`, and `failure_reason` (`non_201_status`, `missing_id`,
-`get_back_404`, `timeout`, or `json_parse_error`). The failed entity is NOT marked
+/api/v1/{resource}/{id}` and confirm 200 with the row populated; (d) for entity types
+with FK fields (TangibleAsset, AccountFinancial, Liability, InsurancePolicy), issue a
+second GET against the FK path implied by the owner relationship
+(`/by-individual/{ownerId}`, `/by-legal-entity/{ownerId}`, or `/by-household/{hhId}`)
+and confirm the new `id` appears in the returned list — this catches FK_ORPHAN
+(individualId=null AND legalEntityId=null AND householdId=null) at write-time, the
+class Rule 79 detects retrospectively. Any failure logs a structured entry to
+`{household_folder}/altitude_review/phase6_create_failures.jsonl` with `operation`,
+`endpoint`, `request_body_excerpt`, `response_status`, `response_body_excerpt`, and
+`failure_reason` (`non_201_status`, `missing_id`, `get_back_404`, `fk_path_orphan`,
+`timeout`, or `json_parse_error`). The failed entity is NOT marked
 CREATED in `run_state` — its UUID stays unset and the failure is surfaced to the
 Phase 5/9 review for user adjudication. The skill MUST NOT auto-retry the same write
 blindly (duplicate-create risk). If the create-failure rate exceeds ~5% of attempts
@@ -6640,6 +6727,67 @@ for a reference example (RM handoff format).
     0.0 without PATCH), the patch step can be skipped — but until then, leave it
     in to prevent silent rollup contamination.
 
+    ### Visibility-edge save-hook workaround (R-W2 amendment, Linear PLT-68 #5)
+
+    The backend save-hook `propagateParentHousehold` is supposed to fire whenever a
+    `HOUSEHOLD → LegalEntity OWNERSHIP` edge is created and stamp
+    `parentHouseholdId` on the LegalEntity row. For 100% economic-ownership edges
+    this works. For 0% visibility edges (the irrevocable-trust-as-visible-only
+    pattern this rule mandates), the hook silently does NOT fire — filed as Linear
+    **PLT-68 bug #5**. The R-W2 rerun caught Barnes' `Seventh Farie Trust` and
+    `Barclay Real Estate Trust` with correct HH→LE OWNERSHIP 0% edges in
+    production but `parentHouseholdId=null` on the LegalEntity records themselves,
+    causing the LEs to drop out of `/by-household` rollups even though the
+    visibility edge was perfectly formed.
+
+    Until the backend fix lands (track PLT-68 #5), the skill MUST work around it.
+    After every successful POST of a `HOUSEHOLD → LegalEntity OWNERSHIP 0%`
+    visibility edge:
+
+    1. **GET the LegalEntity**: `GET /api/v1/legal-entity/{leId}`.
+    2. **Check `parentHouseholdId`**: if null, **PATCH it**:
+       `PATCH /api/v1/legal-entity/{leId}` with body `{"parentHouseholdId": "{hhId}"}`.
+       (LegalEntity's `parentHouseholdId` is normally derived from a save-hook,
+       but with the hook missing for 0% edges, an explicit PATCH is the only
+       path to populate the column.)
+    3. **Apply Rule 75 verification** on the PATCH (assert 200, GET-back the LE,
+       confirm `parentHouseholdId` now equals `{hhId}` — see the "PATCH 200 with
+       silent no-op" caveat called out in Rule 75 for derived fields).
+    4. **Log the workaround application** to
+       `{household_folder}/altitude_review/phase6_visibility_edge_patches.jsonl`
+       with `{ts, hh_id, le_id, le_name, edge_id, parent_household_id_before,
+       parent_household_id_after, rule_75_status}` so a post-run audit can
+       enumerate every workaround invocation.
+
+    ```python
+    # visibility_edge_workaround.py
+    # Apply IMMEDIATELY after every Rule 60 HOUSEHOLD→LE OWNERSHIP 0% POST.
+    # Tracks Linear PLT-68 bug #5 — remove this block once that ticket lands.
+    le_before = api.get(f"/api/v1/legal-entity/{le_id}")
+    if not le_before.get("parentHouseholdId"):
+        api.patch(f"/api/v1/legal-entity/{le_id}", json={"parentHouseholdId": hh_id})
+        le_after = api.get(f"/api/v1/legal-entity/{le_id}")
+        assert le_after.get("parentHouseholdId") == hh_id, (
+            f"PATCH parentHouseholdId silently no-opped on LE {le_id} — escalate"
+        )
+        with open(f"{household_folder}/altitude_review/phase6_visibility_edge_patches.jsonl", "a") as f:
+            f.write(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                "hh_id": hh_id, "le_id": le_id, "le_name": le_after.get("legalName"),
+                "edge_id": rel_id,
+                "parent_household_id_before": le_before.get("parentHouseholdId"),
+                "parent_household_id_after": le_after.get("parentHouseholdId"),
+                "rule_75_status": "PASS",
+            }) + "\n")
+    ```
+
+    Cross-reference: this workaround can be removed when **Linear PLT-68 #5**
+    lands (backend `propagateParentHousehold` save-hook fixed to fire on 0%
+    OWNERSHIP edges). Until then, the workaround is mandatory — without it, the
+    visibility edge persists but the LE is invisible to `/by-household` rollups
+    and the Altitude UI's per-household trust list, which exactly defeats the
+    purpose of creating the visibility edge in the first place.
+
     **2. `parentHouseholdId` on Individual is NOT directly PATCHable.**
     PATCH `/api/v1/individual/{id}` with `{"parentHouseholdId": "..."}` returns 200 OK
     but silently no-ops. The field is derived from traversing HOUSEHOLD→INDIVIDUAL
@@ -7822,6 +7970,41 @@ Common causes the rule tells the agent to enumerate in the Q-blocker:
   73 PATCH-in-place that didn't fully retire the prior edge, or by Phase 4.7
   role-replacement that double-counted a continuing owner.
 
+#### ⚠ Backend does NOT enforce — skill is the only line of defense (R-W2 amendment, Linear PLT-68 #6)
+
+The backend accepts OWNERSHIP percentage sums above 100 silently — there is
+NO write-time constraint on the sum across edges sharing a target. Filed as
+**Linear PLT-68 bug #6**. The R-W2 rerun confirmed: Barnes' `Carrie + Phineas
+Barnes Trust` and `Capizzi Trust` both sit in production at OWNERSHIP sum =
+**200%** (each has two 100% OWNERSHIP edges from different sources), and the
+backend never raised an error on the second POST. The Phase 3.7 sum check
+defined in this rule is therefore the **only** line of defense against
+percentage-sum violations until PLT-68 #6 lands.
+
+When Phase 3.7 detects an `OWNERSHIP_SUM_VIOLATION`, the agent MUST:
+
+1. **NOT auto-fix the percentages.** The agent does not have the source-of-
+   truth context to decide which edge is wrong (or whether both are right and
+   a duplicate exists). Auto-correction risks rewriting a correct edge with
+   bad data.
+2. **Emit a Q-blocker** with the violating target's UUID, the current sum,
+   and the per-edge breakdown.
+3. **Document existing OWNERSHIP edges to the target** in the Q-blocker —
+   each with `{source_id, source_name, source_type, percentage, role,
+   relationship_id}`. The reviewer needs the source UUIDs to delete the wrong
+   edge if a duplicate is the cause, or to PATCH the percentage if a value is
+   wrong.
+4. **Recommend in the Q-blocker**: re-extract from source documents (deeds,
+   trust agreements, K-1s, joint-tenancy registrations) to determine the
+   correct percentages. If the source documents are not present in the
+   household folder, recommend requesting them from the client/advisor.
+
+Cross-reference: when **Linear PLT-68 #6** lands (backend write-time
+enforcement of OWNERSHIP percentage sum constraints), this skill rule
+downgrades from "only line of defense" to "defense-in-depth pre-write check"
+— still valuable for catching extraction-stage errors before they hit the
+network, but no longer load-bearing for production data integrity.
+
 #### Rule 80 — Phase 3.7 OWNERSHIP percentage sum check
 
 In Phase 3.7, for every target entity that receives one or more OWNERSHIP
@@ -7840,7 +8023,13 @@ Comolli rerun where two real-property TAs each had Hannah at 50% but no
 Kevin edge (joint pre-divorce, divorce decree not yet processed in
 extraction). Rule 80 is the most impactful R-W1 finding because it catches
 a class of structural data-integrity gaps that pass entity-by-entity
-validation but fail when OWNERSHIP is summed.
+validation but fail when OWNERSHIP is summed. **The backend does NOT
+enforce sum constraints at write-time** (Linear PLT-68 #6) — Barnes' R-W2
+audit found `Carrie + Phineas Barnes Trust` and `Capizzi Trust` at 200% in
+production, accepted silently. Until PLT-68 #6 lands, this Phase 3.7 check
+is the only line of defense; the agent MUST NOT auto-fix percentages —
+emit a Q-blocker with the violating target id, current sum, and per-edge
+breakdown (source UUIDs), and recommend re-extraction from source documents.
 
 ### Step 5.2: Null-rollup banner in Phase 5 review (Rule 81)
 
@@ -7999,6 +8188,107 @@ Empty file is required on every rerun. Discovered on Hnetinka where a live
 `HH → Lee OWNERSHIP 100%` edge had no `run_state.relationships[]` provenance
 — almost certainly created by an admin operation, manual migration, or an
 earlier agent that did not write `run_state`.
+
+### Step 5.3: Phase 5 duplicate-Contact detection (Rule 84)
+
+Phase 5's review currently catalogs Contacts attached to the household but
+does NOT scan for likely-duplicate Contact records. The R-W2 rerun caught
+Barnes' `Robert Eaddy` (ADVISOR Contact) and `Robert W. Eaddy` (TRUSTEE
+Contact) — almost certainly the same person but recorded as two distinct
+Contact rows because they were extracted from different documents (a
+brokerage statement listing the advisor, and a trust agreement listing the
+trustee) and the match-and-merge pass only deduplicates within the same
+extraction batch, not across roles. The duplicate is benign individually
+(both records are well-formed) but cumulatively erodes the household graph:
+`get_entity_relationships` returns two edges where one belongs, rollups
+double-count contact-related signals, and PATCH operations against one
+record leave the other stale.
+
+Rule 84 adds a Phase 5 step that scans all Contacts attached to the
+household for likely duplicates. The scan is heuristic, not deterministic
+— two records may legitimately be different people with similar names
+(siblings, father/son, attorneys at the same firm). The output is therefore
+a flag for human review, NOT an auto-merge. The skill MUST NOT merge
+Contacts automatically.
+
+**Detection heuristics** — any one of these fires the duplicate flag:
+
+1. **Name similarity (Levenshtein ≤ 2)**: edit distance between the two
+   full-name strings is ≤ 2 characters. Catches typos, dropped middle
+   initials when full middle name vs no middle name (e.g.
+   `"Robert Eaddy"` vs `"Robert W. Eaddy"` — distance 3 on raw strings,
+   but distance 0 after middle-initial normalization, see signal below).
+2. **Shared first+last with optional middle**: after stripping middle
+   names/initials, first+last match exactly. Captures `"Robert Eaddy"` vs
+   `"Robert W. Eaddy"` and `"Jane Smith"` vs `"Jane M Smith"`.
+3. **Email match**: identical email address (case-insensitive) on two
+   Contact records. Strong signal — almost always the same person.
+4. **Phone match**: identical phone digits (after stripping formatting:
+   `(555) 123-4567` and `5551234567` are equivalent). Strong signal.
+5. **Title overlap with name overlap**: e.g. `"John Smith — Attorney"` +
+   `"John Smith — Estate Attorney"`. The role/title fields share substring
+   tokens AND the names match heuristic 2.
+
+**Output** — `{household_folder}/altitude_review/phase5_duplicate_contacts.json`:
+
+```json
+{
+  "ts": "2026-04-28T14:32:11Z",
+  "household_id": "<hh-uuid>",
+  "candidates": [
+    {
+      "contactA": {"id": "<uuid-a>", "name": "Robert Eaddy", "role": "ADVISOR", "email": null, "phone": null},
+      "contactB": {"id": "<uuid-b>", "name": "Robert W. Eaddy", "role": "TRUSTEE", "email": null, "phone": null},
+      "similarity_signals": ["name_first_last_match_with_middle_initial"],
+      "suggested_action": "merge_or_reclassify"
+    }
+  ]
+}
+```
+
+The file is required on every Phase 5 (write `{"ts": ..., "candidates": []}`
+when no candidates are found, so the fleet aggregator can rely on its
+presence — same convention as Rule 83's `out_of_band_relationships.json`).
+
+**Phase 5 review surfacing**: the review markdown MUST include a "Possible
+duplicate Contacts — review" section listing each candidate pair with both
+UUIDs, both names, both roles, the firing signals, and the literal note:
+
+> These two Contact records may be the same person. Review the source
+> documents that produced each record. If they are the same person, the
+> reviewer should merge in Altitude (or the agent can apply a manual merge
+> after explicit authorization). If they are different people, dismiss
+> this flag and the rerun will not re-flag the same pair (mark them as
+> `dismissed_duplicate: true` in run_state to suppress).
+
+The review section is informational, not a data-integrity blocker — Phase 6
+proceeds normally. Auto-merge is explicitly forbidden: the two records may
+legitimately be different people (e.g., a father and son with the same
+first+last name, an attorney and his partner of the same firm), and a
+wrong merge is harder to undo than living with a flagged duplicate.
+
+#### Rule 84 — Phase 5 duplicate-Contact detection
+
+In Phase 5, scan all Contacts attached to the household for likely
+duplicates using these heuristics (any one fires the flag): (1) Levenshtein
+distance ≤ 2 between full-name strings; (2) shared first+last with optional
+middle name/initial; (3) identical email (case-insensitive); (4) identical
+phone digits (after format-stripping); (5) title overlap with name overlap
+(e.g. `"John Smith — Attorney"` + `"John Smith — Estate Attorney"`). Emit
+`{household_folder}/altitude_review/phase5_duplicate_contacts.json` with
+`{ts, household_id, candidates: [{contactA: {id, name, role, email, phone},
+contactB: {id, name, role, email, phone}, similarity_signals: [...],
+suggested_action: "merge_or_reclassify"}]}`. Empty file (`candidates: []`)
+required on every rerun. Surface in the Phase 5 review markdown as a
+"Possible duplicate Contacts — review" section. **DO NOT auto-merge** —
+the two records may legitimately be different people (siblings, father/son,
+attorneys at the same firm); merging is a human decision. The flag is
+informational, not blocking — Phase 6 proceeds normally. Discovered on the
+Barnes R-W2 rerun where `Robert Eaddy` (ADVISOR Contact) and
+`Robert W. Eaddy` (TRUSTEE Contact) were almost certainly the same person
+recorded as two distinct rows because they were extracted from different
+documents and the match-and-merge pass only deduplicates within an
+extraction batch, not across roles.
 
 ---
 
