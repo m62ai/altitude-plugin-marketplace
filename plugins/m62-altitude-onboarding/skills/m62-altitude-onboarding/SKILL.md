@@ -4202,6 +4202,9 @@ post-deploy PATCH to promote legacy-mapped entities to the new enum.
 | PRIVATE_FOUNDATION | FOUNDATION | Verify enum exists; else OTHER |
 | DISREGARDED_LLC | LLC | Use `taxClassification=INDIVIDUAL_SOLE_PROPRIETOR_OR_SINGLE_MEMBER_LLC` (there is no `DISREGARDED_ENTITY` enum value — see taxClassification table below) |
 | SERIES_LLC | LLC | Note series in description |
+| Profit Sharing Plan / Defined Benefit Plan / Defined Contribution Plan / ERISA-qualified retirement plan | `RETIREMENT_PLAN` | New first-class enum shipped backend PR #245 / PLT-67 (deployed 2026-04-28). Previously fell back to `OTHER`. Detect by Form 5500, 401(k) plan document, profit-sharing plan document, ERISA references. |
+| Household-employer EIN (Schedule H domestic-staff payroll entity) | `HOUSEHOLD_EMPLOYER` | New first-class enum (PR #245 / PLT-67, 2026-04-28). Previously fell back to `OTHER`. Detect by Schedule H on 1040 + a separate EIN issued for nanny/housekeeper/estate-staff payroll. |
+| Portfolio aggregator / parent vehicle wrapping multiple direct investments or fund LPs (no operating purpose of its own) | `PORTFOLIO_AGGREGATE` | New first-class enum (PR #245 / PLT-67, 2026-04-28). Previously fell back to `OTHER`. Detect by an LE whose only economic content is a basket of LP / fund-vehicle MEMBER edges, not an operating company or trust. |
 
 **LegalEntity `taxClassification` remaps**:
 
@@ -4438,7 +4441,7 @@ name (`parentHouseholdId`) has different semantics across entity types:
 | **InsurancePolicy** | **READ-ONLY (silent drop, 200 returned)** | Settable (works) | `PATCH /insurance-policy/{id} {"parentHouseholdId": "{hh}"}` |
 | **AccountFinancial** | **READ-ONLY (silent drop, 200 returned)** | Settable (works) | `PATCH /account-financial/{id} {"parentHouseholdId": "{hh}"}` |
 | **Liability** | **READ-ONLY (silent drop, 200 returned)** | Settable (works) | `PATCH /liability/{id} {"parentHouseholdId": "{hh}"}` |
-| **LegalEntity** | n/a | **DERIVED from OWNERSHIP graph (PATCH silently no-ops)** | POST a HOUSEHOLD→LE OWNERSHIP edge — propagateParentHousehold save-hook stamps the column. For irrevocable trusts use 0% per Rule 60; for revocable trusts use 100% per grantor per Rule 60 grantor amendment (PR #15) |
+| **LegalEntity** | n/a | **DERIVED from OWNERSHIP graph (PATCH silently no-ops)** | POST a HOUSEHOLD→LE OWNERSHIP edge — `propagateParentHousehold` save-hook stamps the column on both 100% and 0% edges (0% case fixed by backend PR #244 / PLT-68 #5, deployed 2026-04-28). For irrevocable trusts use 0% per Rule 60; for revocable trusts use 100% per grantor per Rule 60 grantor amendment (PR #15) |
 | **Individual** | n/a | **DERIVED from OWNERSHIP graph (PATCH silently no-ops)** | POST a HOUSEHOLD→INDIVIDUAL OWNERSHIP edge per Rule 60 |
 
 So when `fk_path_orphan` triggers on a TA / Insurance / Liability / AccountFinancial:
@@ -4455,9 +4458,10 @@ So when `fk_path_orphan` triggers on a TA / Insurance / Liability / AccountFinan
    row is reachable through the canonical graph traversal, not just via
    `parentHouseholdId` direct-column lookup.
 
-For LegalEntity FK_ORPHAN, the remediation is purely the OWNERSHIP edge POST
-— the visibility-edge save-hook workaround in Rule 60 (Linear PLT-68 #5)
-handles the 0% case where the save-hook does not fire on its own.
+For LegalEntity FK_ORPHAN, the remediation is purely the OWNERSHIP edge POST.
+The visibility-edge save-hook now propagates `parentHouseholdId` automatically on
+0% OWNERSHIP edges as well as 100% — Linear PLT-68 #5 was resolved by backend
+PR #244 (deployed 2026-04-28); the prior PATCH workaround in Rule 60 is OBSOLETE.
 
 Cross-reference: **Linear PLT-68 #7** tracks the FK-field PATCH silent-drop
 bug. Once that lands, the FK-fields-via-PATCH path becomes valid and this
@@ -4831,10 +4835,13 @@ out_path.write_text('\n'.join(out))
 print(out_path)
 ```
 
-Then upload with `contentType=TXT` and `documentSubType=CORRESPONDENCE` only if the
-target entity type is `ACCOUNT_FINANCIAL`, `TANGIBLE_ASSET`, `INSURANCE_POLICY`, or
-`LIABILITY`. For `INDIVIDUAL` or `LEGAL_ENTITY` targets use `documentSubType=OTHER` —
-their enums do NOT include `CORRESPONDENCE` (per api.json 2026-04-22).
+Then upload with `contentType=TXT` and `documentSubType=CORRESPONDENCE`. As of
+backend PR #245 / PLT-67 (deployed 2026-04-28), `CORRESPONDENCE` is valid on every
+document-bearing entity type — `INDIVIDUAL`, `LEGAL_ENTITY`, `ACCOUNT_FINANCIAL`,
+`TANGIBLE_ASSET`, `INSURANCE_POLICY`, and `LIABILITY` — so no entity-type-specific
+fallback to `OTHER` is required. (Pre-PR #245 the `INDIVIDUAL` and `LEGAL_ENTITY`
+enums did NOT include `CORRESPONDENCE` and required an `OTHER` fallback; that
+constraint no longer applies.)
 
 ## WARNING — Push-agent enum pitfalls (verified on recent production run)
 
@@ -4847,9 +4854,9 @@ recent production run (7 documents required post-push PATCHes):
 | `GOVERNMENT_ID` | 400 | `DRIVERS_LICENSE` / `PASSPORT` / `NATIONAL_ID` / `STATE_ID` — pick the specific type |
 | `TAX_RETURN_1040` | 400 | `FORM_1040` |
 | `ACCOUNT_STATEMENT` on `/individual/` | 400 (not in IndividualDocumentSubType) | `BANK_STATEMENT` / `INVESTMENT_STATEMENT` — OR route the upload to `/account-financial/{id}/document` instead |
-| `ACCOUNT_STATEMENT` on `/account-financial/` | 400 (not in AccountFinancialDocumentSubType) | `BROKERAGE_STATEMENT` / `CUSTODIAL_STATEMENT` / `BANK_STATEMENT` — pick by custodian type |
-| `INVESTMENT_STATEMENT` on `/account-financial/` | 400 (not in AccountFinancialDocumentSubType) | `BROKERAGE_STATEMENT` (for brokerage / investment account statements) or `CUSTODIAL_STATEMENT` (for trust-custodied accounts). `INVESTMENT_STATEMENT` is **Individual / LegalEntity-only** — do NOT use it for AccountFinancial uploads. Liu Family Wave 1 hit 10 × HTTP 400 on Schwab statements before remapping. |
-| `CORRESPONDENCE` on `/individual/` or `/legal-entity/` | 400 (legitimately not in enum) | Fall back to `OTHER` |
+| `ACCOUNT_STATEMENT` on `/account-financial/` | 400 (not in AccountFinancialDocumentSubType) | `BROKERAGE_STATEMENT` / `CUSTODIAL_STATEMENT` / `BANK_STATEMENT` / `INVESTMENT_STATEMENT` — pick by custodian type. (Note: `INVESTMENT_STATEMENT` was added to AccountFinancial by backend PR #245 / PLT-67, deployed 2026-04-28.) |
+| `INVESTMENT_STATEMENT` on `/account-financial/` | ~~400~~ **Now valid** as of backend PR #245 / PLT-67 (deployed 2026-04-28). Use for non-brokerage statements (529s, IRAs, trust-custodied accounts) where `BROKERAGE_STATEMENT` doesn't fit. For traditional brokerage accounts (Schwab, Fidelity, Morgan Stanley) prefer `BROKERAGE_STATEMENT` for semantic precision. (Pre-PR #245 this returned HTTP 400 — Liu Family Wave 1 hit 10 × 400 on Schwab statements; that constraint no longer applies.) |
+| `CORRESPONDENCE` on `/individual/` or `/legal-entity/` | ~~400~~ **Now valid** as of backend PR #245 / PLT-67 (deployed 2026-04-28). `CORRESPONDENCE` is in IndividualDocumentSubType + LegalEntityDocumentSubType. (Pre-PR #245 fell back to `OTHER` — that fallback is no longer required.) |
 | `ENGAGEMENT_LETTER` (anywhere) | 400 (no such enum exists) | `OTHER` |
 | Trust agreements left as `OTHER` | silent (accepted) | `TRUST_AGREEMENT` / `TRUST_AMENDMENTS` / `REVOCABLE_TRUST_DOCUMENT` — always classify trust docs |
 
@@ -4903,6 +4910,8 @@ Estate/Legal: `POWER_OF_ATTORNEY`, `NAME_CHANGE_DOCUMENT`, `MARRIAGE_CERTIFICATE
 Investment: `SUBSCRIPTION_AGREEMENT`, `INVESTMENT_POLICY_STATEMENT`, `INVESTMENT_QUESTIONNAIRE`,
 `INVESTOR_ACCREDITATION`
 
+General: `CORRESPONDENCE` (added by backend PR #245 / PLT-67, deployed 2026-04-28)
+
 Fallback: `OTHER`
 
 #### LegalEntityDocumentCreateRequestDto.documentSubType (84 values)
@@ -4941,29 +4950,32 @@ Other legal: `POWER_OF_ATTORNEY`, `AUTHORIZED_SIGNER_DOCUMENTATION`, `LEGAL_OPIN
 `INCUMBENCY_CERTIFICATE`, `CORPORATE_SEAL`, `AMENDMENT`, `PROMISSORY_NOTE`, `PERSONAL_GUARANTY`,
 `SUBSCRIPTION_AGREEMENT`, `INVESTMENT_POLICY_STATEMENT`, `INVESTOR_QUESTIONNAIRE`, `PPM_ACKNOWLEDGMENT`
 
+General: `WIRE_INSTRUCTIONS`, `CORRESPONDENCE` (both added by backend PR #245 / PLT-67, deployed 2026-04-28; common case for `WIRE_INSTRUCTIONS` is trust-LE wire-and-DTC instruction memos like "DPG 2022 Irrev. IG Trust Wire & DTC Instructions.docx")
+
 Fallback: `OTHER`
 
 #### AccountFinancialDocumentCreateRequestDto.documentSubType (92 values)
 
 Account: `ACCOUNT_AGREEMENT`, `ACCOUNT_APPLICATION`, `TRANSFER_FORM`, `BENEFICIARY_DESIGNATION`,
-`CUSTODIAL_STATEMENT`, `CUSTODY_AGREEMENT`, `FEE_SCHEDULE`, `BROKERAGE_STATEMENT`, `MARGIN_AGREEMENT`,
-`OPTIONS_AGREEMENT`, `TRADE_CONFIRMATION`, `BANK_STATEMENT`, `VOIDED_CHECK`, `DIRECT_DEPOSIT_FORM`,
-`WIRE_INSTRUCTIONS`, `ACH_AUTHORIZATION`
+`CUSTODIAL_STATEMENT`, `CUSTODY_AGREEMENT`, `FEE_SCHEDULE`, `BROKERAGE_STATEMENT`,
+`INVESTMENT_STATEMENT`, `MARGIN_AGREEMENT`, `OPTIONS_AGREEMENT`, `TRADE_CONFIRMATION`,
+`BANK_STATEMENT`, `VOIDED_CHECK`, `DIRECT_DEPOSIT_FORM`, `WIRE_INSTRUCTIONS`, `ACH_AUTHORIZATION`
 
 Tax (same extensive list as Individual)
 
 Retirement: `IRA_ADOPTION_AGREEMENT`, `PLAN_DOCUMENT_401K`, `RMD_NOTICE`, `ROLLOVER_CERTIFICATION`
 
 Authorizations + identity (same as Individual) — use CUSTODIAL_STATEMENT / BROKERAGE_STATEMENT /
-BANK_STATEMENT / TRADE_CONFIRMATION before OTHER.
+INVESTMENT_STATEMENT / BANK_STATEMENT / TRADE_CONFIRMATION before OTHER.
 
-> ⚠ `INVESTMENT_STATEMENT` is **NOT** in `AccountFinancialDocumentSubType`. It only
-> exists in the Individual and LegalEntity enums. For AccountFinancial-anchored
-> brokerage / investment-account statements (Schwab, Fidelity, Morgan Stanley, etc.)
-> use `BROKERAGE_STATEMENT`. For trust-custodied accounts use `CUSTODIAL_STATEMENT`.
-> Bank checking/savings on an AccountFinancial use `BANK_STATEMENT`. Liu Family Wave 1
-> rerun hit HTTP 400 on 10 Schwab statement uploads before this divergence was
-> remapped — formalizing the rule here so subsequent fleet runs do not repeat it.
+> **Note:** `INVESTMENT_STATEMENT` is now valid for AccountFinancial as of backend
+> PR #245 / PLT-67 (deployed 2026-04-28). Use it for non-brokerage statements (529s,
+> IRAs, trust-custodied accounts) where `BROKERAGE_STATEMENT` doesn't fit semantically.
+> For traditional brokerage / investment-account statements (Schwab, Fidelity, Morgan
+> Stanley, etc.) `BROKERAGE_STATEMENT` remains the preferred value; for trust-custodied
+> accounts use `CUSTODIAL_STATEMENT`; for bank checking/savings use `BANK_STATEMENT`.
+> (Pre-PR #245 this enum was Individual / LegalEntity-only and Liu Family Wave 1 hit
+> HTTP 400 on 10 Schwab statement uploads — that constraint no longer applies.)
 
 #### TangibleAssetDocumentCreateRequestDto.documentSubType (96 values)
 
@@ -5002,11 +5014,14 @@ Legal/tax: `LEGAL_AGREEMENT`, `POWER_OF_ATTORNEY`, `TRUST_DOCUMENT`, `LOAN_AGREE
 Other: `BENEFICIARY_DESIGNATION`, `WILL_EXCERPT`, `DONATION_INTENT`, `RECEIPT`, `CORRESPONDENCE`,
 `NOTES`, `OTHER`
 
-#### LiabilityDocumentCreateRequestDto.documentSubType (13 values — small)
+#### LiabilityDocumentCreateRequestDto.documentSubType (14 values — small)
 
 `LOAN_AGREEMENT`, `PROMISSORY_NOTE`, `MORTGAGE_DEED`, `COLLATERAL_AGREEMENT`,
 `LINE_OF_CREDIT_AGREEMENT`, `REFINANCE_DOCUMENTS`, `AMORTIZATION_SCHEDULE`, `PAYOFF_STATEMENT`,
-`ACCOUNT_STATEMENT`, `FORM_1098`, `INSURANCE_CERTIFICATE`, `CORRESPONDENCE`, `OTHER`
+`ACCOUNT_STATEMENT`, `FORM_1098`, `INSURANCE_CERTIFICATE`, `WIRE_INSTRUCTIONS`,
+`CORRESPONDENCE`, `OTHER`
+
+> `WIRE_INSTRUCTIONS` added by backend PR #245 / PLT-67 (deployed 2026-04-28).
 
 #### InsurancePolicyDocumentCreateRequestDto.documentSubType (26 values)
 
@@ -5023,7 +5038,8 @@ Billing: `PREMIUM_NOTICE`, `PAYMENT_RECEIPT`, `BILLING_STATEMENT`, `ANNUAL_STATE
 Beneficiary: `BENEFICIARY_DESIGNATION`, `BENEFICIARY_CHANGE`, `POWER_OF_ATTORNEY`,
 `TRUST_ASSIGNMENT`, `IRREVOCABLE_ASSIGNMENT`, `OWNERSHIP_CHANGE`
 
-Other: `CORRESPONDENCE`, `OTHER`
+Other: `WIRE_INSTRUCTIONS` (added by backend PR #245 / PLT-67, deployed 2026-04-28),
+`CORRESPONDENCE`, `OTHER`
 
 ### Filename → documentSubType classifier (ALWAYS apply before upload)
 
@@ -5090,13 +5106,15 @@ def classify(filename: str, entity_type: str) -> str:
         return 'BANK_STATEMENT'
     if re.search(r'brokerage.?statement|broker.?stmt', f): return 'BROKERAGE_STATEMENT'
     if re.search(r'cap.?acct|capital.?account.?summary', f):
-        # INVESTMENT_STATEMENT exists in Individual / LegalEntity enums only.
-        # AccountFinancial wants BROKERAGE_STATEMENT — do NOT return INVESTMENT_STATEMENT
-        # for that target or the upload returns HTTP 400. (Liu Family Wave 1 — 10 × 400.)
+        # AccountFinancial: BROKERAGE_STATEMENT is the preferred semantic for
+        # capital-account / brokerage statements. INVESTMENT_STATEMENT was added
+        # to AccountFinancial by backend PR #245 / PLT-67 (deployed 2026-04-28)
+        # and is also valid — reserve it for non-brokerage cases below.
         return 'BROKERAGE_STATEMENT' if entity_type == 'ACCOUNT_FINANCIAL' else 'INVESTMENT_STATEMENT'
-    # Generic "investment statement" filename → same divergence applies
+    # Generic "investment statement" filename → INVESTMENT_STATEMENT is now valid
+    # on every enum that this classifier targets (PR #245 / PLT-67, 2026-04-28).
     if re.search(r'investment.?statement|inv.?stmt', f):
-        return 'BROKERAGE_STATEMENT' if entity_type == 'ACCOUNT_FINANCIAL' else 'INVESTMENT_STATEMENT'
+        return 'INVESTMENT_STATEMENT'
     if re.search(r'trade.?confirm|confirmation', f) and 'account' not in f: return 'TRADE_CONFIRMATION'
     if re.search(r'account.?agreement|acct.?agreement', f): return 'ACCOUNT_AGREEMENT'
     if re.search(r'account.?application|acct.?app|new.?account', f): return 'ACCOUNT_APPLICATION'
@@ -5158,18 +5176,17 @@ def classify(filename: str, entity_type: str) -> str:
     if re.search(r'ppm|offering.?memorand', f): return 'PPM_ACKNOWLEDGMENT'
     if re.search(r'ips\b|investment.?policy', f): return 'INVESTMENT_POLICY_STATEMENT'
     if re.search(r'investor.?question', f): return 'INVESTOR_QUESTIONNAIRE'
-    # Correspondence — NOT in IndividualDocumentSubType or LegalEntityDocumentSubType enums.
-    # Per api.json (2026-04-22): only AccountFinancial / TangibleAsset / InsurancePolicy /
-    # Liability accept CORRESPONDENCE. For Individual / LegalEntity / Fund / Order / Account,
-    # fall back to OTHER — sending CORRESPONDENCE returns HTTP 400.
-    # This broke 24/62 uploads on the a recent run before being rewritten.
-    _CORR_ALLOWED = {'ACCOUNT_FINANCIAL', 'TANGIBLE_ASSET', 'INSURANCE_POLICY', 'LIABILITY'}
+    # Correspondence — backend PR #245 / PLT-67 (deployed 2026-04-28) added
+    # CORRESPONDENCE to IndividualDocumentSubType and LegalEntityDocumentSubType.
+    # It was already valid on AccountFinancial / TangibleAsset / InsurancePolicy /
+    # Liability. So CORRESPONDENCE is now valid on every document-bearing entity
+    # this classifier targets — no entity-type-specific fallback to OTHER required.
     if re.search(r'email|correspondence|letter\b|meeting.?notes', f):
-        return 'CORRESPONDENCE' if entity_type in _CORR_ALLOWED else 'OTHER'
+        return 'CORRESPONDENCE'
     # Receipt
     if re.search(r'receipt|invoice', f):
         if entity_type == 'TANGIBLE_ASSET': return 'RECEIPT'
-        return 'CORRESPONDENCE' if entity_type in _CORR_ALLOWED else 'OTHER'
+        return 'CORRESPONDENCE'
     # Unmatched → record + return OTHER
     return 'OTHER'
 ```
@@ -6796,26 +6813,50 @@ for a reference example (RM handoff format).
 
     ### Visibility-edge save-hook workaround (R-W2 amendment, Linear PLT-68 #5)
 
-    The backend save-hook `propagateParentHousehold` is supposed to fire whenever a
+    > **✅ Backend fix shipped 2026-04-28 — PR #244 (Linear PLT-68 bug #5 RESOLVED).**
+    > The `propagateParentHousehold` save-hook now fires on 0% OWNERSHIP edges and
+    > stamps `parentHouseholdId` on the LegalEntity row automatically — same as the
+    > 100% economic-ownership path. Verified by Sridhar on the post-deploy push:
+    > 5 / 5 visibility-edge POSTs propagated `parentHouseholdId` without the
+    > follow-up PATCH. **The PATCH workaround below is OBSOLETE — do NOT apply it
+    > on new pushes.** The historical-note subsection is retained in case a future
+    > regression resurfaces the symptom; if you observe `parentHouseholdId == null`
+    > on a LegalEntity after a successful HOUSEHOLD→LE OWNERSHIP 0% POST, escalate
+    > as a regression of PLT-68 #5 BEFORE re-applying the workaround.
+
+    **Summary of the resolved bug**: The backend save-hook
+    `propagateParentHousehold` is supposed to fire whenever a
     `HOUSEHOLD → LegalEntity OWNERSHIP` edge is created and stamp
     `parentHouseholdId` on the LegalEntity row. For 100% economic-ownership edges
-    this works. For 0% visibility edges (the irrevocable-trust-as-visible-only
-    pattern this rule mandates), the hook silently does NOT fire — filed as Linear
-    **PLT-68 bug #5**. The R-W2 rerun caught Barnes' `Seventh Farie Trust` and
-    `Barclay Real Estate Trust` with correct HH→LE OWNERSHIP 0% edges in
-    production but `parentHouseholdId=null` on the LegalEntity records themselves,
-    causing the LEs to drop out of `/by-household` rollups even though the
-    visibility edge was perfectly formed.
+    this always worked. For 0% visibility edges (the irrevocable-trust-as-visible-only
+    pattern this rule mandates), the hook silently did NOT fire prior to PR #244
+    — filed as Linear **PLT-68 bug #5**, fixed in PR #244 (2026-04-28). The R-W2
+    rerun originally caught Barnes' `Seventh Farie Trust` and `Barclay Real Estate
+    Trust` with correct HH→LE OWNERSHIP 0% edges in production but
+    `parentHouseholdId=null` on the LegalEntity records, dropping them from
+    `/by-household` rollups even though the visibility edge was perfectly formed.
 
-    Until the backend fix lands (track PLT-68 #5), the skill MUST work around it.
-    After every successful POST of a `HOUSEHOLD → LegalEntity OWNERSHIP 0%`
-    visibility edge:
+    **Current behavior (post-PR #244)**: After a successful POST of a
+    `HOUSEHOLD → LegalEntity OWNERSHIP 0%` visibility edge, the LegalEntity's
+    `parentHouseholdId` is populated automatically by the save-hook. No follow-up
+    PATCH or GET-back-and-verify is required for `parentHouseholdId` propagation.
+    Rule 75's other verify-after-PATCH guarantees are unaffected.
+
+    #### Historical note — pre-PR #244 workaround (OBSOLETE — kept only for regression triage)
+
+    > ⚠ **OBSOLETE — backend now propagates `parentHouseholdId` automatically as of
+    > PR #244 (2026-04-28).** The procedure below was mandatory between R-W2 (when
+    > the bug was first caught) and PR #244 (when it was fixed). Do NOT apply on
+    > new pushes. Retained verbatim in case PLT-68 #5 regresses on a future deploy.
+
+    Pre-PR #244 procedure: after every successful POST of a
+    `HOUSEHOLD → LegalEntity OWNERSHIP 0%` visibility edge:
 
     1. **GET the LegalEntity**: `GET /api/v1/legal-entity/{leId}`.
     2. **Check `parentHouseholdId`**: if null, **PATCH it**:
        `PATCH /api/v1/legal-entity/{leId}` with body `{"parentHouseholdId": "{hhId}"}`.
        (LegalEntity's `parentHouseholdId` is normally derived from a save-hook,
-       but with the hook missing for 0% edges, an explicit PATCH is the only
+       but with the hook missing for 0% edges, an explicit PATCH was the only
        path to populate the column.)
     3. **Apply Rule 75 verification** on the PATCH (assert 200, GET-back the LE,
        confirm `parentHouseholdId` now equals `{hhId}` — see the "PATCH 200 with
@@ -6823,37 +6864,34 @@ for a reference example (RM handoff format).
     4. **Log the workaround application** to
        `{household_folder}/altitude_review/phase6_visibility_edge_patches.jsonl`
        with `{ts, hh_id, le_id, le_name, edge_id, parent_household_id_before,
-       parent_household_id_after, rule_75_status}` so a post-run audit can
+       parent_household_id_after, rule_75_status}` so a post-run audit could
        enumerate every workaround invocation.
 
     ```python
-    # visibility_edge_workaround.py
-    # Apply IMMEDIATELY after every Rule 60 HOUSEHOLD→LE OWNERSHIP 0% POST.
-    # Tracks Linear PLT-68 bug #5 — remove this block once that ticket lands.
-    le_before = api.get(f"/api/v1/legal-entity/{le_id}")
-    if not le_before.get("parentHouseholdId"):
-        api.patch(f"/api/v1/legal-entity/{le_id}", json={"parentHouseholdId": hh_id})
-        le_after = api.get(f"/api/v1/legal-entity/{le_id}")
-        assert le_after.get("parentHouseholdId") == hh_id, (
-            f"PATCH parentHouseholdId silently no-opped on LE {le_id} — escalate"
-        )
-        with open(f"{household_folder}/altitude_review/phase6_visibility_edge_patches.jsonl", "a") as f:
-            f.write(json.dumps({
-                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-                "hh_id": hh_id, "le_id": le_id, "le_name": le_after.get("legalName"),
-                "edge_id": rel_id,
-                "parent_household_id_before": le_before.get("parentHouseholdId"),
-                "parent_household_id_after": le_after.get("parentHouseholdId"),
-                "rule_75_status": "PASS",
-            }) + "\n")
+    # visibility_edge_workaround.py — OBSOLETE post-PR #244 (2026-04-28).
+    # Retained for regression triage only; do NOT invoke on current pushes.
+    # le_before = api.get(f"/api/v1/legal-entity/{le_id}")
+    # if not le_before.get("parentHouseholdId"):
+    #     api.patch(f"/api/v1/legal-entity/{le_id}", json={"parentHouseholdId": hh_id})
+    #     le_after = api.get(f"/api/v1/legal-entity/{le_id}")
+    #     assert le_after.get("parentHouseholdId") == hh_id, (
+    #         f"PATCH parentHouseholdId silently no-opped on LE {le_id} — escalate"
+    #     )
+    #     with open(f"{household_folder}/altitude_review/phase6_visibility_edge_patches.jsonl", "a") as f:
+    #         f.write(json.dumps({
+    #             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    #             "hh_id": hh_id, "le_id": le_id, "le_name": le_after.get("legalName"),
+    #             "edge_id": rel_id,
+    #             "parent_household_id_before": le_before.get("parentHouseholdId"),
+    #             "parent_household_id_after": le_after.get("parentHouseholdId"),
+    #             "rule_75_status": "PASS",
+    #         }) + "\n")
     ```
 
-    Cross-reference: this workaround can be removed when **Linear PLT-68 #5**
-    lands (backend `propagateParentHousehold` save-hook fixed to fire on 0%
-    OWNERSHIP edges). Until then, the workaround is mandatory — without it, the
-    visibility edge persists but the LE is invisible to `/by-household` rollups
-    and the Altitude UI's per-household trust list, which exactly defeats the
-    purpose of creating the visibility edge in the first place.
+    Cross-reference: PLT-68 #5 was resolved by **PR #244** (2026-04-28). If a
+    regression resurfaces the symptom (visibility edge POSTs leaving
+    `parentHouseholdId == null` on the LegalEntity), file a follow-up Linear ticket
+    citing PLT-68 #5 BEFORE re-applying the commented procedure above.
 
     **2. `parentHouseholdId` on Individual is NOT directly PATCHable.**
     PATCH `/api/v1/individual/{id}` with `{"parentHouseholdId": "..."}` returns 200 OK

@@ -500,7 +500,7 @@ Binary file content.
 
 **Parts:**
 - `createRequest` (application/json): `InsurancePolicyDocumentCreateRequestDto`
-  - `documentSubType`: `DocumentTypeInsurancePolicy` enum value (e.g., POLICY_DECLARATION, CLAIM_FORM)
+  - `documentSubType`: `DocumentTypeInsurancePolicy` enum value (e.g., POLICY_DECLARATION, CLAIM_FORM, WIRE_INSTRUCTIONS — `WIRE_INSTRUCTIONS` added by backend PR #245 / PLT-67, deployed 2026-04-28)
   - `title`, `description`, `tags` (inherited from base)
 - `file`: The document file
 
@@ -516,7 +516,7 @@ Binary file content.
 
 **Parts:**
 - `createRequest` (application/json): `LiabilityDocumentCreateRequestDto`
-  - `documentSubType`: `DocumentTypeLiability` enum value (e.g., LOAN_AGREEMENT, FORM_1098)
+  - `documentSubType`: `DocumentTypeLiability` enum value (e.g., LOAN_AGREEMENT, FORM_1098, WIRE_INSTRUCTIONS — `WIRE_INSTRUCTIONS` added by backend PR #245 / PLT-67, deployed 2026-04-28)
   - `title`, `description`, `tags` (inherited from base)
 - `file`: The document file
 
@@ -559,6 +559,7 @@ All document create request DTOs share these optional fields:
 - **Residence & Property:** `UTILITY_BILL`, `LEASE_AGREEMENT`, `PROPERTY_DEED`, `MORTGAGE_STATEMENT`
 - **Legal:** `POWER_OF_ATTORNEY`, `NAME_CHANGE_DOCUMENT`, `MARRIAGE_CERTIFICATE`, `DIVORCE_DECREE`, `COURT_ORDER`
 - **Investment:** `SUBSCRIPTION_AGREEMENT`, `INVESTMENT_POLICY_STATEMENT`, `INVESTMENT_QUESTIONNAIRE`, `INVESTOR_ACCREDITATION`
+- **General:** `CORRESPONDENCE` (added by backend PR #245 / PLT-67, deployed 2026-04-28)
 - **Default:** `OTHER`
 
 ### 5.3 LegalEntityDocumentCreateRequestDto
@@ -579,6 +580,7 @@ All document create request DTOs share these optional fields:
 - **Financial Statements:** `AUDITED_FINANCIALS`, `BALANCE_SHEET`, `INCOME_STATEMENT`, `CASH_FLOW_STATEMENT`, `BANK_STATEMENT`, `INVESTMENT_STATEMENT`, `BUSINESS_CREDIT_REPORT`
 - **Legal & Authority:** `POWER_OF_ATTORNEY`, `AUTHORIZED_SIGNER_DOCUMENTATION`, `LEGAL_OPINION`, `INCUMBENCY_CERTIFICATE`, `CORPORATE_SEAL`
 - **Investment:** `SUBSCRIPTION_AGREEMENT`, `INVESTMENT_POLICY_STATEMENT`, `INVESTOR_QUESTIONNAIRE`, `PPM_ACKNOWLEDGMENT`
+- **General:** `WIRE_INSTRUCTIONS`, `CORRESPONDENCE` (added by backend PR #245 / PLT-67, deployed 2026-04-28 — common case: trust-LE wire-instruction memos like "DPG 2022 Irrev. IG Trust Wire & DTC Instructions.docx")
 - **Default:** `OTHER`
 
 ### 5.4 TangibleAssetDocumentCreateRequestDto
@@ -615,9 +617,9 @@ All document create request DTOs share these optional fields:
 - **Compliance & ID:** `AML_DOCUMENTATION`, `KYC_DOCUMENTATION`, `FATCA_CRS_FORM`, `PASSPORT`, `DRIVERS_LICENSE`, `SOCIAL_SECURITY_CARD`, `TAX_IDENTIFICATION`
 - **Authority/Trust/Entity:** `POWER_OF_ATTORNEY`, `AUTHORIZED_SIGNER`, `CORPORATE_RESOLUTION`, `TRUST_AGREEMENT`, `TRUST_CERTIFICATION`, `OPERATING_AGREEMENT`, `PARTNERSHIP_AGREEMENT`, `EIN_CONFIRMATION`, `BUSINESS_LICENSE`, `CERTIFICATE_OF_GOOD_STANDING`
 - **Estate:** `PROBATE_DOCUMENT`, `DEATH_CERTIFICATE`, `EXECUTOR_APPOINTMENT`
-- **General:** `FINANCIAL_STATEMENT`, `INVESTMENT_POLICY_STATEMENT`, `CORRESPONDENCE`, `NOTIFICATION`, `OTHER`
+- **General:** `FINANCIAL_STATEMENT`, `INVESTMENT_POLICY_STATEMENT`, `INVESTMENT_STATEMENT`, `CORRESPONDENCE`, `NOTIFICATION`, `OTHER`
 
-> **GOTCHA:** `INVESTMENT_STATEMENT` is **NOT** a valid value for `DocumentTypeAccountFinancial`. It is only valid for `DocumentTypeIndividual` (see 5.2) and `DocumentTypeLegalEntity` (see 5.3). For brokerage/investment account statements anchored to an `AccountFinancial`, use `BROKERAGE_STATEMENT`. Submitting `INVESTMENT_STATEMENT` against an AccountFinancial document upload returns HTTP 400.
+> **Note:** `INVESTMENT_STATEMENT` is now valid for `DocumentTypeAccountFinancial` as of backend PR #245 / PLT-67 (deployed 2026-04-28). Use it for non-brokerage statements (529s, IRAs, trust-custodied accounts) where `BROKERAGE_STATEMENT` doesn't fit semantically. For traditional brokerage / investment-account statements (Schwab, Fidelity, Morgan Stanley, etc.), `BROKERAGE_STATEMENT` is still preferred. (Prior to PR #245 this enum was Individual / LegalEntity-only and returned HTTP 400 against AccountFinancial — that constraint no longer applies.)
 
 ---
 
