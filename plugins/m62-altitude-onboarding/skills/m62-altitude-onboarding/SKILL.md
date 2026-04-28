@@ -1279,16 +1279,86 @@ staleness" warning to surface in the Phase 5 review.
 ### Step 1.5: Lookup-by-prior-UUID pass (only on rerun) — Rule 69
 
 If `run_state.json` exists from a prior run, before proceeding to Phase 2, GET
-every UUID in `run_state.entities.*` with `?scope=ALL_TENANTS` and classify each as:
-**(a)** found AND in current universe (expected); **(b)** found AND NOT in current
-universe (orphan since prior run — needs Phase 6 OWNERSHIP wiring); **(c)**
-soft-deleted (record in `run_state.softDeletedAwaitingHardDelete[]` per Rule 66);
-**(d)** 404 even with scope (hard-deleted — remove from run_state).
+every UUID in `run_state.entities.*` with `?scope=ALL_TENANTS` and classify each
+into one of four buckets that map directly to the `classification` field of
+`stale_prior_uuids.json` (see deliverable below):
+
+| # | Bucket | Lookup result | `classification` value | Recovery action |
+|---|--------|--------------|------------------------|-----------------|
+| (a) | **live_in_universe** | found AND in current universe | `live` (NOT stale — do not write to file) | none — expected steady state |
+| (b) | **orphan_since_prior_run** | found AND NOT in current universe | `orphan` (NOT stale in the deletion sense — write under a separate `orphans[]` key for Phase 6 OWNERSHIP wiring) | re-wire via Phase 6 OWNERSHIP edges |
+| (c) | **soft_deleted** | returns row with `deleted: true` only when `?includeDeleted=true&scope=ALL_TENANTS` | `soft_deleted` | record in `run_state.softDeletedAwaitingHardDelete[]` per Rule 66; fleet aggregator schedules admin hard-delete |
+| (d) | **hard_deleted** | 404 even with `?scope=ALL_TENANTS&includeDeleted=true` | `hard_deleted` | remove the UUID from `run_state.entities.*` so the next run does not retry the lookup |
+
+If the lookup result is ambiguous (e.g. transient 5xx, network timeout, scope
+mismatch the skill cannot disambiguate), classify as `unknown` and surface in the
+Phase 5 review for the user — do not silently treat as hard-deleted.
 
 This catches prior-run-created entities invisible to the standard graph traversal.
-See Rule 69 for the full classification table and recovery procedure.
 
-### Step 1.5: Build the Altitude Universe index
+#### Deliverable — `stale_prior_uuids.json`
+
+The skill MUST write `{household_folder}/altitude_review/stale_prior_uuids.json`
+at the end of Step 1.5 — even on a fresh run with zero prior UUIDs and even when
+zero stale UUIDs are found. The fleet aggregator that runs after the family runs
+relies on the file's presence to confirm Step 1.5 executed; an absent file is
+treated as "Step 1.5 was skipped" and triggers a rerun. Same convention as
+`cross_contamination_findings.json` (Rule 71) and `backend_enum_gaps.json`
+(Rule 72).
+
+Schema (one entry per stale — buckets (c) and (d) — UUID; bucket (a) is omitted;
+bucket (b) orphans live under `orphans[]`):
+
+```json
+{
+  "household": "<name>",
+  "household_id": "<uuid>",
+  "stale_uuids": [
+    {
+      "uuid": "5ef14ddc-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "prior_label": "feedTheFuture",
+      "prior_run": "2026-04-15-run-12",
+      "lookup_status": "404_with_scope_ALL_TENANTS",
+      "classification": "hard_deleted",
+      "fleet_aggregator_action": "remove_from_run_state"
+    }
+  ],
+  "orphans": [
+    {
+      "uuid": "<uuid>",
+      "prior_label": "<label from run_state>",
+      "prior_run": "<date or run-id>",
+      "lookup_status": "200_found_outside_universe",
+      "classification": "orphan",
+      "fleet_aggregator_action": "schedule_phase6_ownership_wire"
+    }
+  ]
+}
+```
+
+Empty-result form (still required):
+
+```json
+{"household": "<name>", "household_id": "<uuid>", "stale_uuids": [], "orphans": []}
+```
+
+`prior_label` is the key under `run_state.entities.*` that pointed to the UUID
+(e.g. `legalEntities.feedTheFuture`). `prior_run` is the prior `run_state.runId`
+or the prior `run_state.completedAt` date — whichever the prior file recorded.
+
+#### Rule 69 — Lookup prior-run UUIDs and emit `stale_prior_uuids.json`
+
+On every rerun, before Phase 2, the skill MUST resolve every UUID in the prior
+`run_state.entities.*` against `?scope=ALL_TENANTS` (with `includeDeleted=true`
+for the soft-delete probe), classify each as `live` / `orphan` / `soft_deleted` /
+`hard_deleted` / `unknown`, and write the stale and orphan UUIDs to
+`altitude_review/stale_prior_uuids.json`. The file is mandatory — empty schema
+must still be written when zero stale or orphan UUIDs are found, so the fleet
+aggregator can reliably read it. Soft-deleted UUIDs are also added to
+`run_state.softDeletedAwaitingHardDelete[]` per Rule 66; hard-deleted UUIDs are
+removed from `run_state.entities.*` before Phase 2 begins.
+
+### Step 1.5b: Build the Altitude Universe index
 
 Create an in-memory index for matching:
 
@@ -2753,6 +2823,90 @@ old one first so the new POST doesn't hit 409 Conflict.
 additional co-trustee rather than a replacement), leave the old relationship intact and
 flag in Open Questions. Never silently retire a relationship on ambiguous signals.
 
+### Step 4.7b: Upgrading relationship edges (Rule 73)
+
+**Use PATCH on the existing edge — NEVER POST a second edge between the same source
+and target with a different `relationshipType`.** Altitude's relationship store enforces
+a uniqueness constraint on `(sourceEntityId, targetEntityId)` (across types, not just
+within a single type). POSTing a new OWNERSHIP edge when a MEMBER edge already exists
+between the same pair returns **HTTP 409 Data Integrity** — observed during the Tusk
+Family Wave 1 rerun on MEMBER → OWNERSHIP upgrades.
+
+The fix is to mutate the edge in place: locate the existing edge, then PATCH its
+`relationshipType` (and any added fields like `percentage`) via JSON Merge Patch.
+This preserves the edge's UUID and audit history (`createdAt`, original creator,
+prior `relationshipType`) — POST-and-DELETE breaks that lineage and is the wrong
+shape for a "this MEMBER is now an OWNER" event, which is a type upgrade, not a
+new relationship.
+
+**Recipe:**
+
+```bash
+# 1. Locate the existing edge (preferred form: traverse from source, filter by target)
+SRC_TYPE="INDIVIDUAL"; SRC_ID="<src uuid>"; TGT_ID="<tgt uuid>"
+EXISTING=$(curl -s -H "X-API-Key: $KEY" \
+  "$API/api/v1/entity-relationship/from/${SRC_TYPE}/${SRC_ID}" \
+  | jq --arg t "$TGT_ID" '.[] | select(.targetEntityId == $t and .effectiveTo == null)')
+REL_ID=$(echo "$EXISTING" | jq -r '.id')
+OLD_TYPE=$(echo "$EXISTING" | jq -r '.relationshipType')
+echo "Upgrading edge ${REL_ID}: ${OLD_TYPE} -> OWNERSHIP"
+
+# 2. PATCH the edge — body uses JSON Merge Patch semantics (null fields ignored)
+curl -X PATCH "$API/api/v1/entity-relationship/${REL_ID}" \
+  -H "Content-Type: application/merge-patch+json" -H "X-API-Key: $KEY" \
+  -d '{
+    "relationshipType": "OWNERSHIP",
+    "percentage": 50,
+    "notes": "Upgraded from '"${OLD_TYPE}"' per <source document>"
+  }'
+```
+
+> The `/from/{sourceType}/{sourceId}` form is the documented traversal endpoint
+> (api.json line ~97483). The base list endpoint
+> `GET /api/v1/entity-relationship?sourceEntityId=...&targetEntityId=...` accepts
+> dynamic field filters per its OpenAPI description and works for the same lookup
+> when the source-type is unknown — prefer the typed `/from/...` form when you
+> already know the source type, falling back to dynamic filters only when you do
+> not.
+
+**Common cases this applies to:**
+
+- **MEMBER → OWNERSHIP** — LLC member receives a percentage allocation in a later
+  amendment; the previously-typeless membership edge becomes a typed ownership stake.
+  (Tusk Family case.)
+- **TRUSTEE → GRANTOR** — on the death of the original grantor, a co-trustee becomes
+  the new grantor of a successor trust; the existing TRUSTEE edge is upgraded rather
+  than duplicated.
+- **BENEFICIARY → OWNERSHIP** — a remainder beneficiary becomes outright owner upon
+  trust termination or distribution; the BENEFICIARY edge is upgraded to OWNERSHIP
+  with the distributed percentage.
+
+**When NOT to use PATCH-upgrade:**
+
+- The old edge represents an event that genuinely ended (e.g. trustee resigned
+  before the grantor died) — that is the role-replacement case from Step 4.7,
+  use retire-and-create (mark `effectiveTo`, then POST the new edge).
+- The new relationship has a different source or target (e.g. ownership moves to
+  a different person) — that is a transfer, use `POST /api/v1/entity-relationship/transfer`.
+
+#### Rule 73 — Upgrade existing relationship edges via PATCH, not POST + DELETE
+
+When a relationship between an existing source/target pair changes
+`relationshipType` (e.g. MEMBER becomes OWNERSHIP, TRUSTEE becomes GRANTOR), the
+skill MUST PATCH the existing edge's `relationshipType` (and any new fields like
+`percentage`) rather than POST a new edge of the new type. POSTing a second edge
+between the same `(sourceEntityId, targetEntityId)` pair — regardless of type —
+returns HTTP 409 Data Integrity. PATCH preserves the edge UUID and audit history
+(created date, original creator, original relationship metadata); a POST + DELETE
+sequence breaks that lineage and is the wrong semantics for a type upgrade.
+Locate the existing edge via
+`GET /api/v1/entity-relationship/from/{sourceType}/{sourceId}` filtered by
+`targetEntityId` (or via dynamic filters on the base list endpoint), then PATCH
+with `Content-Type: application/merge-patch+json`. This rule is distinct from
+Rule 41 (role replacement, where the role-holder changes — old edge is retired
+via `effectiveTo`, new edge is POSTed for the new holder). Use PATCH-upgrade
+ONLY when the source AND target are unchanged and only the type/percentage shifts.
+
 ### Step 4.8: Addepar (or any externally-synced) Account Handling — READ-ONLY
 
 Accounts with an active external sync (Addepar, Orion, Black Diamond, custodian direct feed)
@@ -4102,6 +4256,7 @@ recent production run (7 documents required post-push PATCHes):
 | `TAX_RETURN_1040` | 400 | `FORM_1040` |
 | `ACCOUNT_STATEMENT` on `/individual/` | 400 (not in IndividualDocumentSubType) | `BANK_STATEMENT` / `INVESTMENT_STATEMENT` — OR route the upload to `/account-financial/{id}/document` instead |
 | `ACCOUNT_STATEMENT` on `/account-financial/` | 400 (not in AccountFinancialDocumentSubType) | `BROKERAGE_STATEMENT` / `CUSTODIAL_STATEMENT` / `BANK_STATEMENT` — pick by custodian type |
+| `INVESTMENT_STATEMENT` on `/account-financial/` | 400 (not in AccountFinancialDocumentSubType) | `BROKERAGE_STATEMENT` (for brokerage / investment account statements) or `CUSTODIAL_STATEMENT` (for trust-custodied accounts). `INVESTMENT_STATEMENT` is **Individual / LegalEntity-only** — do NOT use it for AccountFinancial uploads. Liu Family Wave 1 hit 10 × HTTP 400 on Schwab statements before remapping. |
 | `CORRESPONDENCE` on `/individual/` or `/legal-entity/` | 400 (legitimately not in enum) | Fall back to `OTHER` |
 | `ENGAGEMENT_LETTER` (anywhere) | 400 (no such enum exists) | `OTHER` |
 | Trust agreements left as `OTHER` | silent (accepted) | `TRUST_AGREEMENT` / `TRUST_AMENDMENTS` / `REVOCABLE_TRUST_DOCUMENT` — always classify trust docs |
@@ -4111,6 +4266,16 @@ the recent run, ~70% of `OTHER` usage was for document types that DID have a
 specific enum, but under a different name. Always pick the most specific valid
 value from the target entity's enum; only use `OTHER` after confirming no
 option fits.
+
+> ⚠ **Per-entity-type `documentSubType` enums diverge** — verify against the
+> api.json schema for the specific entity before assigning. Generic-sounding
+> enum names like `INVESTMENT_STATEMENT`, `ACCOUNT_STATEMENT`, `CORRESPONDENCE`,
+> and `GOVERNMENT_ID` are NOT universally valid across all entity types. Each
+> entity's `*DocumentCreateRequestDto.documentSubType` enum is independent;
+> a value valid on Individual may 400 on AccountFinancial and vice-versa.
+> See the per-entity enum lists below — and the classifier in this section
+> remaps where needed (e.g. `INVESTMENT_STATEMENT` → `BROKERAGE_STATEMENT`
+> when the target is `ACCOUNT_FINANCIAL`).
 
 ### documentSubType — intelligent selection (NEVER default to OTHER)
 
@@ -4199,6 +4364,14 @@ Retirement: `IRA_ADOPTION_AGREEMENT`, `PLAN_DOCUMENT_401K`, `RMD_NOTICE`, `ROLLO
 
 Authorizations + identity (same as Individual) — use CUSTODIAL_STATEMENT / BROKERAGE_STATEMENT /
 BANK_STATEMENT / TRADE_CONFIRMATION before OTHER.
+
+> ⚠ `INVESTMENT_STATEMENT` is **NOT** in `AccountFinancialDocumentSubType`. It only
+> exists in the Individual and LegalEntity enums. For AccountFinancial-anchored
+> brokerage / investment-account statements (Schwab, Fidelity, Morgan Stanley, etc.)
+> use `BROKERAGE_STATEMENT`. For trust-custodied accounts use `CUSTODIAL_STATEMENT`.
+> Bank checking/savings on an AccountFinancial use `BANK_STATEMENT`. Liu Family Wave 1
+> rerun hit HTTP 400 on 10 Schwab statement uploads before this divergence was
+> remapped — formalizing the rule here so subsequent fleet runs do not repeat it.
 
 #### TangibleAssetDocumentCreateRequestDto.documentSubType (96 values)
 
@@ -4324,7 +4497,14 @@ def classify(filename: str, entity_type: str) -> str:
     if re.search(r'\bstatement\b', f) and ('bank' in f or 'chequing' in f or 'checking' in f or 'savings' in f):
         return 'BANK_STATEMENT'
     if re.search(r'brokerage.?statement|broker.?stmt', f): return 'BROKERAGE_STATEMENT'
-    if re.search(r'cap.?acct|capital.?account.?summary', f): return 'INVESTMENT_STATEMENT'
+    if re.search(r'cap.?acct|capital.?account.?summary', f):
+        # INVESTMENT_STATEMENT exists in Individual / LegalEntity enums only.
+        # AccountFinancial wants BROKERAGE_STATEMENT — do NOT return INVESTMENT_STATEMENT
+        # for that target or the upload returns HTTP 400. (Liu Family Wave 1 — 10 × 400.)
+        return 'BROKERAGE_STATEMENT' if entity_type == 'ACCOUNT_FINANCIAL' else 'INVESTMENT_STATEMENT'
+    # Generic "investment statement" filename → same divergence applies
+    if re.search(r'investment.?statement|inv.?stmt', f):
+        return 'BROKERAGE_STATEMENT' if entity_type == 'ACCOUNT_FINANCIAL' else 'INVESTMENT_STATEMENT'
     if re.search(r'trade.?confirm|confirmation', f) and 'account' not in f: return 'TRADE_CONFIRMATION'
     if re.search(r'account.?agreement|acct.?agreement', f): return 'ACCOUNT_AGREEMENT'
     if re.search(r'account.?application|acct.?app|new.?account', f): return 'ACCOUNT_APPLICATION'
@@ -4673,6 +4853,7 @@ object itself is empty or truncated.
 # Inputs: DOC_ID (returned id from upload), SOURCE_PATH (file on disk that was uploaded),
 #         EXPECTED_CONTENT_TYPE (the contentType enum value used in the upload — PDF, JPG, etc.)
 SOURCE_BYTES=$(wc -c < "${SOURCE_PATH}" | tr -d ' ')
+SRC_SHA=$(shasum -a 256 "${SOURCE_PATH}" | awk '{print $1}')
 VERIFY_OUT=/tmp/verify_${DOC_ID}.bin
 HEADERS_OUT=/tmp/verify_${DOC_ID}.headers
 
@@ -4682,14 +4863,21 @@ curl -s -o "${VERIFY_OUT}" \
   -H "X-API-Key: ${API_KEY}" -H "X-Firm-Id: ${FIRM_ID}" \
   "${BASE}/api/v1/document/${DOC_ID}/content"
 
-# Compare body byte count to source
+# Compare body byte count AND content hash to source
 DOWNLOAD_BYTES=$(wc -c < "${VERIFY_OUT}" | tr -d ' ')
+DL_SHA=$(shasum -a 256 "${VERIFY_OUT}" | awk '{print $1}')
 echo "source=${SOURCE_BYTES} downloaded=${DOWNLOAD_BYTES}"
+echo "src_sha=${SRC_SHA} dl_sha=${DL_SHA}"
+[[ "${SRC_SHA}" == "${DL_SHA}" ]] || { echo "SHA mismatch — content corruption"; }
 ```
 
 Use `%{size_download}` and `%{http_code}` (curl's write-out variables) so the script
 captures byte count and status without dumping bytes to the console; `-D` writes the
 response headers to a file for the `Content-Type` and `Content-Length` parse.
+SHA256 is computed on the on-disk source and on the downloaded body and compared —
+this catches a class of bug that byte-count + content-type cannot: a response with
+the correct size and MIME but the wrong bytes (e.g. backend serves a different
+document due to S3 key collision, race condition during write, or a content swap).
 
 #### PASS criteria (ALL must hold)
 
@@ -4703,6 +4891,9 @@ response headers to a file for the `Content-Type` and `Content-Length` parse.
   matches the `contentType` enum value used in the upload (e.g. uploaded as `PDF` →
   response `Content-Type` is `application/pdf`; uploaded as `JPG` → `image/jpeg`;
   uploaded as `TXT` → `text/plain` or `text/plain; charset=...`).
+- SHA256 of the GET response body equals SHA256 of the source file on disk
+  (`SRC_SHA == DL_SHA`). This is mandatory — size + content-type alone do not
+  guarantee the bytes are the file the skill intended to upload.
 
 #### FAIL criteria (ANY triggers FAIL)
 
@@ -4711,6 +4902,8 @@ response headers to a file for the `Content-Type` and `Content-Length` parse.
 - `SIZE_DOWNLOAD` < 50% of `SOURCE_BYTES` (likely truncated S3 object)
 - `SIZE_DOWNLOAD` differs from `SOURCE_BYTES` by more than the tolerance above
 - response `Content-Type` does not correspond to the upload's `contentType` enum
+- `SRC_SHA != DL_SHA` (content-corruption case — bytes returned are NOT the bytes
+  uploaded, even when size and Content-Type happen to match)
 
 #### On FAIL — log, do not retry
 
@@ -4719,7 +4912,7 @@ Append a structured entry to
 object per line):
 
 ```json
-{"document_id": "<uuid>", "source_path": "<path>", "uploaded_content_type": "PDF", "expected_bytes": 184320, "downloaded_bytes": 0, "http_code": 200, "response_content_type": "application/json", "failure_reason": "metadata_shell_zero_bytes", "occurred_at": "YYYY-MM-DDTHH:MM:SSZ"}
+{"document_id": "<uuid>", "source_path": "<path>", "uploaded_content_type": "PDF", "expected_bytes": 184320, "downloaded_bytes": 0, "src_sha256": "<hex>", "downloaded_sha256": "<hex>", "http_code": 200, "response_content_type": "application/json", "failure_reason": "metadata_shell_zero_bytes | size_mismatch | content_type_mismatch | sha256_mismatch", "occurred_at": "YYYY-MM-DDTHH:MM:SSZ"}
 ```
 
 Mark the document `verification_status: NOT_VERIFIED` in `run_state.documents[]`.
@@ -4743,10 +4936,15 @@ sum of the source files (which already crossed the wire on upload).
 
 After every successful document upload (HTTP 200/201 with a new `id`), the skill
 MUST `GET /api/v1/document/{id}/content` and confirm that the returned body is
-non-empty, byte-exact (or within ±256 bytes if and only if a future api.json
-documents server-side wrapping), and has a response `Content-Type` consistent with
-the upload's `contentType` enum. Failures are logged to
-`phase7_verification_failures.jsonl`, the document is marked `NOT_VERIFIED` in
+(a) non-empty, (b) byte-exact (or within ±256 bytes if and only if a future
+api.json documents server-side wrapping), (c) has a response `Content-Type`
+consistent with the upload's `contentType` enum, AND (d) has a SHA256 hash equal
+to SHA256 of the source file on disk. The SHA256 check is a 2026-04-28
+augmentation — observed during Lamond Family Wave 1 verification — and catches
+content-corruption cases (S3 key collision, write-race, content swap) where size
+and MIME are correct but the bytes returned are from a different document.
+Failures are logged to `phase7_verification_failures.jsonl` with both source and
+downloaded SHA256, the document is marked `NOT_VERIFIED` in
 `run_state.documents[]`, and the failure is surfaced in the user-facing review.
 The skill MUST NOT auto-re-upload on FAIL — duplicate-document risk outweighs the
 benefit. A run with zero documents uploaded still ends Phase 7 with a (possibly
