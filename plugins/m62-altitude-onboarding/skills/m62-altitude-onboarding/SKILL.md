@@ -4422,6 +4422,73 @@ for that entity type, fall back to a direct field check on the GET-by-id respons
 (`individualId != null OR legalEntityId != null OR householdId != null`). Only flag
 `fk_path_orphan` when the row demonstrably has all three FK columns null.
 
+#### FK-path remediation — PATCH-field semantics asymmetry (R-W3 amendment, Linear PLT-68 #7)
+
+McIntosh R-W3 confirmed Rule 75's FK-path verification was correct in concept,
+but the **remediation** previously implied here ("retry the create with the FK
+fields explicitly set — `individualId` / `legalEntityId` / `householdId`
+populated alongside the OWNERSHIP edge") is **wrong on TangibleAsset and
+InsurancePolicy**. PATCHing those FK fields directly returns 200 OK and
+silently drops the field — filed as **Linear PLT-68 bug #7**. The same field
+name (`parentHouseholdId`) has different semantics across entity types:
+
+| Entity type | `individualId` / `legalEntityId` / `householdId` via PATCH | `parentHouseholdId` via PATCH | Correct remediation |
+|---|---|---|---|
+| **TangibleAsset** | **READ-ONLY (silent drop, 200 returned)** | Settable (works) | `PATCH /tangible-asset/{id} {"parentHouseholdId": "{hh}"}` |
+| **InsurancePolicy** | **READ-ONLY (silent drop, 200 returned)** | Settable (works) | `PATCH /insurance-policy/{id} {"parentHouseholdId": "{hh}"}` |
+| **AccountFinancial** | **READ-ONLY (silent drop, 200 returned)** | Settable (works) | `PATCH /account-financial/{id} {"parentHouseholdId": "{hh}"}` |
+| **Liability** | **READ-ONLY (silent drop, 200 returned)** | Settable (works) | `PATCH /liability/{id} {"parentHouseholdId": "{hh}"}` |
+| **LegalEntity** | n/a | **DERIVED from OWNERSHIP graph (PATCH silently no-ops)** | POST a HOUSEHOLD→LE OWNERSHIP edge — propagateParentHousehold save-hook stamps the column. For irrevocable trusts use 0% per Rule 60; for revocable trusts use 100% per grantor per Rule 60 grantor amendment (PR #15) |
+| **Individual** | n/a | **DERIVED from OWNERSHIP graph (PATCH silently no-ops)** | POST a HOUSEHOLD→INDIVIDUAL OWNERSHIP edge per Rule 60 |
+
+So when `fk_path_orphan` triggers on a TA / Insurance / Liability / AccountFinancial:
+
+1. **Do NOT** retry the create with `individualId` / `legalEntityId` /
+   `householdId` populated — those fields are silently dropped by PATCH on
+   these types, and PR #15 testing confirms the same is true on POST when
+   only those fields are sent without an OWNERSHIP edge.
+2. **Do** issue `PATCH /api/v1/{entity-type}/{id} {"parentHouseholdId":
+   "{hhId}"}` and apply Rule 75 verification to the PATCH (assert 200,
+   GET-back, confirm `parentHouseholdId` now equals `{hhId}`). The PATCH
+   200 + silent no-op caveat applies — re-fetch is mandatory.
+3. **Do** POST the appropriate OWNERSHIP edge alongside the PATCH so the
+   row is reachable through the canonical graph traversal, not just via
+   `parentHouseholdId` direct-column lookup.
+
+For LegalEntity FK_ORPHAN, the remediation is purely the OWNERSHIP edge POST
+— the visibility-edge save-hook workaround in Rule 60 (Linear PLT-68 #5)
+handles the 0% case where the save-hook does not fire on its own.
+
+Cross-reference: **Linear PLT-68 #7** tracks the FK-field PATCH silent-drop
+bug. Once that lands, the FK-fields-via-PATCH path becomes valid and this
+remediation table can be simplified — but until then, route every FK_ORPHAN
+remediation through `parentHouseholdId` (for FK-bearing types) or through
+an OWNERSHIP edge POST (for derived-FK types like LegalEntity / Individual).
+
+#### Verification endpoint reference (R-W3 amendment)
+
+The FK-path queryability check above relies on `/by-{owner}` endpoints whose
+availability varies by entity type. McIntosh R-W3 hit a 404 chasing
+`/tangible-asset/by-household/{hhId}` — that endpoint does NOT exist; the
+correct path is `/tangible-asset/by-owner/HOUSEHOLD/{hhId}` (which uses the
+`/by-owner/{TYPE}/{id}` pattern instead of `/by-household/{id}`). The skill
+must use the verified endpoint set below; deviating produces phantom
+fk_path_orphan flags driven by 404s on nonexistent routes:
+
+| Entity type | Available verification endpoints | Notes |
+|---|---|---|
+| TangibleAsset | `/tangible-asset/by-individual/{id}`, `/tangible-asset/by-legal-entity/{id}`, `/tangible-asset/by-owner/HOUSEHOLD/{hhId}` | **`/tangible-asset/by-household/{hhId}` does NOT exist** — use `/by-owner/HOUSEHOLD/...` for the household-FK check |
+| InsurancePolicy | `/insurance-policy/by-individual/{id}`, `/insurance-policy/by-legal-entity/{id}`, `/insurance-policy/by-household/{hhId}` | All three present |
+| AccountFinancial | `/account-financial/by-individual/{id}`, `/account-financial/by-legal-entity/{id}`, `/account-financial/by-household/{hhId}` | All three present |
+| Liability | `/liability/by-individual/{id}`, `/liability/by-legal-entity/{id}`, `/liability/by-household/{hhId}` | All three present |
+| LegalEntity | `/legal-entity/by-household/{hhId}` (paginated) | Listed by household via `parentHouseholdId` |
+| Individual | `/individual/by-household/{hhId}` | Listed by household via `parentHouseholdId` |
+
+When the household-scoped check is needed for TangibleAsset, the harness
+MUST use `/tangible-asset/by-owner/HOUSEHOLD/{hhId}` — the `verified_create`
+helper's `fk_check.path` for TA-by-household is therefore
+`"/api/v1/tangible-asset/by-owner/HOUSEHOLD"` (not `"/api/v1/tangible-asset/by-household"`).
+
 #### FAIL handling — log, do NOT auto-retry
 
 On any verification failure, append a structured entry to
@@ -6835,6 +6902,72 @@ for a reference example (RM handoff format).
     But first apply Rule 74 disambiguation — many 409s on relationship POST are
     live duplicates not phantoms.
 
+    ### INACTIVE Individual gotcha — `parentHouseholdId` becomes immutable (R-W3 amendment, Linear PLT-68 #8)
+
+    McIntosh R-W3 surfaced a write-time gotcha specific to Individuals whose
+    `status == "INACTIVE"` (typically the deceased-spouse case): once an
+    Individual is INACTIVE, neither the direct PATCH path NOR the indirect
+    OWNERSHIP-edge path will populate `parentHouseholdId`. Roger McIntosh
+    (deceased) had `parentHouseholdId == null`; PATCH
+    `/api/v1/individual/{rogerId} {"parentHouseholdId": "..."}` returned 200 OK
+    but the field stayed null on GET-back. The propagateParentHousehold
+    save-hook also does not fire for INACTIVE-target OWNERSHIP edges — POSTing
+    a fresh HOUSEHOLD→INDIVIDUAL OWNERSHIP edge to Roger left the column
+    unchanged. The Individual is effectively orphaned for as long as it
+    remains INACTIVE, and there is no clean PATCH-only remediation path. This
+    is filed as **Linear PLT-68 bug #8**.
+
+    **Skill rule** — to avoid this dead-end:
+
+    1. **At Individual POST time, always set `parentHouseholdId` in the
+       initial create payload.** Do NOT rely on a follow-up PATCH or on the
+       propagateParentHousehold save-hook firing later. The Individual POST
+       path accepts `parentHouseholdId` directly (unlike PATCH on the
+       FK-bearing types covered in Rule 75); use it.
+    2. **Pair the POST with a HOUSEHOLD → INDIVIDUAL OWNERSHIP edge** in the
+       same Phase 6 batch so the graph traversal is also valid (not just the
+       direct column).
+    3. **Apply Rule 75 verification on the POST**: GET-back, confirm
+       `parentHouseholdId` is set, confirm the OWNERSHIP edge is queryable.
+       Both must hold before marking the Individual CREATED in `run_state`.
+
+    **For existing INACTIVE Individuals already in production with null
+    `parentHouseholdId`** (the McIntosh-Roger case), the skill cannot
+    remediate via PATCH. The agent MUST emit a Q-blocker recommending one of:
+
+    - **Option A** — temporarily reactivate the Individual (PATCH `status`
+      back to `ACTIVE`), set `parentHouseholdId` via the now-functional save-
+      hook (POST a HOUSEHOLD→INDIVIDUAL OWNERSHIP edge), confirm the column
+      populated, then re-deactivate (PATCH `status` back to `INACTIVE`).
+      This is the user-driven remediation path — the skill does NOT do it
+      autonomously because the status round-trip is high-impact (rollups
+      shift, dashboards update, downstream reports re-render).
+    - **Option B** — wait for **Linear PLT-68 #8** to land, after which
+      `propagateParentHousehold` will fire on INACTIVE-target OWNERSHIP
+      edges and the Q-blocker resolves automatically on the next rerun.
+
+    Q-blocker schema:
+
+    ```json
+    {
+      "blocker_type": "INACTIVE_INDIVIDUAL_PARENT_HH_NULL",
+      "individual_id": "<uuid>",
+      "individual_name": "Roger McIntosh",
+      "individual_status": "INACTIVE",
+      "parent_household_id": null,
+      "household_id": "<hh-uuid>",
+      "remediation_options": ["temporarily_reactivate_then_set_then_redeactivate", "wait_for_PLT-68_8"],
+      "linear_ticket": "PLT-68 #8"
+    }
+    ```
+
+    **Cross-reference**: this gotcha is the INACTIVE-target counterpart to
+    quirk 2 above (PATCH parentHouseholdId no-ops on Individual + LegalEntity)
+    and to Rule 60's visibility-edge save-hook workaround (Linear PLT-68 #5).
+    Together, PLT-68 #5 / #7 / #8 form a family of save-hook bugs around
+    `parentHouseholdId` propagation; the skill works around each independently
+    until the backend ships consolidated fixes.
+
     ### Phase 3.7 self-audit addition
 
     For every LegalEntity in `extraction_cache`, verify:
@@ -7853,6 +7986,70 @@ presence.
 {"insurancePolicyId": "<uuid>", "tangibleAssetId": "<uuid>", "policyNumber": "<num>", "carrier": "Chubb", "isInsured_before": false, "isInsured_after": true, "tai_link_action": "POSTED|VERIFIED_EXISTING", "ts": "2026-04-28T14:32:11Z"}
 ```
 
+#### Failure handling — Step 2 Q-blocker exit on null `coverageAmount` (R-W3 amendment)
+
+McIntosh R-W3 hit a partial-success case Rule 78 originally treated as a
+failure: the Mercury Commercial Auto policy `BQ0000792488` covering Robin
+McIntosh's BMW X5. Rule 78 Step 1 (PATCH `isInsured: true` on the TA)
+succeeded, but Step 2 (POST `TangibleAssetInsurance` link record) failed
+because Mercury's source data had `coverageAmount == null`. The
+`TangibleAssetInsurance` POST schema requires `coverageAmount` as a non-null
+numeric — there is no path to create the link record without it.
+
+This is **expected behavior when the source data is incomplete**, NOT a
+Rule 78 failure. The PATCH on the TA already captured the insurance
+relationship at the summary level (`isInsured: true` + `primaryInsurance
+PolicyNumber`); only the precise per-coverage line-item is deferred. The
+right outcome is a Q-blocker recommending the reviewer backfill
+`coverageAmount` (from a declarations page, the carrier's online portal, or
+a follow-up ask to the client) and then either rerun the Phase 6 link step
+or POST the link manually.
+
+**Step 2 explicit pre-check**:
+
+```python
+# rule_78_step2.py — apply BEFORE attempting the TangibleAssetInsurance POST
+def link_ta_insurance(policy, ta, household_folder):
+    if policy.get("coverageAmount") is None:
+        # Q-blocker exit — NOT a Rule 78 failure
+        emit_q_blocker(
+            blocker_type="TA_INSURANCE_LINK_DEFERRED_NULL_COVERAGE_AMOUNT",
+            policy_id=policy["id"],
+            policy_number=policy.get("policyNumber"),
+            tangible_asset_id=ta["id"],
+            tangible_asset_name=ta.get("nickname") or ta.get("description"),
+            recommended_action="Backfill coverageAmount on the policy from "
+                               "declarations page or carrier portal, then rerun "
+                               "Phase 6 link step.",
+        )
+        log_link_action(
+            policy_id=policy["id"], ta_id=ta["id"],
+            tai_link_action="DEFERRED_NULL_COVERAGE_AMOUNT",
+            note="Q-blocker emitted; not a failure",
+        )
+        return  # continue with the next pair — do NOT halt Phase 6
+    # ... normal POST + Rule 75 verification path ...
+```
+
+The `tai_link_action` enum on `phase6_ta_insurance_links.jsonl` gains a
+third value alongside `POSTED` and `VERIFIED_EXISTING`:
+
+| `tai_link_action` | Meaning |
+|---|---|
+| `POSTED` | New TangibleAssetInsurance row created during this run |
+| `VERIFIED_EXISTING` | Pre-existing link confirmed via GET |
+| `DEFERRED_NULL_COVERAGE_AMOUNT` | Q-blocker emitted because policy.coverageAmount was null. Step 1 (TA `isInsured` PATCH) still ran successfully; only the link-record POST is deferred until source data is backfilled |
+
+Phase 6 does NOT halt or retry on this case. The deferred link is surfaced
+to the Phase 5 review with the policy + TA UUIDs so the human reviewer can
+decide whether to chase the missing `coverageAmount` or accept the
+summary-level insurance attribution as sufficient.
+
+Discovered on McIntosh R-W3 — Mercury policy BQ0000792488 covering BMW X5
+hit this case; Rule 78 Step 1 (PATCH `isInsured`) succeeded, Step 2
+(TangibleAssetInsurance POST) was correctly deferred via Q-blocker rather
+than logged as a failure.
+
 #### Rule 78 — Phase 6 must auto-link InsurancePolicy↔TangibleAsset
 
 During Phase 6, when an InsurancePolicy entity is created or updated AND it
@@ -7863,12 +8060,21 @@ the Rule 28 summary fields (`primaryInsurancePolicyNumber`, `insuredValue`,
 record exists between them via `GET /api/v1/tangible-asset/{assetId}/insurance`,
 POSTing one through `POST /api/v1/tangible-asset/{assetId}/insurance` if not.
 Both writes apply Rule 75 verification (status assert, id assert, GET-back).
+**Step 2 pre-check (R-W3 amendment)**: before attempting the
+`TangibleAssetInsurance` POST, verify `policy.coverageAmount != null` — if
+null, emit a `TA_INSURANCE_LINK_DEFERRED_NULL_COVERAGE_AMOUNT` Q-blocker
+recommending backfill, log the link action as `DEFERRED_NULL_COVERAGE_AMOUNT`
+on `phase6_ta_insurance_links.jsonl`, and continue to the next pair. This is
+NOT a Rule 78 failure — Step 1 still captured the summary-level insurance
+attribution; only the per-coverage line-item is deferred. McIntosh R-W3
+hit this on Mercury policy BQ0000792488 covering Robin McIntosh's BMW X5
+(coverageAmount missing in source data).
 The cross-link MUST NOT be deferred to Phase 5 review — by then the household
 ships with `isInsured: false` on policies whose 1:1 TA was already in the
 household. Output is `phase6_ta_insurance_links.jsonl`, one entry per linked
-pair (existing or newly-created), required even when empty. Discovered on the
-Comolli rerun where two real-property TAs had `isInsured: false` despite each
-carrying a 1:1 Chubb HOMEOWNERS policy.
+pair (existing, newly-created, or null-coverage-deferred), required even
+when empty. Discovered on the Comolli rerun where two real-property TAs had
+`isInsured: false` despite each carrying a 1:1 Chubb HOMEOWNERS policy.
 
 ### Step 1.5c: Detect FK_ORPHAN TangibleAssets (Rule 79)
 
@@ -8005,17 +8211,132 @@ downgrades from "only line of defense" to "defense-in-depth pre-write check"
 — still valuable for catching extraction-stage errors before they hit the
 network, but no longer load-bearing for production data integrity.
 
+#### False-positive exemptions (R-W3 amendment, McIntosh rerun)
+
+The McIntosh R-W3 rerun produced **6 OWNERSHIP_SUM_VIOLATION flags that all
+turned out to be CORRECT data per existing Rule 60 grantor patterns**. The
+flags were noisy, not informative — they slowed the Phase 5 review and risked
+training the reviewer to dismiss the signal as routine. Rule 80's sum-check
+now excludes two well-defined patterns BEFORE applying the ±1% tolerance:
+
+**Exemption A — HOUSEHOLD-source OWNERSHIP edges are visibility-only and
+DO NOT count toward economic ownership totals.**
+
+Rule 60's HOUSEHOLD → LegalEntity OWNERSHIP 0% edge is a graph-reachability
+construct, not an economic-ownership claim. Including it in the per-target
+sum makes irrevocable trusts (which legitimately have only the visibility
+edge and no economic edges from individuals) appear at sum = 0% and trigger
+a violation. McIntosh hit five such false positives — five irrevocable
+trusts with HOUSEHOLD→LE OWNERSHIP 0% as the sole inbound OWNERSHIP edge.
+All were correctly modeled per Rule 60.
+
+When summing OWNERSHIP edges to a target, **filter out edges where
+`sourceEntityType == "HOUSEHOLD"`** before applying the tolerance check. If
+the remaining (non-HOUSEHOLD) edges sum to 0 (i.e. the only inbound
+OWNERSHIP is the visibility edge), the target is an irrevocable trust under
+Rule 60 — exempt from the sum check. Log to
+`ownership_sum_exemptions.jsonl` rather than `ownership_sum_violations.jsonl`
+so the Phase 5 review can still surface the case to the reviewer (with
+`exemption_reason: "irrevocable_trust_visibility_only"`), but it does NOT
+emit a Q-blocker and does NOT count against the violation total.
+
+**Exemption B — revocable trusts with N grantors at N×100% per the Rule 60
+grantor pattern.**
+
+PR #15's amendment to Rule 60 mandates that **every grantor of a revocable
+trust gets an OWNERSHIP 100% edge** alongside the GRANTOR edge (the IRC §671
+economic-ownership argument). For joint revocable trusts (two grantors),
+this produces a sum of 200%; for three-grantor structures, 300%. These are
+correct per Rule 60. McIntosh hit one such false positive — the Dawdy Family
+Trust at sum = 200% with both Kari Dawdy and Kevin Dawdy each at 100%, the
+canonical joint-revocable pattern.
+
+Detection: the target is a `LegalEntityType == "TRUST"` AND every inbound
+OWNERSHIP edge (excluding HOUSEHOLD-source edges per Exemption A) is from an
+Individual at exactly 100%. In that case, accept any positive multiple of
+100% as the valid sum (`actual_sum mod 100 == 0` with at least one edge,
+within ±1% rounding tolerance). Log to `ownership_sum_exemptions.jsonl`
+with `exemption_reason: "revocable_trust_joint_grantor_pattern"` and the
+grantor count, then continue without emitting a Q-blocker.
+
+**Order of operations** when checking a target's OWNERSHIP sum:
+
+1. Partition inbound OWNERSHIP edges into `household_edges` (Exemption A
+   candidates) and `other_edges`.
+2. Compute `non_household_sum = sum(e.percentage for e in other_edges)`.
+3. **Exemption A**: if `other_edges == []` AND `household_edges != []` AND
+   the target is a `LegalEntity`, log exemption and skip. The HH→LE
+   visibility edge is the entire ownership signal.
+4. **Exemption B**: if the target is `LegalEntityType == "TRUST"` AND every
+   edge in `other_edges` has `sourceEntityType == "INDIVIDUAL"` AND
+   `percentage == 100` (within 1%), AND `non_household_sum` is a positive
+   multiple of 100 within ±1% — log exemption and skip.
+5. **Otherwise** apply the existing 99-101% tolerance to `non_household_sum`
+   (NOT the full sum including HOUSEHOLD edges).
+
+```python
+# rule_80_exemptions.py
+def check_ownership_sum(target, inbound_ownership_edges):
+    """Returns (status, detail) where status is one of:
+    'PASS', 'EXEMPT_A', 'EXEMPT_B', 'VIOLATION'."""
+    household_edges = [e for e in inbound_ownership_edges
+                       if e.get("sourceEntityType") == "HOUSEHOLD"]
+    other_edges = [e for e in inbound_ownership_edges
+                   if e.get("sourceEntityType") != "HOUSEHOLD"]
+    non_hh_sum = sum(float(e.get("percentage") or 0) for e in other_edges)
+
+    # Exemption A — visibility-only on irrevocable trust
+    if not other_edges and household_edges and target.get("type") == "LEGAL_ENTITY":
+        return ("EXEMPT_A", "irrevocable_trust_visibility_only")
+
+    # Exemption B — joint-grantor revocable trust pattern (Rule 60 / PR #15)
+    is_trust = (target.get("legalEntityType") == "TRUST")
+    all_indiv_100 = (
+        len(other_edges) >= 1 and
+        all(e.get("sourceEntityType") == "INDIVIDUAL"
+            and abs(float(e.get("percentage") or 0) - 100) < 1
+            for e in other_edges)
+    )
+    is_n_x_100 = (
+        non_hh_sum > 0 and
+        abs(non_hh_sum - round(non_hh_sum / 100) * 100) < 1
+    )
+    if is_trust and all_indiv_100 and is_n_x_100:
+        return ("EXEMPT_B", f"revocable_trust_joint_grantor_pattern n={len(other_edges)}")
+
+    # Default tolerance check on non-HOUSEHOLD edges
+    if 99 <= non_hh_sum <= 101:
+        return ("PASS", f"sum={non_hh_sum}")
+    return ("VIOLATION", f"sum={non_hh_sum} (excluding HOUSEHOLD edges)")
+```
+
+Cross-reference: this exemption block is the operational counterpart to
+Rule 60's grantor amendment (PR #15) and visibility-edge doctrine. When
+either of those rules changes (e.g. revocable-trust ownership semantics
+shift), this exemption logic MUST be revisited in lockstep.
+
 #### Rule 80 — Phase 3.7 OWNERSHIP percentage sum check
 
 In Phase 3.7, for every target entity that receives one or more OWNERSHIP
 edges across the merged extraction, sum the `percentage` field across all
-edges. Tolerance is ±1% (joint accounts round to 50/50, partnership K-1s
-sometimes 33.33/33.33/33.34, small rounding is acceptable). When the sum is
-< 99% or > 101%, flag `OWNERSHIP_SUM_VIOLATION`, log to
-`ownership_sum_violations.jsonl` with `{target_entity_id, target_entity_name,
-target_entity_type, actual_sum, expected: 100, contributing_edges, ts}`, and
-emit a Q-blocker enumerating the common causes (missing counterparty,
-partnership minor partner missed, life-estate / reversionary interests,
+edges **EXCLUDING `sourceEntityType == "HOUSEHOLD"` edges** (Rule 60
+visibility edges are not economic ownership). Tolerance is ±1% (joint
+accounts round to 50/50, partnership K-1s sometimes 33.33/33.33/33.34,
+small rounding is acceptable). Two false-positive exemptions apply BEFORE
+the tolerance check (R-W3 amendment, McIntosh rerun): **Exemption A** —
+if a `LegalEntity` target's only inbound OWNERSHIP is a HOUSEHOLD-source
+visibility edge (irrevocable-trust pattern), log to
+`ownership_sum_exemptions.jsonl` and skip the sum check. **Exemption B** —
+if the target is `LegalEntityType == "TRUST"` AND every non-HOUSEHOLD edge
+is from an Individual at exactly 100%, accept any positive multiple of 100%
+(joint-grantor revocable trust pattern per Rule 60 / PR #15 — Dawdy Family
+Trust at 200% with two grantors at 100% each is the canonical case). Only
+outside both exemptions, when the non-HOUSEHOLD sum is < 99% or > 101%,
+flag `OWNERSHIP_SUM_VIOLATION`, log to `ownership_sum_violations.jsonl`
+with `{target_entity_id, target_entity_name, target_entity_type, actual_sum,
+expected: 100, contributing_edges, ts}`, and emit a Q-blocker enumerating
+the common causes (missing counterparty, partnership minor partner missed,
+life-estate / reversionary interests,
 duplicate-edge-from-Rule-73-not-fully-retired, post-divorce gap). DO NOT
 halt — a partial-ownership write with an open Q-blocker is better than a
 no-write; the human reviewer adjudicates in Phase 5. Discovered on the
@@ -8030,6 +8351,10 @@ production, accepted silently. Until PLT-68 #6 lands, this Phase 3.7 check
 is the only line of defense; the agent MUST NOT auto-fix percentages —
 emit a Q-blocker with the violating target id, current sum, and per-edge
 breakdown (source UUIDs), and recommend re-extraction from source documents.
+**McIntosh R-W3** produced 6 OWNERSHIP_SUM_VIOLATION flags (5 irrevocable
+trusts at sum 0%, Dawdy Family Trust at 200%) that all turned out to be
+correct Rule 60 patterns — the exemptions added here suppress that class
+of noise without weakening the underlying integrity check.
 
 ### Step 5.2: Null-rollup banner in Phase 5 review (Rule 81)
 
