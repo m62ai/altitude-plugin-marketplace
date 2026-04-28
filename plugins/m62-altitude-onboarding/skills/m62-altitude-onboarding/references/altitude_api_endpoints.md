@@ -394,7 +394,7 @@ All document upload endpoints use **multipart/form-data** format with the follow
 
 **Request Format:**
 ```
-POST /api/v1/{entity}/{id}/documents
+POST /api/v1/{entity}/{id}/document
 Content-Type: multipart/form-data
 
 Parts:
@@ -407,7 +407,7 @@ Query Parameters:
   skipDuplicates (optional): boolean, default true
 ```
 
-### 4.1 POST /api/v1/individual/{id}/documents
+### 4.1 POST /api/v1/individual/{id}/document
 **Summary:** Upload a document for an individual
 
 **Path Parameters:**
@@ -436,7 +436,7 @@ Binary file content.
 
 ---
 
-### 4.2 POST /api/v1/legal-entity/{id}/documents
+### 4.2 POST /api/v1/legal-entity/{id}/document
 **Summary:** Upload a document for a legal entity
 
 **Path Parameters:**
@@ -454,7 +454,7 @@ Binary file content.
 
 ---
 
-### 4.3 POST /api/v1/account-financial/{id}/documents
+### 4.3 POST /api/v1/account-financial/{id}/document
 **Summary:** Upload a document for a financial account
 
 **Path Parameters:**
@@ -470,7 +470,7 @@ Binary file content.
 
 ---
 
-### 4.4 POST /api/v1/tangible-asset/{id}/documents
+### 4.4 POST /api/v1/tangible-asset/{id}/document
 **Summary:** Upload a document for a tangible asset
 
 **Path Parameters:**
@@ -486,7 +486,7 @@ Binary file content.
 
 ---
 
-### 4.5 ~~POST /api/v1/household/{id}/documents~~ — NOT SUPPORTED
+### 4.5 ~~POST /api/v1/household/{id}/document~~ — NOT SUPPORTED
 
 > **Household does NOT support document upload.** There is no `HouseholdDocumentResource` or `HouseholdDocumentCreateRequestDto`.
 >
@@ -607,7 +607,17 @@ All document create request DTOs share these optional fields:
 **Entity-Specific Fields:**
 - `accountFinancialId`: UUID string - Account ID
 
-**Document Sub-Types:** Use appropriate subtype for financial documents (account statements, confirmations, etc.), default to `OTHER`
+**Document Sub-Types** (`DocumentTypeAccountFinancial` enum — partial list of common values; default to `OTHER` if unsure):
+- **Account/Onboarding:** `ACCOUNT_AGREEMENT`, `ACCOUNT_APPLICATION`, `TRANSFER_FORM`, `BENEFICIARY_DESIGNATION`, `CUSTODY_AGREEMENT`, `CUSTODIAL_STATEMENT`, `FEE_SCHEDULE`, `MARGIN_AGREEMENT`, `OPTIONS_AGREEMENT`
+- **Statements & Confirmations:** `BANK_STATEMENT`, `BROKERAGE_STATEMENT`, `TRADE_CONFIRMATION`, `VOIDED_CHECK`, `WIRE_INSTRUCTIONS`, `ACH_AUTHORIZATION`, `DIRECT_DEPOSIT_FORM`
+- **Tax Forms:** `FORM_1099`, `FORM_1099_DIV`, `FORM_1099_INT`, `FORM_1099_B`, `FORM_1099_MISC`, `FORM_1099_R`, `FORM_K1_1065`, `FORM_K1_1120S`, `FORM_K1_1041`, `FORM_W2`, `FORM_W2G`, `FORM_5498`, `FORM_8949`, `TAX_SUMMARY`, `FORM_W9`, `FORM_W8BEN`
+- **Retirement:** `IRA_ADOPTION_AGREEMENT`, `PLAN_DOCUMENT_401K`, `RMD_NOTICE`, `ROLLOVER_CERTIFICATION`
+- **Compliance & ID:** `AML_DOCUMENTATION`, `KYC_DOCUMENTATION`, `FATCA_CRS_FORM`, `PASSPORT`, `DRIVERS_LICENSE`, `SOCIAL_SECURITY_CARD`, `TAX_IDENTIFICATION`
+- **Authority/Trust/Entity:** `POWER_OF_ATTORNEY`, `AUTHORIZED_SIGNER`, `CORPORATE_RESOLUTION`, `TRUST_AGREEMENT`, `TRUST_CERTIFICATION`, `OPERATING_AGREEMENT`, `PARTNERSHIP_AGREEMENT`, `EIN_CONFIRMATION`, `BUSINESS_LICENSE`, `CERTIFICATE_OF_GOOD_STANDING`
+- **Estate:** `PROBATE_DOCUMENT`, `DEATH_CERTIFICATE`, `EXECUTOR_APPOINTMENT`
+- **General:** `FINANCIAL_STATEMENT`, `INVESTMENT_POLICY_STATEMENT`, `CORRESPONDENCE`, `NOTIFICATION`, `OTHER`
+
+> **GOTCHA:** `INVESTMENT_STATEMENT` is **NOT** a valid value for `DocumentTypeAccountFinancial`. It is only valid for `DocumentTypeIndividual` (see 5.2) and `DocumentTypeLegalEntity` (see 5.3). For brokerage/investment account statements anchored to an `AccountFinancial`, use `BROKERAGE_STATEMENT`. Submitting `INVESTMENT_STATEMENT` against an AccountFinancial document upload returns HTTP 400.
 
 ---
 
@@ -944,7 +954,7 @@ Content-Type: application/json
 
 **Step 4: Upload identification document**
 ```bash
-POST /api/v1/individual/{individual_uuid}/documents
+POST /api/v1/individual/{individual_uuid}/document
 Authorization: Bearer $TOKEN
 Content-Type: multipart/form-data
 
