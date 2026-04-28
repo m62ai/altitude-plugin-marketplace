@@ -5413,6 +5413,139 @@ corruption case — these are admin-purged pre-checksum-feature uploads (a
 pre-existing condition) and belong in the Phase 8 FYI bucket, not the blocking
 review.
 
+### Step 7.9b: Rewrite legacy run_state on doc re-upload (Rule 76)
+
+When Phase 7 needs to re-upload a document that already has a prior
+`run_state.documents.uploaded[]` entry — because the prior upload's UUID 404s
+on `GET /api/v1/document/{id}/content`, because the file changed, because a
+prior run was aborted mid-upload, or for any other reason — the upload returns
+a NEW document UUID. The skill MUST NOT simply append the new entry alongside
+the old one without touching the old entry. If the legacy entry's `documentId`
+is left in place, it now points to an entity that no longer exists, and any
+future audit that GETs that UUID will see a 404 and (incorrectly) report the
+document as missing — even though the underlying file is intact under the new
+UUID.
+
+The R2 recovery wave on the Glickman household quantified this: 33 of 34
+documents flagged "missing" by the persistence audit were in fact re-uploaded
+under fresh UUIDs by an intermediate rerun, but the legacy `run_state` entries
+were never rewritten. A basename cross-check against the family's
+currently-live docs resolved every one of the 33 to a live UUID. They were
+UUID-rotation artifacts, not real losses.
+
+#### The two valid patterns (pick one — be consistent within a household)
+
+**Pattern A — Replace in place**: rewrite the prior `documents.uploaded[]`
+entry with the new UUID, the new upload timestamp, and the new metadata. The
+prior UUID is discarded. This is the simpler pattern and is the default
+unless there is a specific reason to retain a paper trail of the old UUID.
+
+**Pattern B — Mark superseded**: keep the prior entry, add a `supersededBy:
+<new-uuid>` field and a `supersededAt: <iso-timestamp>` field on it, and add
+the new upload as a fresh entry. This preserves a full history of the rotation
+chain — useful when the rotation was triggered by a verification failure
+worth auditing, or when reconciling against an external system that may still
+hold the old UUID.
+
+In both patterns, the file's underlying source path (`source_path`) and SHA256
+of the source-on-disk MUST appear in the post-rewrite `run_state` so a future
+audit can perform the basename / SHA cross-check called out below and in
+Rule 77.
+
+#### Python recipe — both patterns
+
+```python
+import json, datetime, pathlib
+
+RUN_STATE = pathlib.Path(f"{household_folder}/altitude_review/run_state.json")
+
+def _load():
+    return json.loads(RUN_STATE.read_text())
+
+def _save(state):
+    RUN_STATE.write_text(json.dumps(state, indent=2, sort_keys=True))
+
+def replace_in_place(source_path: str, new_doc_id: str, new_meta: dict) -> None:
+    """Pattern A — overwrite the prior entry. Discards the old UUID."""
+    state = _load()
+    uploaded = state.setdefault("documents", {}).setdefault("uploaded", [])
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    for entry in uploaded:
+        if entry.get("source_path") == source_path:
+            entry["documentId"] = new_doc_id
+            entry["uploadedAt"] = now
+            entry.update(new_meta)
+            entry.pop("supersededBy", None)
+            entry.pop("supersededAt", None)
+            _save(state)
+            return
+    # No prior entry — fresh upload, append new
+    uploaded.append({"source_path": source_path, "documentId": new_doc_id,
+                     "uploadedAt": now, **new_meta})
+    _save(state)
+
+def mark_superseded(source_path: str, new_doc_id: str, new_meta: dict) -> None:
+    """Pattern B — retain the old entry with supersededBy, add a new one."""
+    state = _load()
+    uploaded = state.setdefault("documents", {}).setdefault("uploaded", [])
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    for entry in uploaded:
+        if (entry.get("source_path") == source_path and
+                "supersededBy" not in entry):
+            entry["supersededBy"] = new_doc_id
+            entry["supersededAt"] = now
+    uploaded.append({"source_path": source_path, "documentId": new_doc_id,
+                     "uploadedAt": now, **new_meta})
+    _save(state)
+```
+
+The skill picks Pattern A or Pattern B based on the run's policy — usually A
+for routine reruns, B when the rotation was caused by a Rule 70 verification
+failure that the user wants surfaced in the audit log. Mixing patterns within
+a single household's `run_state` is not allowed; pick one and stick with it
+for the whole upload pass.
+
+#### Cross-reference with Rule 70
+
+Rule 76 is the persistence half of Rule 70's verification story. Rule 70
+catches the upload-time integrity failures that often lead to a re-upload
+(zero-byte shells, SHA mismatch, content-type drift). Rule 76 ensures that
+when those re-uploads happen, the recorded state on disk reflects the new
+UUID — otherwise Rule 70's verifier passes on the new UUID, but a downstream
+audit still GETs the old UUID and reports a phantom 404. Together: Rule 70
+verifies the upload landed correctly; Rule 76 ensures we remember which UUID
+it landed under.
+
+#### Symptom — how to recognize a Rule 76 violation after the fact
+
+> If a future persistence audit (per Rule 77) reports a high doc-404 count
+> for a household, but a basename cross-check against the same household's
+> currently-live docs (via `GET /api/v1/document?householdId=...` or the
+> per-entity document list) shows the files exist under different UUIDs,
+> the cause is almost certainly missing Rule 76 compliance in a prior
+> re-upload. Resolution: rewrite the stale `run_state.documents.uploaded[]`
+> entries to point at the live UUIDs (Pattern A) or annotate them
+> `supersededBy` (Pattern B). Do NOT delete the live docs and do NOT
+> re-upload the source files — duplicate-document risk is significant.
+
+#### Rule 76 — Rewrite legacy run_state on doc re-upload — preserve UUID-to-source linkage
+
+When Phase 7 re-uploads a document that already has a prior
+`run_state.documents.uploaded[]` entry, the skill MUST rewrite the prior entry
+in place with the new `documentId` and upload timestamp (Pattern A) OR add a
+`supersededBy: <new-uuid>` field to the prior entry while appending the new
+entry separately (Pattern B). Mixing patterns within a single household's
+`run_state` is forbidden. The post-rewrite entry MUST retain `source_path` and
+the source-on-disk SHA256 so future audits can do basename / SHA cross-checks.
+Failing to apply Rule 76 leaves the legacy entry's `documentId` pointing at a
+deleted entity; future persistence audits GET that UUID, see a 404, and report
+the document as missing even though the data is intact under a new UUID. The
+R2 recovery wave found 33 of 34 documents flagged "missing" on Glickman were
+UUID-rotation artifacts of this exact kind. Rule 76 is the persistence
+counterpart to Rule 70's upload verification — Rule 70 catches the failures
+that trigger re-uploads; Rule 76 ensures the resulting UUID rotation is
+recorded so the next audit sees the truth.
+
 ---
 
 ## Phase 8: Advisor Open-Items Packet (REQUIRED final output)
@@ -7101,6 +7234,342 @@ for a reference example (RM handoff format).
       in `036296f4-...e9b8` (admin tenant), not Verita's `550e8400-...0001`. Firm-admin
       `/to/` showed 0 HH→LE OWNERSHIP edges despite the 201 response. Cleanup: hard-delete
       the wrong-tenant edge, re-POST with API key. Always verify post-write.
+
+---
+
+## Auditing the fleet — persistence-audit methodology
+
+Persistence audits run AFTER the onboarding skill ships a household, to confirm
+that the entities created and documents uploaded are still present and queryable
+via the firm-scoped API. They are not part of the per-household onboarding
+workflow — they are a fleet-level reconciliation tool — but the rules below
+constrain how they MUST consume the artifacts the skill produces (notably
+`run_state*.json` files), so they belong in this skill.
+
+### How persistence audits go wrong
+
+The naive audit walks every `<household>/altitude_review/*.json` and
+`<household>/run_state*.json` file in the fleet, harvests every UUID it sees,
+and GET-checks each one against the live API. Any 404 is reported as
+"missing data".
+
+This produces wildly inflated 404 counts for two compounding reasons:
+
+1. **Rule 76 violations from prior runs.** If an intermediate rerun re-uploaded
+   documents and DID NOT rewrite the legacy `documents.uploaded[]` entries,
+   those legacy entries still contain dead UUIDs. Those UUIDs 404 because the
+   doc was rotated to a new UUID — not because data was lost.
+2. **Aggregation across superseded `run_state_<date>.json` files.** Households
+   accumulate multiple dated `run_state` snapshots over a series of rerun
+   cycles. Older snapshots reference UUIDs that the most-recent run replaced or
+   abandoned. Those superseded UUIDs are by definition not the current state —
+   GET-checking them and counting the 404s as "missing" treats the fleet as if
+   every prior snapshot were authoritative, which is the opposite of true.
+
+The R2 recovery wave on Levine quantified this: the 66 + 20 audit-flagged 404s
+on Levine were ALL stale references resolved by intervening reruns. Zero were
+real losses. The audit's signal-to-noise ratio was zero.
+
+### Rule 77 methodology — most-recent run_state per household
+
+A persistence audit MUST:
+
+1. **Per-household, identify the most-recent `run_state` snapshot.** Glob
+   `<household>/altitude_review/run_state_*.json` (or whatever the snapshot
+   pattern is — `run_state.json` plus dated `run_state_<YYYY-MM-DD>.json`
+   variants). Lexicographically sort the dated filenames (date is in the name,
+   so lex-sort is correct). The largest is the most recent. If only the
+   undated `run_state.json` exists, that is the most recent.
+2. **Pull UUIDs ONLY from that file.** Do not aggregate across older
+   snapshots for the GET-check pass.
+3. **Classify older snapshots' UUIDs separately.** Any UUID that appears in
+   an older snapshot but NOT in the most-recent one is by definition
+   not-the-current-state. Tag those `historical_not_current` and report them
+   in a SEPARATE bucket from the current-state findings; do NOT contribute
+   them to the headline 404 count.
+4. **GET-check ONLY the most-recent file's UUIDs.** This is the headline
+   audit pass. Findings here have a chance of being real losses; findings
+   from older snapshots almost never are.
+
+### Rule 77 — Rule 76 cross-check on each 404
+
+For every UUID from the most-recent `run_state` that returns 404, the audit
+MUST ALSO perform a basename + SHA cross-check against the household's
+currently-live documents:
+
+1. Load the source-on-disk path and source SHA256 from the
+   `run_state.documents.uploaded[]` entry that contained the 404'd UUID.
+2. Query the household's live documents:
+   `GET /api/v1/document?householdId=<household-uuid>`
+3. For each live document, compare its `originalFileName` (basename of the
+   source the doc was uploaded from) AND, where available, its size and
+   server-side metadata to the source-on-disk basename and byte count.
+4. If a live document matches the basename and source bytes, the 404'd
+   UUID is a Rule 76 violation — the file was re-uploaded under a new
+   UUID and the legacy `run_state` entry was never rewritten. Classify
+   the finding as `superseded` and record the live UUID alongside the
+   dead one.
+
+Findings with no basename match in the live docs are classified
+`genuinely_missing`. These are the only findings that warrant recovery action.
+
+### Age-weighted confidence
+
+Audit findings carry a confidence dimension that depends on the AGE of the
+underlying state file the finding was extracted from. The older the source
+snapshot, the more rerun cycles have had a chance to supersede the entries
+in it, and the more likely a 404 reflects an intervening rotation rather
+than a real loss.
+
+Every finding the audit emits MUST carry an `as_of_date` (the date stamp of
+the source state file — usually parsed from the filename, e.g.
+`run_state_2026-04-22.json` → `2026-04-22`) and an `age_days` (the integer
+number of days between `as_of_date` and the audit run date).
+
+Confidence heuristic (treat as guidance, not a hard threshold — document
+edge cases in the audit output):
+
+| Source state file age | Confidence | Default action |
+|---|---|---|
+| `< 24 hours` | **High** — finding likely real | Recovery warranted; investigate the 404 with the same urgency as a fresh failure. |
+| `1 – 7 days` | **Medium** — possibly real | Verify against current state before recovery. Re-run the Rule 77 cross-check (basename + SHA) at audit time, NOT at finding time, to catch reruns that landed between snapshot and audit. |
+| `> 7 days` | **Low** — likely stale | Default to `historical_likely_superseded`; require explicit cross-check before declaring missing. Do NOT contribute these to the headline `genuinely_missing` count. |
+
+The R2 evidence: the audit on Levine and Glickman ran a few hours after the
+recovery wave, but it referenced state from snapshot files that were DAYS
+old in some cases. Those older entries had a near-100% false-positive rate
+because intervening reruns had rotated their UUIDs (Rule 76) or replaced
+their entities. The headline `genuinely_missing` count must reflect that —
+it should require source-state-file age `< 24h` to merit the
+`genuinely_missing` label. Older candidates that still 404 and still
+have no basename match should classify as `historical_likely_superseded`,
+flagged for review but not for immediate recovery.
+
+Rationale: in a system with intervening rerun cycles, prior-state staleness
+compounds. Treating a 7-day-old 404 with the same weight as a 1-hour-old
+404 will produce an audit that cries wolf — and an operator who learns to
+ignore audit output is worse than no audit at all.
+
+### Audit JSON schema — distinguishing findings
+
+When emitting findings, the audit MUST distinguish three classes:
+
+```json
+{
+  "audit_run_at": "2026-04-28T14:00:00Z",
+  "household": "Levine",
+  "household_id": "<uuid>",
+  "most_recent_run_state": "run_state_2026-04-27.json",
+  "most_recent_run_state_as_of": "2026-04-27",
+  "findings": {
+    "genuinely_missing": [
+      {
+        "kind": "document",
+        "uuid": "<dead-uuid>",
+        "source_path": "/.../source.pdf",
+        "source_basename": "source.pdf",
+        "source_sha256": "<hex>",
+        "as_of_date": "2026-04-27",
+        "age_days": 1,
+        "confidence": "high",
+        "live_basename_match": null,
+        "notes": "404 on most-recent run_state UUID, no basename match in live docs, source < 24h old"
+      }
+    ],
+    "superseded": [
+      {
+        "kind": "document",
+        "uuid": "<dead-uuid>",
+        "live_uuid": "<live-uuid>",
+        "source_path": "/.../source.pdf",
+        "source_basename": "source.pdf",
+        "as_of_date": "2026-04-27",
+        "age_days": 1,
+        "confidence": "high",
+        "remediation": "Apply Rule 76 — rewrite run_state entry to live_uuid (Pattern A) or annotate supersededBy (Pattern B). Do NOT re-upload."
+      }
+    ],
+    "historical_not_current": [
+      {
+        "kind": "document",
+        "uuid": "<old-uuid>",
+        "source_state_file": "run_state_2026-04-15.json",
+        "as_of_date": "2026-04-15",
+        "age_days": 13,
+        "confidence": "low",
+        "notes": "Appears only in older run_state, not in most-recent. Not part of current state."
+      }
+    ],
+    "historical_likely_superseded": [
+      {
+        "kind": "document",
+        "uuid": "<dead-uuid>",
+        "source_state_file": "run_state_2026-04-15.json",
+        "as_of_date": "2026-04-15",
+        "age_days": 13,
+        "confidence": "low",
+        "live_basename_match": null,
+        "notes": "404 + no basename match, but source-state-file age > 7d; do not classify genuinely_missing without explicit cross-check."
+      }
+    ]
+  }
+}
+```
+
+The headline "missing data" count the audit reports to humans MUST be the
+count of `genuinely_missing` only. The `superseded`, `historical_not_current`,
+and `historical_likely_superseded` buckets are reported separately, with the
+`superseded` bucket linking back to Rule 76 for remediation.
+
+### Python recipe — audit driver skeleton
+
+```python
+import json, glob, os, datetime, requests
+
+def most_recent_run_state(household_dir: str) -> str | None:
+    """Return path to the most-recent run_state file for a household."""
+    candidates = sorted(glob.glob(
+        os.path.join(household_dir, "altitude_review", "run_state_*.json")))
+    if candidates:
+        return candidates[-1]  # lex-sort by date in filename
+    fallback = os.path.join(household_dir, "altitude_review", "run_state.json")
+    return fallback if os.path.exists(fallback) else None
+
+def parse_as_of(path: str) -> str:
+    """Parse YYYY-MM-DD from a run_state filename, or use the file mtime."""
+    base = os.path.basename(path)
+    if base.startswith("run_state_") and base.endswith(".json"):
+        return base[len("run_state_"):-len(".json")]
+    mtime = datetime.datetime.utcfromtimestamp(os.path.getmtime(path))
+    return mtime.date().isoformat()
+
+def audit_household(household_dir: str, household_id: str, base: str,
+                    headers: dict, audit_date: datetime.date) -> dict:
+    findings = {"genuinely_missing": [], "superseded": [],
+                "historical_not_current": [], "historical_likely_superseded": []}
+
+    most_recent_path = most_recent_run_state(household_dir)
+    if not most_recent_path:
+        return {"findings": findings, "skipped": "no_run_state"}
+
+    most_recent = json.loads(open(most_recent_path).read())
+    as_of = parse_as_of(most_recent_path)
+    age_days = (audit_date - datetime.date.fromisoformat(as_of)).days
+
+    # 1. Headline pass — only most-recent UUIDs
+    current_uuids = {e["documentId"]: e
+                     for e in most_recent.get("documents", {}).get("uploaded", [])
+                     if "documentId" in e and "supersededBy" not in e}
+
+    # 2. Pull live docs once for basename cross-check
+    live = requests.get(f"{base}/api/v1/document",
+                        params={"householdId": household_id},
+                        headers=headers, timeout=30).json()
+    live_by_basename = {d.get("originalFileName"): d
+                       for d in live.get("data", live if isinstance(live, list) else [])
+                       if d.get("originalFileName")}
+
+    for uuid, entry in current_uuids.items():
+        r = requests.get(f"{base}/api/v1/document/{uuid}", headers=headers, timeout=15)
+        if r.status_code == 200:
+            continue
+        # 404 — try basename cross-check (Rule 76)
+        src_basename = os.path.basename(entry.get("source_path", ""))
+        live_match = live_by_basename.get(src_basename)
+        finding = {
+            "kind": "document", "uuid": uuid,
+            "source_path": entry.get("source_path"),
+            "source_basename": src_basename,
+            "source_sha256": entry.get("source_sha256"),
+            "as_of_date": as_of, "age_days": age_days,
+        }
+        if live_match:
+            finding["live_uuid"] = live_match.get("id")
+            finding["confidence"] = "high" if age_days < 1 else "medium" if age_days <= 7 else "low"
+            finding["remediation"] = ("Apply Rule 76 — rewrite run_state entry "
+                                      "to live_uuid (Pattern A) or annotate "
+                                      "supersededBy (Pattern B). Do NOT re-upload.")
+            findings["superseded"].append(finding)
+        else:
+            if age_days < 1:
+                finding["confidence"] = "high"
+                findings["genuinely_missing"].append(finding)
+            elif age_days <= 7:
+                finding["confidence"] = "medium"
+                findings["genuinely_missing"].append(finding)
+            else:
+                finding["confidence"] = "low"
+                findings["historical_likely_superseded"].append(finding)
+
+    # 3. Older snapshots — historical_not_current bucket
+    older_paths = [p for p in sorted(glob.glob(
+        os.path.join(household_dir, "altitude_review", "run_state_*.json")))
+        if p != most_recent_path]
+    for old_path in older_paths:
+        old_state = json.loads(open(old_path).read())
+        old_as_of = parse_as_of(old_path)
+        old_age = (audit_date - datetime.date.fromisoformat(old_as_of)).days
+        for e in old_state.get("documents", {}).get("uploaded", []):
+            uuid = e.get("documentId")
+            if not uuid or uuid in current_uuids:
+                continue
+            findings["historical_not_current"].append({
+                "kind": "document", "uuid": uuid,
+                "source_state_file": os.path.basename(old_path),
+                "as_of_date": old_as_of, "age_days": old_age,
+                "confidence": "low",
+            })
+
+    return {"household_id": household_id,
+            "most_recent_run_state": os.path.basename(most_recent_path),
+            "most_recent_run_state_as_of": as_of,
+            "findings": findings}
+```
+
+### Cross-reference
+
+Rule 77 and Rule 76 share a symptom space: a 404 on a `run_state` UUID that
+turns out to be a UUID rotation rather than a data loss. Rule 76 PREVENTS the
+condition by requiring the rotating run to rewrite legacy entries. Rule 77
+DETECTS the condition (when Rule 76 was not applied) by cross-checking each
+404 against the household's live docs by basename + source bytes. An audit
+that finds many `superseded` entries should escalate to a Rule 76 backfill
+pass on the affected households — not to a re-upload.
+
+#### Rule 77 — Persistence audits must use most-recent run_state, with Rule 76 cross-check and age-weighted confidence
+
+A fleet persistence audit MUST: (a) for each household, identify the
+most-recent `run_state_*.json` (lex-sort by the date in the filename;
+fall back to `run_state.json` if no dated snapshots exist) and pull
+UUIDs ONLY from that file for the headline GET-check pass; (b) classify
+UUIDs that appear ONLY in older snapshots as `historical_not_current`
+and report them in a separate bucket — they are by definition not the
+current state and contribute zero signal to "data loss" metrics; (c)
+for every 404 on a most-recent-run_state UUID, perform a Rule 76 cross-
+check — load the source basename and SHA from the `run_state` entry,
+query the household's live docs (`GET /api/v1/document?householdId=…`),
+and if a live doc matches the source basename and bytes, classify as
+`superseded` (Rule 76 violation, remediated by run_state rewrite, NOT
+by re-upload) rather than as missing; (d) tag every finding with an
+`as_of_date` (parsed from the source state file's name, falling back
+to file mtime) and an `age_days`, and apply the age-weighted
+confidence heuristic — `< 24h` is high confidence, `1–7d` is medium,
+`> 7d` is low and defaults to `historical_likely_superseded` rather
+than `genuinely_missing`; (e) emit findings under four buckets —
+`genuinely_missing` (real losses; recovery action warranted),
+`superseded` (Rule 76 violations; rewrite the legacy run_state entry),
+`historical_not_current` (UUIDs from older snapshots that don't appear
+in the current snapshot), and `historical_likely_superseded` (404s on
+old snapshots with no basename match — flagged but not blocking).
+The headline "missing data" count reported to humans MUST be the count
+of `genuinely_missing` only. R2 evidence: on Levine, all 66+20 audit-
+flagged 404s were stale references resolved by intervening reruns;
+applying Rule 77 would have produced a `genuinely_missing` count of
+zero and routed all findings to `superseded` or
+`historical_likely_superseded` instead. Rule 77 is the audit-side
+counterpart to Rule 76 — Rule 76 prevents UUID rotation from being
+silently lost; Rule 77 detects it after the fact when prevention
+failed.
 
 ---
 
