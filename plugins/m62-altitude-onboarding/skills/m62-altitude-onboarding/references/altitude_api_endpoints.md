@@ -386,6 +386,117 @@ Schema: `EntityRelationshipDto`
 - `createdBy`: User who created the relationship. Type: string
 - `lastModifiedBy`: User who last modified the relationship. Type: string
 
+### 3.2 PATCH /api/v1/entity-relationship/{id}
+
+**Summary:** Partially update an existing entity relationship.
+
+**Path Parameters:**
+- `id` (required): Relationship ID (UUID).
+
+**Body form (correct):** send the fields to update as a JSON body.
+
+```json
+{
+  "percentage": 50.00
+}
+```
+
+```json
+{
+  "effectiveTo": "2025-12-31",
+  "role": "Former Trustee"
+}
+```
+
+**Response:**
+- **200 OK**: Relationship updated. Body: `EntityRelationshipDto`.
+- **404 Not Found**: id does not exist OR is hidden by tenant scoping (see Rule on tenant-scope asymmetry under DELETE below).
+
+**⚠️ WARNING — Query-param form silently no-ops (2026-04-29 cleanup execution).**
+The OpenAPI spec at lines 27350-27521 documents a query-param form
+`PATCH /api/v1/entity-relationship/{id}?percentage=N`. The Podolsky
+cleanup confirmed: this form returns **HTTP 200** with the unchanged
+`EntityRelationshipDto` body (no error, no warning) but does NOT persist
+the change. A subsequent `GET /api/v1/entity-relationship/{id}` shows
+the original percentage. The body form (above) DOES persist. A backend
+ticket is queued; until it lands, **always use the body form** for
+percentage and any other field update.
+
+**Side-by-side**:
+
+```bash
+# ✅ CORRECT — body form persists
+curl -X PATCH "$BASE/api/v1/entity-relationship/$REL_ID" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"percentage": 50}'
+
+# ❌ WRONG — query-param form silently no-ops despite HTTP 200
+curl -X PATCH "$BASE/api/v1/entity-relationship/$REL_ID?percentage=50" \
+  -H "Authorization: Bearer $JWT"
+# Response: 200 OK + EntityRelationshipDto, but percentage unchanged
+```
+
+This applies to ALL fields, not just `percentage` — the query-param form
+is documented across multiple fields in the spec but the body form is
+the only one that persists today.
+
+### 3.3 DELETE /api/v1/entity-relationship/{id}
+
+**Summary:** Remove an entity relationship. Two semantic variants exist:
+
+- `DELETE /api/v1/entity-relationship/{id}` — soft-delete (sets `deleted: true`,
+  row remains queryable with `?includeDeleted=true`).
+- `DELETE /api/v1/entity-relationship/{id}/hard` — hard-delete (row is removed).
+  **Preferred for "created in error"** edges per Rule 73 / Rule 74 doctrine —
+  hard-delete avoids the soft-deleted ghost rows that confuse 409 disambiguation.
+- `DELETE /api/v1/entity-relationship/{id}?force=true` — also a hard-delete,
+  equivalent to the `/hard` form. Either is valid with `ROLE_ADMIN_TENANT`.
+
+**Auth requirement (2026-04-29 cleanup execution):** the `/hard` and
+`?force=true` hard-delete forms require **`ROLE_ADMIN_TENANT` JWT** —
+NOT a firm-admin API key. The Podolsky cleanup attempted hard-delete with
+the firm-admin API key and got HTTP 403; switching to a JWT obtained via
+`POST /api/v1/authenticate` with admin credentials succeeded. The
+soft-delete form (no `/hard`, no `force`) does work with firm-admin API
+key, but soft-delete leaves the ghost row behind.
+
+```bash
+# Get an admin JWT
+JWT=$(curl -s -X POST "$BASE/api/v1/authenticate" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@firm","password":"...","tenantId":"<tenant-uuid>"}' \
+  | jq -r '.token')
+
+# Hard-delete with admin JWT (preferred for "created in error")
+curl -X DELETE "$BASE/api/v1/entity-relationship/$REL_ID/hard" \
+  -H "Authorization: Bearer $JWT"
+# 204 No Content
+
+# Equivalent form
+curl -X DELETE "$BASE/api/v1/entity-relationship/$REL_ID?force=true" \
+  -H "Authorization: Bearer $JWT"
+# 204 No Content
+```
+
+**Tenant-scope asymmetry — known consistency gap (2026-04-29 cleanup
+execution).** The GET-by-id endpoint
+`GET /api/v1/entity-relationship/{id}` is more strictly tenant-scoped
+than the enumeration endpoint
+`GET /api/v1/entity-relationship/to/{type}/{id}/active`. The same caller
+(same JWT, same tenant context) may see a relationship enumerated via
+the `/to/{type}/{id}/active` traversal and then get **HTTP 404** on a
+direct GET-by-id of the very edge that was just enumerated. Both
+endpoints accept the same auth and report the same tenant header, but
+the by-id path applies an extra row-level scope filter that the
+enumeration path does not. A backend ticket is queued to align the two
+paths. Until then, the workaround is: when an edge appears in
+enumeration but a direct GET 404s, proceed directly to the DELETE call —
+the DELETE accepts the id even when GET 404s, presumably because the
+DELETE applies the same scope as the enumeration endpoint, not the
+by-id GET. Confirmed during the Podolsky cleanup on 4 cross-tenant
+edges that needed removal.
+
 ---
 
 ## 4. DOCUMENT UPLOAD ENDPOINTS
