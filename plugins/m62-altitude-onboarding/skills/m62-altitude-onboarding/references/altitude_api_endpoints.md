@@ -386,60 +386,81 @@ Schema: `EntityRelationshipDto`
 - `createdBy`: User who created the relationship. Type: string
 - `lastModifiedBy`: User who last modified the relationship. Type: string
 
-### 3.2 PATCH /api/v1/entity-relationship/{id}
+### 3.2 PATCH /api/v1/entity-relationship/{id} and /{id}/attributes
 
-**Summary:** Partially update an existing entity relationship.
+**Summary:** Partially update an existing entity relationship. Two distinct endpoints, each with its own input format. PLT-73's route-collision fix (shipped 2026-04-29, PR #253) split the previously-overlapping handlers onto separate paths.
 
-**Path Parameters:**
-- `id` (required): Relationship ID (UUID).
+> **✅ Backend fix shipped 2026-04-29 — PLT-73 RESOLVED.** Pre-fix, the
+> documented query-param form on `/{id}` silently no-op'd because of a
+> Spring routing collision between the inherited body-form merge-patch
+> handler and the bespoke query-param handler. The fix moved the
+> bespoke query-param handler to `/{id}/attributes`. The query-param
+> form on `/{id}` now returns **HTTP 400 with an actionable error
+> message** redirecting the caller to either `/{id}/attributes` or the
+> body form. Verified in prod: query-param on `/{id}` returns 400 +
+> redirect; query-param on `/{id}/attributes` returns 200 + persisted
+> change. **No more silent no-ops on this endpoint.**
 
-**Body form (correct):** send the fields to update as a JSON body.
+#### 3.2a `PATCH /{id}` — body-form merge-patch
+
+Send a JSON body with only the fields you want to change.
 
 ```json
-{
-  "percentage": 50.00
-}
+{ "percentage": 50.00 }
 ```
 
 ```json
-{
-  "effectiveTo": "2025-12-31",
-  "role": "Former Trustee"
-}
+{ "effectiveTo": "2025-12-31", "role": "Former Trustee" }
 ```
-
-**Response:**
-- **200 OK**: Relationship updated. Body: `EntityRelationshipDto`.
-- **404 Not Found**: id does not exist OR is hidden by tenant scoping (see Rule on tenant-scope asymmetry under DELETE below).
-
-**⚠️ WARNING — Query-param form silently no-ops (2026-04-29 cleanup execution).**
-The OpenAPI spec at lines 27350-27521 documents a query-param form
-`PATCH /api/v1/entity-relationship/{id}?percentage=N`. The Podolsky
-cleanup confirmed: this form returns **HTTP 200** with the unchanged
-`EntityRelationshipDto` body (no error, no warning) but does NOT persist
-the change. A subsequent `GET /api/v1/entity-relationship/{id}` shows
-the original percentage. The body form (above) DOES persist. A backend
-ticket is queued; until it lands, **always use the body form** for
-percentage and any other field update.
-
-**Side-by-side**:
 
 ```bash
-# ✅ CORRECT — body form persists
 curl -X PATCH "$BASE/api/v1/entity-relationship/$REL_ID" \
   -H "Authorization: Bearer $JWT" \
   -H "Content-Type: application/json" \
   -d '{"percentage": 50}'
-
-# ❌ WRONG — query-param form silently no-ops despite HTTP 200
-curl -X PATCH "$BASE/api/v1/entity-relationship/$REL_ID?percentage=50" \
-  -H "Authorization: Bearer $JWT"
-# Response: 200 OK + EntityRelationshipDto, but percentage unchanged
 ```
 
-This applies to ALL fields, not just `percentage` — the query-param form
-is documented across multiple fields in the spec but the body form is
-the only one that persists today.
+**Response:**
+- **200 OK**: Relationship updated. Body: full `EntityRelationshipDto`.
+- **400 Bad Request** with title `Query params [...] are not accepted on PATCH /{id}`: caller passed query params to this endpoint. Error body redirects to `/{id}/attributes`.
+- **400 Bad Request** with title `Entity not found` (`error.idnotfound`): merge-patch lookup did not find the entity. Possible reasons: id genuinely missing, OR caller's tenant scope cannot resolve an entity that exists in another tenant. Cross-tenant body-form PATCH is more strictly scoped than the bespoke query-param handler — if the caller is operating cross-tenant, **prefer 3.2b `/attributes` form** below (it inherited the broader tolerance).
+
+#### 3.2b `PATCH /{id}/attributes` — query-param form (canonical post-PLT-73)
+
+Pass field updates as query params. Body is optional. This is the **canonical query-param path** introduced by the PLT-73 fix — the original `?percentage=N` recipe in older runbooks should be moved to this path.
+
+```bash
+# Both work identically post-PLT-73:
+curl -X PATCH "$BASE/api/v1/entity-relationship/$REL_ID/attributes?percentage=50" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" -d '{}'
+
+curl -X PATCH "$BASE/api/v1/entity-relationship/$REL_ID/attributes?percentage=50" \
+  -H "Authorization: Bearer $JWT"
+```
+
+**Supported query params** (per the bespoke handler's signature, unchanged across the PLT-73 move):
+- `percentage` (BigDecimal)
+- `role` (String)
+- `isPrimary` (Boolean)
+- additional fields per OpenAPI spec — same set the original `?percentage=N` form supported.
+
+**Response:**
+- **200 OK**: full updated `EntityRelationshipDto`.
+- Triggers the OWNERSHIP-sum guard (`EntityRelationshipService.guardOwnershipSum`) and emits per-field `Updating X: old → new` log lines (audit trail richer than 3.2a's merge-patch path).
+
+#### When to use which
+
+| Use case | Endpoint |
+|---|---|
+| Single-field correction (percentage, role, isPrimary) | `/attributes` (3.2b) |
+| Multi-field merge-patch with a JSON DTO | `/{id}` (3.2a) |
+| Cross-tenant operations (caller's tenant ≠ edge's tenant) | Prefer `/attributes` (3.2b) — broader scope inherited from the bespoke handler |
+| Need rich `Updating X: old → new` log emission for audit forensics | `/attributes` (3.2b) |
+
+#### Pre-PLT-73 historical context (for readers of older runbooks)
+
+If you encounter an older runbook (including the one in `Discovery/Podolsky Family/altitude_review/CLEANUP_2026-04-29.md`) that says "PATCH `?percentage=N` query-param form silently no-ops; use body form only" — that was the pre-2026-04-29 behavior. The PLT-73 fix preserves both forms as valid but on different paths. When migrating recipes: replace `PATCH /{id}?percentage=N` with `PATCH /{id}/attributes?percentage=N`.
 
 ### 3.3 DELETE /api/v1/entity-relationship/{id}
 
