@@ -1321,7 +1321,7 @@ into one of four buckets that map directly to the `classification` field of
 | (b) | **orphan_since_prior_run** | found AND NOT in current universe | `orphan` (NOT stale in the deletion sense — write under a separate `orphans[]` key for Phase 6 OWNERSHIP wiring) | re-wire via Phase 6 OWNERSHIP edges |
 | (c) | **soft_deleted** | returns row with `deleted: true` only when `?includeDeleted=true&scope=ALL_TENANTS` | `soft_deleted` | record in `run_state.softDeletedAwaitingHardDelete[]` per Rule 66; fleet aggregator schedules admin hard-delete |
 | (d) | **hard_deleted** | 404 even with `?scope=ALL_TENANTS&includeDeleted=true` | `hard_deleted` | remove the UUID from `run_state.entities.*` so the next run does not retry the lookup |
-| (e) | **fk_orphan** (TangibleAsset only) | found via direct GET, but both `individualId IS NULL` AND `legalEntityId IS NULL`, regardless of `parentHouseholdId` | `fk_orphan` (write under `fk_orphans[]` key — see Rule 79) | Phase 6 attempts to populate missing FK from source docs (deed/title/registration); on ambiguity, emit Q-blocker |
+| (e) | **fk_orphan** (TangibleAsset, AccountFinancial, Liability — R-W7 expansion) | found via direct GET, but both `individualId IS NULL` AND `legalEntityId IS NULL`, regardless of `parentHouseholdId` | `fk_orphan` (write under `fk_orphans[]` key — see Rule 79) | Backend save-hook backfills on next write that touches the row (PLT-71 forward-only fix). For untouched legacy rows, escalate to RM/ops for one-shot backfill. Source-doc population only needed if no natural write would touch the row. |
 
 If the lookup result is ambiguous (e.g. transient 5xx, network timeout, scope
 mismatch the skill cannot disambiguate), classify as `unknown` and surface in the
@@ -1349,7 +1349,7 @@ Schema — one entry per UUID, bucketed by classification:
 
 - **`stale_uuids[]`** — buckets (c) `soft_deleted` and (d) `hard_deleted`
 - **`orphans[]`** — bucket (b) `orphan`
-- **`fk_orphans[]`** — bucket (e) `fk_orphan` (Rule 79; TangibleAsset only)
+- **`fk_orphans[]`** — bucket (e) `fk_orphan` (Rule 79; TangibleAsset, AccountFinancial, Liability per R-W7)
 - **`details[]`** — bucket (a) `live` audit trail (NEW; see Rule 69 amendment).
   Required even on an all-clean rerun where `stale_uuids[]`, `orphans[]`, and
   `fk_orphans[]` are all empty. Without it, an empty `stale_prior_uuids.json`
@@ -2636,6 +2636,41 @@ curl -X PATCH "$API/api/v1/entity-relationship/$OLD_ID" \
   -d '{"effectiveTo":"2025-07-08"}'
 # then POST new relationships with effectiveFrom: "2025-07-08"
 ```
+
+#### Rule 41 atomic retire-and-replace (R-W7 amendment, Emmett completion)
+
+**Retire-and-replace must be a single atomic Phase-6 operation, not split
+across runs.** When Phase 6 plans both (a) creating new OWNERSHIP edges and
+(b) retiring old superseded edges on the same target entity, partial-push
+state is dangerous: shipping only the create-half leaves the target with
+both old and new edges active, which trips Rule 80's OWNERSHIP-sum
+violation as a hindsight error.
+
+Emmett R-W7 found this empirically: between 2026-04-25 and 2026-04-29, an
+agent shipped 82 of 92 planned relationships including new child-trust
+edges on Casa Rincon, Lot 72, RMP, and RMM, but the corresponding "retire
+Dan@100% legacy" edges on those same LEs were left for "next session" and
+never executed. Result: 4 LEs with sum=200% OWNERSHIP that Rule 80 now
+flags as violations of unclear provenance.
+
+**Required discipline**:
+
+1. When `phase6_plan` includes any retire-and-replace pair, both halves
+   MUST be in the same Phase 6 push, OR the entry MUST be skipped
+   entirely until the retire-half can run.
+2. If a partial push is unavoidable (e.g., Q-blockers gate the retire
+   side but not the create side), the create-half MUST be deferred too —
+   never ship the new edge while the old edge is still live.
+3. `run_state.json` MUST mark partial-push state explicitly under a
+   `phase6_partial_pairs[]` key with the unfinished pair's UUIDs so the
+   next session completes them before any new work.
+4. Phase 5 review banner MUST surface partial-pair risk: any planned
+   create whose corresponding retire is gated on a Q-blocker is flagged
+   as `RETIRE_GATED — DO NOT SHIP CREATE-HALF YET`.
+
+This generalizes Rule 41 (role replacement) and Rule 60 (visibility-only
+revocable trust edges): atomicity of retire-and-replace pairs is a
+Phase-6 invariant, not a per-rule concern.
 
 ### Step 4.4: Extract and validate relationships
 
@@ -8552,23 +8587,35 @@ pair (existing, newly-created, or null-coverage-deferred), required even
 when empty. Discovered on the Comolli rerun where two real-property TAs had
 `isInsured: false` despite each carrying a 1:1 Chubb HOMEOWNERS policy.
 
-### Step 1.5c: Detect FK_ORPHAN TangibleAssets (Rule 79)
+### Step 1.5c: Detect FK_ORPHAN entities (Rule 79)
 
-> **✅ Backend fix shipped 2026-04-29 — PLT-71 RESOLVED.** The backend
-> now retroactively backfills `parentHouseholdId` (and the relevant
-> graph-derived FK columns) on existing FK_ORPHAN rows on the next write
-> that touches the row, and rejects new writes that would create a fresh
-> FK_ORPHAN. The previously-documented Phase 6 workaround ("attempts to
-> populate missing FK from source documents") is **no longer required for
-> remediation** — the backend self-heals on next write. **Rule 79's
-> purpose narrows from detection-plus-remediation to detection-only**:
-> the rule remains valuable as a Phase 1.5 audit step (catches legacy
-> rows still in the FK_ORPHAN state, surfaces them in
-> `stale_prior_uuids.json` for fleet-aggregator visibility), but Phase 6
-> no longer needs to chase deeds/titles/registrations to populate FKs
-> manually. The first OWNERSHIP edge POST or PATCH that touches the row
-> triggers the backend backfill. Cross-reference the analogous PLT-67 /
-> PLT-68 fix markers in commit e523c0e (PR #30).
+> **✅ Backend fix shipped 2026-04-29 — PLT-71 FORWARD-ONLY FIX**, legacy
+> retrofit pending. The save-hook now backfills graph-derived FK columns
+> on **new POSTs and on PATCHes that touch the row**, but **does NOT
+> retroactively heal pre-existing FK_ORPHAN rows on its own**. Empirical
+> evidence (R-W7, 2026-04-29): Podolsky 5/5 sampled TAs, Hugret-Johnston
+> 1/1 TA, Cummings 3/3 TAs + 7/7 AccountFinancials + 1 Liability all
+> still FK_ORPHAN despite the deploy. See PLT-71 comment for the full
+> sample.
+>
+> **Implication for Rule 79**: detection retains full value (catches
+> the legacy rows that the forward-only fix doesn't heal), but Phase 6
+> remediation falls into one of two paths:
+>
+> 1. If a write naturally touches the row (e.g., new OWNERSHIP edge,
+>    field PATCH), the save-hook backfills as a side effect — Phase 6
+>    can rely on this for in-flight changes.
+> 2. For pre-existing rows that aren't being touched by any planned
+>    write, **the backend doesn't self-heal**. Direct PATCH on FK
+>    columns returns HTTP 400 (Rule 75 R-W3 amendment). Self-service
+>    cleanup requires either a one-shot backend data migration
+>    (recommended, tracked on PLT-71) or laborious OWNERSHIP-edge churn
+>    (delete + re-POST per row to retrigger the save-hook).
+>
+> **Scope expansion (R-W7)**: PLT-71 was originally scoped to TangibleAsset.
+> Cummings R-W7 found the same FK-NULL-with-OWNERSHIP-edge-intact pattern on
+> AccountFinancial (7/7) and Liability (1) too. Rule 79 detection now
+> covers any entity with FK + edge-graph design, not just TAs.
 
 The Rule 69 prior-UUID lookup pass classifies entities into `live`, `orphan`,
 `soft_deleted`, and `hard_deleted` buckets — but the Comolli rerun surfaced a
@@ -8615,13 +8662,26 @@ registration); on ambiguity (joint tenants where the IND vs LE attribution
 isn't yet decided) emit a Q-blocker rather than guess. Discovered on the
 Comolli rerun where two real-property TAs ($25M + $5M) had both FKs NULL
 despite a populated `parentHouseholdId`. **Post-PLT-71 (shipped
-2026-04-29)**: the backend now retroactively backfills the missing FK
-columns on the next write that touches the row, so Phase 6 no longer
-needs to chase deeds/titles for remediation — the rule's purpose narrows
-to detection/audit. The first OWNERSHIP edge POST or PATCH triggers the
-backend backfill; the agent SHOULD still log to `fk_orphans[]` for
-fleet-aggregator visibility, but the workaround "Phase 6 attempts to
-populate missing FK from source docs" is de-emphasized and now optional.
+2026-04-29) is forward-only**: new POSTs and PATCHes-that-touch-the-row
+trigger backfill, but legacy FK_ORPHAN rows that no write touches stay
+orphaned indefinitely. R-W7 evidence: Podolsky 5/5 TAs, Hugret-Johnston
+1/1 TA, Cummings 3/3 TAs + 7/7 AccountFinancials + 1 Liability all still
+FK_ORPHAN post-deploy.
+
+**Scope expansion (R-W7)**: detection now covers TangibleAsset,
+AccountFinancial, AND Liability (Cummings finding) — any entity with
+FK + edge-graph design. The classification rule for `fk_orphans[]` is:
+direct GET returns 200 AND `individualId IS NULL` AND
+`legalEntityId IS NULL` (regardless of `parentHouseholdId`),
+**applied across all three entity types**.
+
+The agent SHOULD still log to `fk_orphans[]` for fleet-aggregator
+visibility. Phase 6 remediation: relies on the save-hook for any row
+that naturally gets touched by a planned write (preferred — zero
+extra work). For untouched legacy rows, escalate to RM/ops for the
+one-shot backend backfill job tracked on PLT-71. The Phase-6
+"populate missing FK from source documents" workaround is now optional
+and only useful if no natural write would otherwise touch the row.
 
 ### Step 3.7: OWNERSHIP percentage sum check (Rule 80)
 
