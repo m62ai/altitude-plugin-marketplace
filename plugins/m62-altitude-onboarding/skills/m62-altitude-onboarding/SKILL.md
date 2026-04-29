@@ -114,6 +114,31 @@ work. Always set `effectiveFrom` correctly (or OMIT it) AT CREATION time. For SP
 the marriage date is unknown, omit `effectiveFrom` at POST time rather than defaulting to
 "today".
 
+**Invariant — temporal ordering (R-W8 amendment, Comolli rerun 2026-04-29)**:
+`effectiveFrom <= effectiveTo` MUST hold on every SPOUSE/MARRIAGE-related
+edge before POST. Comolli's R-W8 audit found a SPOUSE edge with
+`effectiveFrom=2026-04-20` (data-entry date) and `effectiveTo=2026-01-29`
+(decree date) — `effectiveTo < effectiveFrom`, an inverted temporal pair.
+This happens when the agent uses today's date as the marriage date instead
+of OMITTING `effectiveFrom` per the rule above.
+
+**Pre-POST check** the agent MUST run on any SPOUSE/MARRIAGE/PARTNER edge:
+
+```python
+if effective_from and effective_to and effective_from > effective_to:
+    raise ValueError(
+        f"SPOUSE edge has effectiveFrom={effective_from} > effectiveTo={effective_to}; "
+        "marriage date must precede decree date. If marriage date is unknown, "
+        "OMIT effectiveFrom at POST time."
+    )
+```
+
+If the inverted edge already exists in production (per Comolli), the
+remediation is `PATCH /entity-relationship/{id}/attributes` to clear
+`effectiveFrom` (best-effort if Spring merge-patch ignores it) OR
+hard-delete + re-POST with the corrected ordering — preserve the audit
+trail by setting the correct dates rather than null-ing.
+
 ## Always create PARENT/CHILD edges for household children
 
 The Household→Individual OWNERSHIP relationship (skill default) establishes MEMBERSHIP but
@@ -5978,6 +6003,83 @@ it landed under.
 > `supersededBy` (Pattern B). Do NOT delete the live docs and do NOT
 > re-upload the source files — duplicate-document risk is significant.
 
+#### Rule 76 entity-rotation analog (R-W8 amendment, Cummings rerun 2026-04-29)
+
+Rule 76 was originally written to handle **document UUID rotation** — when
+re-uploaded source files land under a new UUID and the prior UUID 404s.
+The same problem shape occurs at the **entity level**: when an entity's
+UUID rotates (typically because the prior record was hard-deleted and
+re-created, or because a backfill/reconciliation pass re-keyed it), any
+inbound relationship edges pointing at the old UUID become orphaned. The
+new UUID has no inbound edges; the old UUID 404s; the relationships exist
+only as ghost edges referencing a non-existent entity.
+
+Cummings R-W8 found a canonical case: Contact `Bryn Mawr Trust Company of
+Delaware` rotated from `f66b8eb2-...` (now 404) to `df2e635a-...` (live).
+Two prior TRUSTEE edges (one each from Spousal Trust and 2026 Irrevocable
+Trust) referenced the old UUID and were never migrated. The new UUID has
+0 inbound edges; the trusts now have no recorded TRUSTEE Contact in their
+graph traversal even though the Contact still exists.
+
+**Detection**: when Rule 69's prior-UUID lookup pass finds an entity's
+UUID hard-deleted (404 even with `?scope=ALL_TENANTS`) AND a same-name
+or same-email entity exists under a new UUID, classify the rotation in
+`run_state.entityRotations[]` and check whether inbound edges from the
+old UUID need migration.
+
+**Migration pattern** (Pattern A — preferred, mirrors doc-rotation
+Pattern A):
+
+```python
+# entity_rotation_migrate.py
+old_uuid = "f66b8eb2-..."
+new_uuid = "df2e635a-..."
+new_type = "CONTACT"
+
+# 1. Enumerate edges that referenced the old UUID. Cannot use the standard
+#    /to/{type}/{id}/active because the old UUID is hard-deleted (returns
+#    404 on /to). The edges live in entity_relationship rows that survive
+#    target hard-delete; they need to be discovered via run_state history
+#    or a backend admin query.
+prior_run_edges = [
+    e for e in run_state["relationships"]["created"]
+    if e["targetEntityId"] == old_uuid or e["sourceEntityId"] == old_uuid
+]
+
+# 2. For each prior edge, POST a new edge against the rotated UUID using
+#    /entity-relationship POST with the same shape but updated target/source.
+#    Apply Rule 75 verification.
+for e in prior_run_edges:
+    new_edge = dict(e)
+    if e["targetEntityId"] == old_uuid:
+        new_edge["targetEntityId"] = new_uuid
+        new_edge["targetEntityType"] = new_type
+    if e["sourceEntityId"] == old_uuid:
+        new_edge["sourceEntityId"] = new_uuid
+        new_edge["sourceEntityType"] = new_type
+    api.post("/api/v1/entity-relationship", json=new_edge)
+    # Rule 75 verify
+
+# 3. Rewrite run_state references: replace old_uuid with new_uuid in
+#    entityRotations[], relationships, and any cached UUID list.
+```
+
+**Open question (R-W8 anomaly)**: when a Contact UUID rotates, did the
+prior edges actually survive? The Bryn Mawr case suggests they did NOT —
+the edges may have been hard-deleted alongside the entity. This is a
+backend behavior question worth verifying (with a known rotation pair):
+do edges to/from a hard-deleted entity get cascaded-deleted, soft-deleted,
+or left orphaned? The migration pattern above assumes "left orphaned and
+visible via run_state history." If the edges were also cascaded-deleted,
+then Pattern A is "POST fresh edges from the run_state plan, no migration
+needed" — same outcome but framed as creation rather than re-targeting.
+
+Cross-reference: Rule 76 (doc rotation) and Rule 76 entity-rotation
+analog are siblings. Rule 76 prevents `run_state` drift on doc UUID
+rotation; the entity-rotation analog prevents inbound edge orphaning on
+entity UUID rotation. Both share the principle: rotation is a UUID
+rewrite, not a delete-then-recreate.
+
 #### Rule 76 — Rewrite legacy run_state on doc re-upload — preserve UUID-to-source linkage
 
 When Phase 7 re-uploads a document that already has a prior
@@ -6989,6 +7091,71 @@ for a reference example (RM handoff format).
     fire on overlapping but distinct error classes: Rule 53 strengthening
     catches firm-as-personName at extraction; Rule 85 catches
     direction inversion at relationship POST.
+
+    ### Rule 53 strengthening — advisor-firm-misattribution on Contacts (R-W8 amendment, fleet-wide)
+
+    R-W8 clean-pass found a recurring pattern across **8 families**
+    (Lim Q16, Tusk Q16, McIntosh × 6 Contacts, Ryan × 6 Contacts, Chang
+    via Mary Cheng's Verita-stamped record, Cummings via Bryn Mawr Trust
+    Company, Hugret-Johnston via Jones/Zafari Group, Rohlen × 5 firms):
+    every external Contact (advisor, attorney, accountant, trustee, auditor)
+    has `firmName="Verita Strategic Wealth Partners"` even though the actual
+    employer is a different firm — preserved correctly in the `biography`
+    field but not extracted into `firmName`.
+
+    Root cause: Phase 4 contact extraction sets `firmName` to the engaging
+    advisory firm (the household's advisor, e.g. Verita) as a default when
+    the source document doesn't explicitly state the Contact's employer.
+    But Verita is the firm doing the work for this household — it is NOT
+    the employer of the household's external accountant, attorney,
+    insurance broker, or trustee Contact. The Contact's true employer
+    (Loeb & Loeb LLP for an attorney, Realize CPA for an accountant,
+    Hanson Bridgett for outside counsel, etc.) is what should populate
+    `firmName`.
+
+    **Pre-write validation rule** the agent MUST run on Phase 6 Contact
+    POST when role-type ∈ {`ADVISOR`, `ATTORNEY`, `ACCOUNTANT`, `TRUSTEE`,
+    `SUCCESSOR_TRUSTEE`, `AUDITOR`}:
+
+    ```python
+    VERITA_ADVISOR_FIRM_CONSTANT = "Verita Strategic Wealth Partners"
+
+    def validate_contact_firmname(contact_dto, role):
+        if role not in {"ADVISOR", "ATTORNEY", "ACCOUNTANT", "TRUSTEE",
+                        "SUCCESSOR_TRUSTEE", "AUDITOR"}:
+            return  # other roles can have any firmName
+        firm = contact_dto.get("firmName")
+        if firm == VERITA_ADVISOR_FIRM_CONSTANT:
+            raise ValueError(
+                f"Contact firmName cannot default to '{VERITA_ADVISOR_FIRM_CONSTANT}' "
+                f"for {role} role — that's THIS household's advisor, not the "
+                f"Contact's employer. Extract the true employer from source docs "
+                f"(typically biography, signature block, or letterhead). If unknown, "
+                f"set firmName=None and emit a Q-blocker requesting RM input."
+            )
+    ```
+
+    The intent is **never default** to the advisory firm constant for
+    role-type Contacts. Either extract the true employer from source
+    documents, or leave `firmName=None` and emit a Q-blocker.
+    `biography` may contain hints (e.g., "Adam Levine's accountant at
+    Frank, Rimerman + Co. LLP") that the parser should mine before
+    falling through.
+
+    **Corollary — firm contact info masquerading as personal contact**:
+    Emmett R-W8 found Dan A. Emmett's `email=Investments@RinconAdvisors.com`
+    on the Individual record. This is a family-office shared mailbox, not
+    the individual's personal email. Same pattern: Phase 4 set the
+    Contact/Individual's email to a firm-controlled address because the
+    source document signed by that address. The agent SHOULD distinguish
+    individual identity contact info from firm-mailbox contact info — a
+    `*@<advisorFirm>.com` or `Investments@*` pattern on an Individual's
+    `email` field is a red flag.
+
+    Backend ticket TBD if Phase 6 Contact POST should validate
+    `firmName != advisorFirm` server-side as a guard against this whole
+    class of error. R-W8 surfaced 25+ instances; cleanup is RM-led
+    (each Contact's `firmName` rewrite needs source-doc verification).
 
     ### What does NOT count as a Rule 60 gap — external fund vehicle exception
 
@@ -8566,6 +8733,40 @@ the Rule 28 summary fields (`primaryInsurancePolicyNumber`, `insuredValue`,
 record exists between them via `GET /api/v1/tangible-asset/{assetId}/insurance`,
 POSTing one through `POST /api/v1/tangible-asset/{assetId}/insurance` if not.
 Both writes apply Rule 75 verification (status assert, id assert, GET-back).
+
+**Idempotency guard (R-W8 amendment, Podolsky cleanup post-mortem
+2026-04-29).** Step 2 (`POST /tangible-asset/{id}/insurance`) MUST first
+GET the existing `/insurance` children and check whether a non-deleted
+child already exists with matching `policyNumber` (or matching
+InsurancePolicy `id` reference, depending on schema). If a match exists,
+mark `tai_link_action=VERIFIED_EXISTING` in `phase6_ta_insurance_links.jsonl`
+and SKIP the POST. Without this check, partial-pair re-runs (e.g., the
+2026-04-29 Podolsky cleanup that re-attempted Rule 78 link Step 2 after a
+prior session's Step 1 had already created the child via a different code
+path) produce duplicate active insurance children. Podolsky now has 6 dup
+rows from this exact mistake (`57651a0f`, `b0f3f94e`, `e3ef5a0f`,
+`79914e1f`, `2ace868d`, `44c4d09a`) plus 9 jewelry pairs that were
+incorrectly flagged DEFERRED when their existing children already
+satisfied the Rule 78 invariant.
+
+```python
+# Pseudocode for the idempotency check before Step 2:
+existing = api.get(f"/api/v1/tangible-asset/{ta_id}/insurance")
+already_linked = any(
+    not c.get("deleted") and c.get("policyNumber") == policy.policyNumber
+    for c in (existing if isinstance(existing, list) else existing.get("content", []))
+)
+if already_linked:
+    log_action("VERIFIED_EXISTING")
+    return  # SKIP the POST
+```
+
+The Auto-trio dups in Podolsky also illustrate a downstream cost: the
+re-POSTed children captured the *policy* liability limit ($500,000) as
+`coverageAmount` instead of the per-vehicle agreed value, so the dup rows
+are also semantically wrong. **First do no harm**: scan existing children
+before POSTing, even when the prior session's `phase6_ta_insurance_links.jsonl`
+suggests a link is missing.
 **Step 2 pre-check (R-W3 amendment, expanded by 2026-04-29 cleanup
 execution)**: before attempting the `TangibleAssetInsurance` POST,
 verify ALL THREE of `coverageAmount`, `effectiveDate`, AND
