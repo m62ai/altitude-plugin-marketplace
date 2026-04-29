@@ -163,16 +163,13 @@ X-API-Key: ak_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 **Required Fields:** `legalName`, `entityType`
 
-> ⚠️ **Vestigial null fields on read (PLT-75 — backend ticket open).** GET responses
-> on `/api/v1/legal-entity/{id}` and the list endpoints include two deprecated
-> fields that **always serialize as null**: `name` and `legalEntityType`. The active
-> fields are `displayName` / `legalName` (both populated with the entity's name)
-> and `entityType` (populated with the enum). When reading a LegalEntity in agent
-> code, **read `displayName` or `legalName` for the name and `entityType` for the
-> type — never `name` or `legalEntityType`** (those are leftover from a DTO
-> migration and will return null even on correctly-populated entities). Discovered
-> on Cummings R-W7 verification + Emmett audit underreporting; reproduced 2026-04-29
-> on prod via curl. Fix tracked on PLT-75.
+> ℹ️ **Field naming note.** When reading a LegalEntity, use `legalName`
+> (or `displayName`) for the name and `entityType` for the type. Earlier
+> documentation referenced `name` and `legalEntityType`; **those fields
+> do not exist on the DTO** (PLT-75 retraction, 2026-04-29 — original
+> ticket was a field-existence-vs-nullness false positive; `dict.get('name')`
+> returned None for a missing key, misread as "vestigial null field").
+> The DTO contract is correctly migrated.
 
 **Writable Fields:**
 
@@ -285,14 +282,6 @@ X-API-Key: ak_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 **Description:** Investment account (brokerage, retirement, etc.) holding securities and cash.
 
 **Required Fields:** `name`, `accountCategory`, `subCategory`, `currencyCode`
-
-> ℹ️ **Minor vestigial field on read** (related to PLT-75): the `displayName` field
-> is exposed on AccountFinancial DTO responses but consistently serializes as null
-> while `name` carries the populated value. Opposite direction from LegalEntity
-> (where `name` is null and `displayName` is populated). For AccountFinancial,
-> read `name`. PLT-75 acceptance criteria call for AccountFinancial DTO to be
-> audited for this inverse pattern; until then, the agent should treat `displayName`
-> as a deprecated read field on this entity.
 
 **Writable Fields:**
 
