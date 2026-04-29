@@ -4425,49 +4425,187 @@ for that entity type, fall back to a direct field check on the GET-by-id respons
 (`individualId != null OR legalEntityId != null OR householdId != null`). Only flag
 `fk_path_orphan` when the row demonstrably has all three FK columns null.
 
-#### FK-path remediation — PATCH-field semantics asymmetry (R-W3 amendment, Linear PLT-68 #7)
+#### FK-path remediation — FK fields are graph-derived (R-W3 amendment, Linear PLT-68 #7)
 
-McIntosh R-W3 confirmed Rule 75's FK-path verification was correct in concept,
-but the **remediation** previously implied here ("retry the create with the FK
-fields explicitly set — `individualId` / `legalEntityId` / `householdId`
-populated alongside the OWNERSHIP edge") is **wrong on TangibleAsset and
-InsurancePolicy**. PATCHing those FK fields directly returns 200 OK and
-silently drops the field — filed as **Linear PLT-68 bug #7**. The same field
-name (`parentHouseholdId`) has different semantics across entity types:
+> **✅ Backend fix shipped 2026-04-29 — PR #246 (Linear PLT-68 bug #7 RESOLVED).**
+> PATCH attempts on FK columns (`individualId`, `legalEntityId`,
+> `householdId`) AND on `parentHouseholdId` for TangibleAsset,
+> InsurancePolicy, AccountFinancial, and Liability now return HTTP **400**
+> with a structured envelope: `{"message": "Field 'individualId' cannot be
+> set via PATCH on this resource. Owner-asset linkage is derived from
+> entity_relationship rows. Use POST /api/v1/entity-relationship with
+> relationshipType=OWNERSHIP (or HOUSEHOLD_MEMBERSHIP for individuals) to
+> mutate ownership."}` (the field name varies; the guidance is uniform).
+> The prior R-W3 workaround that PATCHed `parentHouseholdId` directly on
+> TA / Insurance / Liability / AccountFinancial is **OBSOLETE** — that
+> path now returns 400, not 200-with-silent-drop. The canonical
+> remediation is an OWNERSHIP edge POST, with the
+> `propagateParentHousehold` save-hook populating the FK columns
+> automatically. The "FK fields are graph-derived" architectural pattern
+> is now uniform across **LegalEntity, TangibleAsset, InsurancePolicy,
+> Liability, AccountFinancial** (see the architectural note that follows
+> this section).
 
-| Entity type | `individualId` / `legalEntityId` / `householdId` via PATCH | `parentHouseholdId` via PATCH | Correct remediation |
+McIntosh R-W3 confirmed Rule 75's FK-path verification was correct in concept.
+The pre-PR #246 remediation that PATCHed `parentHouseholdId` directly on
+TA/Insurance/Liability/AccountFinancial worked only because the backend
+silently swallowed the field on those types but quietly applied it to
+`parentHouseholdId` (an asymmetry that no longer exists post-PR #246). The
+**current** remediation is uniform: POST the OWNERSHIP edge and let the
+save-hook stamp the FK column.
+
+| Entity type | FK fields via PATCH (post-PR #246) | `parentHouseholdId` via PATCH (post-PR #246) | Correct remediation |
 |---|---|---|---|
-| **TangibleAsset** | **READ-ONLY (silent drop, 200 returned)** | Settable (works) | `PATCH /tangible-asset/{id} {"parentHouseholdId": "{hh}"}` |
-| **InsurancePolicy** | **READ-ONLY (silent drop, 200 returned)** | Settable (works) | `PATCH /insurance-policy/{id} {"parentHouseholdId": "{hh}"}` |
-| **AccountFinancial** | **READ-ONLY (silent drop, 200 returned)** | Settable (works) | `PATCH /account-financial/{id} {"parentHouseholdId": "{hh}"}` |
-| **Liability** | **READ-ONLY (silent drop, 200 returned)** | Settable (works) | `PATCH /liability/{id} {"parentHouseholdId": "{hh}"}` |
-| **LegalEntity** | n/a | **DERIVED from OWNERSHIP graph (PATCH silently no-ops)** | POST a HOUSEHOLD→LE OWNERSHIP edge — `propagateParentHousehold` save-hook stamps the column on both 100% and 0% edges (0% case fixed by backend PR #244 / PLT-68 #5, deployed 2026-04-28). For irrevocable trusts use 0% per Rule 60; for revocable trusts use 100% per grantor per Rule 60 grantor amendment (PR #15) |
-| **Individual** | n/a | **DERIVED from OWNERSHIP graph (PATCH silently no-ops)** | POST a HOUSEHOLD→INDIVIDUAL OWNERSHIP edge per Rule 60 |
+| **TangibleAsset** | **400 with "use OWNERSHIP" pointer** | **400 with "use OWNERSHIP" pointer** | POST OWNERSHIP edge from rightful owner; save-hook stamps `parentHouseholdId` and FK columns. For ownership reassignment use `POST /api/v1/entity-relationship/transfer` (bi-temporal). |
+| **InsurancePolicy** | **400 with "use OWNERSHIP" pointer** | **400 with "use OWNERSHIP" pointer** | Same as TangibleAsset — POST OWNERSHIP edge; transfer endpoint for reassignment. |
+| **AccountFinancial** | **400 with "use OWNERSHIP" pointer** | **400 with "use OWNERSHIP" pointer** | Same as TangibleAsset — POST OWNERSHIP edge; transfer endpoint for reassignment. |
+| **Liability** | **400 with "use OWNERSHIP" pointer** | **400 with "use OWNERSHIP" pointer** | Same as TangibleAsset — POST OWNERSHIP edge; transfer endpoint for reassignment. |
+| **LegalEntity** | n/a | **DERIVED from OWNERSHIP graph (PATCH rejected)** | POST a HOUSEHOLD→LE OWNERSHIP edge — `propagateParentHousehold` save-hook stamps the column on both 100% and 0% edges (0% case fixed by backend PR #244 / PLT-68 #5, deployed 2026-04-28). For irrevocable trusts use 0% per Rule 60; for revocable trusts use 100% per grantor per Rule 60 grantor amendment (PR #15). |
+| **Individual** | n/a | **DERIVED from OWNERSHIP graph (PATCH rejected)** | POST a HOUSEHOLD→INDIVIDUAL OWNERSHIP edge (HOUSEHOLD_MEMBERSHIP also valid for member-only relationships) per Rule 60. |
 
-So when `fk_path_orphan` triggers on a TA / Insurance / Liability / AccountFinancial:
+So when `fk_path_orphan` triggers on **any** FK-bearing type (TA / Insurance /
+Liability / AccountFinancial) post-PR #246:
 
-1. **Do NOT** retry the create with `individualId` / `legalEntityId` /
-   `householdId` populated — those fields are silently dropped by PATCH on
-   these types, and PR #15 testing confirms the same is true on POST when
-   only those fields are sent without an OWNERSHIP edge.
-2. **Do** issue `PATCH /api/v1/{entity-type}/{id} {"parentHouseholdId":
-   "{hhId}"}` and apply Rule 75 verification to the PATCH (assert 200,
-   GET-back, confirm `parentHouseholdId` now equals `{hhId}`). The PATCH
-   200 + silent no-op caveat applies — re-fetch is mandatory.
-3. **Do** POST the appropriate OWNERSHIP edge alongside the PATCH so the
-   row is reachable through the canonical graph traversal, not just via
-   `parentHouseholdId` direct-column lookup.
+1. **Do NOT** retry the create or follow-up with PATCH on `individualId` /
+   `legalEntityId` / `householdId` / `parentHouseholdId` — backend now
+   rejects all of those with HTTP 400 + the structured "use OWNERSHIP"
+   pointer.
+2. **Do** POST the appropriate OWNERSHIP edge from the rightful owner
+   (Individual or LegalEntity) to the target asset:
+   `POST /api/v1/entity-relationship` with
+   `{"sourceEntityType": "INDIVIDUAL" | "LEGAL_ENTITY",
+   "sourceEntityId": "<owner UUID>",
+   "targetEntityType": "TANGIBLE_ASSET" | "INSURANCE_POLICY" |
+   "ACCOUNT_FINANCIAL" | "LIABILITY", "targetEntityId": "<asset UUID>",
+   "relationshipType": "OWNERSHIP", "percentage": 100, "role": "Owner"}`.
+   For Individuals to Households use
+   `relationshipType=HOUSEHOLD_MEMBERSHIP` (member-only) or
+   `OWNERSHIP` (with percentage) per Rule 60.
+3. **Apply Rule 75 verification** to the OWNERSHIP POST: assert 201,
+   capture the new edge `id`, GET-back the asset and confirm the FK
+   column (`individualId` or `legalEntityId`) AND `parentHouseholdId`
+   are now populated by the save-hook.
+4. **For legitimate ownership reassignment** (rightful owner changed —
+   e.g., death + estate distribution, gift, sale-to-trust), use
+   `POST /api/v1/entity-relationship/transfer` rather than a raw
+   OWNERSHIP POST. The transfer endpoint preserves bi-temporal history
+   (the `effectiveDate` request field, plus `effectiveFrom`/`effectiveTo`
+   on the resulting edges in the response, plus `existingRelationshipId`
+   / `percentageToTransfer` / `newOwnerId` / `newOwnerType` /
+   `newOwnerRole` on the request body — see api.json
+   `/api/v1/entity-relationship/transfer` for the full
+   `TransferOwnershipRequestDto` schema). This is the canonical
+   audit-trail-preserving path; do NOT delete + recreate edges.
 
 For LegalEntity FK_ORPHAN, the remediation is purely the OWNERSHIP edge POST.
-The visibility-edge save-hook now propagates `parentHouseholdId` automatically on
+The visibility-edge save-hook propagates `parentHouseholdId` automatically on
 0% OWNERSHIP edges as well as 100% — Linear PLT-68 #5 was resolved by backend
 PR #244 (deployed 2026-04-28); the prior PATCH workaround in Rule 60 is OBSOLETE.
 
-Cross-reference: **Linear PLT-68 #7** tracks the FK-field PATCH silent-drop
-bug. Once that lands, the FK-fields-via-PATCH path becomes valid and this
-remediation table can be simplified — but until then, route every FK_ORPHAN
-remediation through `parentHouseholdId` (for FK-bearing types) or through
-an OWNERSHIP edge POST (for derived-FK types like LegalEntity / Individual).
+The Rule 75 **FK-path queryability check** above still serves a useful
+purpose: it acts as a **detection** mechanism that catches FK_ORPHAN rows
+already in the data (legacy rows from pre-Rule-75 onboardings, rows
+whose OWNERSHIP edge was deleted out-of-band, rows created by an external
+sync that did not go through the graph). The **prevention** path is now
+baked into the API itself (any attempt to PATCH the FK or
+`parentHouseholdId` returns 400 with the helpful "use OWNERSHIP" pointer);
+the Rule 75 check no longer needs to backstop a silent-drop write.
+
+Cross-reference: **Linear PLT-68 #7** was resolved by backend **PR #246**
+(deployed 2026-04-29). If a regression resurfaces the symptom (PATCH on
+FK fields silently dropping rather than returning 400), file a follow-up
+Linear ticket citing PLT-68 #7 BEFORE re-applying the historical
+workaround below.
+
+#### Historical note — pre-PR #246 PATCH-parentHouseholdId workaround (OBSOLETE)
+
+> ⚠ **OBSOLETE — backend now rejects PATCH on FK and `parentHouseholdId`
+> fields with HTTP 400 + structured "use OWNERSHIP" pointer as of PR
+> #246 (2026-04-29).** The procedure below was mandatory between
+> McIntosh R-W3 (when the silent-drop bug was first caught) and PR #246
+> (when the field was made unambiguously read-only via PATCH with a
+> helpful 400 instead of a silent 200). Do NOT apply on new pushes.
+> Retained verbatim in case PLT-68 #7 regresses on a future deploy.
+
+Pre-PR #246 procedure: when `fk_path_orphan` triggered on a
+TA/Insurance/Liability/AccountFinancial, the agent issued
+`PATCH /api/v1/{entity-type}/{id} {"parentHouseholdId": "{hhId}"}` and
+applied Rule 75 verification to the PATCH (assert 200, GET-back, confirm
+`parentHouseholdId` now equals `{hhId}` — the "PATCH 200 + silent no-op"
+caveat called out in Rule 75 for derived fields). The agent ALSO POSTed
+the appropriate OWNERSHIP edge alongside the PATCH so the row was
+reachable through the canonical graph traversal, not just via
+`parentHouseholdId` direct-column lookup. Post-PR #246 the PATCH step is
+removed; only the OWNERSHIP edge POST remains, and the save-hook handles
+column population.
+
+```python
+# fk_orphan_remediation_legacy.py — OBSOLETE post-PR #246 (2026-04-29).
+# Retained for regression triage only; do NOT invoke on current pushes.
+# api.patch(f"/api/v1/tangible-asset/{ta_id}", json={"parentHouseholdId": hh_id})
+# api.post("/api/v1/entity-relationship", json={
+#     "sourceEntityType": "INDIVIDUAL", "sourceEntityId": owner_id,
+#     "targetEntityType": "TANGIBLE_ASSET", "targetEntityId": ta_id,
+#     "relationshipType": "OWNERSHIP", "percentage": 100, "role": "Owner",
+# })
+# # Then Rule 75 verification on both writes...
+```
+
+#### Architectural pattern — FK fields are graph-derived (PR #246, 2026-04-29)
+
+> **Single source of truth for ownership mutation.** Owner-asset linkage on
+> **LegalEntity, TangibleAsset, InsurancePolicy, Liability, and
+> AccountFinancial** is now exclusively mutated via the OWNERSHIP graph
+> (or `HOUSEHOLD_MEMBERSHIP` for Individual-to-Household member-only
+> attachment). The FK columns (`individualId`, `legalEntityId`,
+> `householdId`, `parentHouseholdId`) on these resources are **READ-ONLY
+> via PATCH**; backend rejects PATCH attempts with HTTP 400 and structured
+> guidance pointing to `POST /api/v1/entity-relationship` (or `/transfer`
+> for bi-temporal reassignment).
+
+This is the architectural consequence of the Linear PLT-68 #7 fix in PR
+#246 (deployed 2026-04-29). Previously the FK semantics were uneven:
+LegalEntity's `parentHouseholdId` was always graph-derived, but
+TA/Insurance/Liability/AccountFinancial's `parentHouseholdId` was
+directly settable via PATCH. PR #246 unified all five entity types under
+the graph-derived model so the skill, agents, and downstream consumers
+have one mental model for ownership mutation.
+
+**Implications for agents**:
+
+- **Never PATCH** FK fields (`individualId`, `legalEntityId`,
+  `householdId`) or `parentHouseholdId` on LegalEntity, TangibleAsset,
+  InsurancePolicy, Liability, or AccountFinancial. Backend rejects with
+  HTTP 400 + structured pointer to the OWNERSHIP edge POST path.
+- **To create ownership**: `POST /api/v1/entity-relationship` with
+  `relationshipType=OWNERSHIP` (asset linkage) or
+  `relationshipType=HOUSEHOLD_MEMBERSHIP` (Individual member-only,
+  no percentage). The `propagateParentHousehold` save-hook populates
+  the FK columns and `parentHouseholdId` on the target row
+  automatically.
+- **To change ownership**: use
+  `POST /api/v1/entity-relationship/transfer` — bi-temporal endpoint
+  that preserves audit trail of effective dates. Request schema (see
+  `TransferOwnershipRequestDto` in api.json): `existingRelationshipId`,
+  `newOwnerType`, `newOwnerId`, `percentageToTransfer`,
+  `effectiveDate`, optional `newOwnerRole` and `notes`. The endpoint
+  ends the prior edge with `effectiveTo = transferDate - 1` and
+  creates the new edge(s) with `effectiveFrom = transferDate`,
+  preserving the historical view (valuations as of dates before the
+  transfer correctly attribute to the prior owner).
+- **To detect existing FK_ORPHANs in legacy data**: Rule 75's FK-path
+  queryability check still works as a *detection* mechanism — the row
+  exists in the DB but has all three FK columns null because no
+  inbound OWNERSHIP edge was ever wired. Remediation is the same
+  graph-POST path described above.
+- **The skill must NOT carry payload templates that include FK or
+  `parentHouseholdId` fields in PATCH bodies for these entity types.**
+  Every Phase 6 PATCH payload should be scrubbed of those fields
+  before issuing the request, otherwise the entire PATCH will reject
+  with 400 (the field-rejection error halts the whole PATCH, not just
+  the offending field). If a PATCH body legitimately needs to update
+  other fields (e.g. notes, valuation, custodian), strip the FK /
+  `parentHouseholdId` keys first.
 
 #### Verification endpoint reference (R-W3 amendment)
 
@@ -6917,6 +7055,44 @@ for a reference example (RM handoff format).
     The same rule applies to LegalEntity's `parentHouseholdId` — derived from an inbound
     OWNERSHIP edge, not directly PATCHable.
 
+    ### TangibleAsset / InsurancePolicy / Liability — `parentHouseholdId` is now also graph-derived (PR #246 amendment, Linear PLT-68 #7)
+
+    > **✅ Backend fix shipped 2026-04-29 — PR #246 (Linear PLT-68 bug #7 RESOLVED).**
+    > Previously LegalEntity's `parentHouseholdId` was graph-derived (not
+    > PATCHable) but TangibleAsset, InsurancePolicy, Liability, and
+    > AccountFinancial allowed direct PATCH. PR #246 unifies the model:
+    > **all five FK-bearing entity types** now treat `parentHouseholdId`
+    > (and the per-owner FK columns `individualId` / `legalEntityId` /
+    > `householdId`) as graph-derived. PATCH attempts on these fields
+    > return HTTP 400 with a structured "use OWNERSHIP" pointer rather
+    > than the prior silent-drop or silent-apply behavior. The
+    > `propagateParentHousehold` save-hook fires uniformly across all
+    > five types when an inbound OWNERSHIP edge is POSTed, populating the
+    > FK and `parentHouseholdId` columns automatically.
+
+    **Implications for Phase 6 push agents handling TA / Insurance / Liability**:
+
+    - To attach a TangibleAsset / InsurancePolicy / Liability to a
+      household, POST the OWNERSHIP edge from the rightful owner
+      (Individual or LegalEntity) to the asset. The save-hook walks the
+      ownership chain and stamps `parentHouseholdId` on the asset.
+    - Do NOT include `parentHouseholdId`, `individualId`, or
+      `legalEntityId` in PATCH bodies on these entity types — the field
+      will reject the entire PATCH with 400. POST the OWNERSHIP edge
+      instead.
+    - For ownership reassignment (e.g., asset gifted from one family
+      member to another), use `POST /api/v1/entity-relationship/transfer`
+      — bi-temporal endpoint that preserves the historical view (see
+      Rule 75 architectural-pattern subsection for the full request
+      schema).
+
+    Cross-reference: this is the same "FK fields are graph-derived"
+    architectural pattern surfaced first in Rule 75 — applied uniformly
+    across LegalEntity, TangibleAsset, InsurancePolicy, Liability, and
+    AccountFinancial as of PR #246 (2026-04-29). See Rule 75's
+    "Architectural pattern — FK fields are graph-derived" subsection
+    for the full canonical write-path summary.
+
     **3. Soft-deleting an entity with active relationship edges is BLOCKED (409).**
     `DELETE /api/v1/legal-entity/{id}` (soft) returns `409 Entity In Use` if ANY
     non-deleted entity_relationship row references it, even if the referenced entities
@@ -7423,14 +7599,37 @@ for a reference example (RM handoff format).
     ```
 
     **⚠ Search-API quirk (discovered on Hnetinka rerun) — the `.equals` suffix
-    returns HTTP 500.** The suffix form `parentHouseholdId.equals={uuid}` returns
-    HTTP 500 `not joinable` on `/api/v1/individual/search` (and the same shape on
-    other entity `/search` endpoints). Only the no-suffix form
-    `parentHouseholdId={uuid}` works. The skill MUST NEVER emit `.equals` on
-    `parentHouseholdId`. The curl recipes above are the canonical no-suffix form
-    — copy them verbatim. If a future search helper auto-appends `.equals` for
-    UUID-typed columns by convention, override that behavior on
-    `parentHouseholdId` specifically.
+    returns HTTP 400 (was HTTP 500 pre-PR #246).**
+
+    > **✅ Backend fix shipped 2026-04-29 — PR #246 (Linear PLT-68 bug #1 RESOLVED).**
+    > The `.equals` suffix on `parentHouseholdId` (and other search columns)
+    > now returns HTTP **400** with a structured "unsupported filter suffix"
+    > envelope rather than the prior HTTP 500 `not joinable` stack-trace
+    > leak. The skill behavior is unchanged — `.equals` is still rejected
+    > and the skill MUST still emit the no-suffix form. The fix only
+    > corrects the failure mode (4xx client error vs 5xx server error) so
+    > the request looks like a client mistake rather than a backend bug in
+    > monitoring dashboards.
+
+    The suffix form `parentHouseholdId.equals={uuid}` returns HTTP 400 on
+    `/api/v1/individual/search` (and the same shape on other entity `/search`
+    endpoints). Only the no-suffix form `parentHouseholdId={uuid}` works. The
+    skill MUST NEVER emit `.equals` on `parentHouseholdId`. The curl recipes
+    above are the canonical no-suffix form — copy them verbatim. If a future
+    search helper auto-appends `.equals` for UUID-typed columns by convention,
+    override that behavior on `parentHouseholdId` specifically.
+
+    #### Historical note — pre-PR #246 failure mode (OBSOLETE)
+
+    > ⚠ **OBSOLETE — pre-PR #246 (2026-04-29) the `.equals` suffix returned
+    > HTTP 500 `not joinable` rather than HTTP 400. The skill behavior is
+    > the same in both eras (never emit `.equals`); this note is retained
+    > only so a Phase 6 push log showing a 500 on a `.equals`-suffixed
+    > query can be triaged as "pre-PR #246 run" rather than misread as a
+    > current backend incident.
+
+    Cross-reference: **PLT-68 #1** was resolved by backend **PR #246**
+    (deployed 2026-04-29).
 
     **Defense-in-depth: client-filter every result by `parentHouseholdId`.** Even with
     the backend filter, after every search call, verify each result's
@@ -7498,17 +7697,46 @@ for a reference example (RM handoff format).
     refresh or wait until the nightly job re-runs.
 
     **⚠ Search-API quirk on TangibleAsset (discovered on Hnetinka rerun) —
-    `parentHouseholdId` filter is silently ignored.**
-    `GET /api/v1/tangible-asset/search?parentHouseholdId={uuid}` returns
-    firm-wide results regardless of the filter (verified on Hnetinka rerun). The
-    backend accepts the parameter without error but does not apply it server-side.
-    The caller MUST therefore client-side filter every result by checking
-    `parentHouseholdId` on each returned record before using the count for the
-    Rule 68 rollup health check. Without the local filter, Rule 68 will under- or
-    over-count the household's TangibleAssets and produce a false "rollup
-    healthy / unhealthy" signal. Apply the same defense-in-depth client filter
-    described in Rule 67 — keep records whose `parentHouseholdId` equals the
-    current household OR is null, drop the rest.
+    `parentHouseholdId` filter is now honored (was silently ignored pre-PR #246).**
+
+    > **✅ Backend fix shipped 2026-04-29 — PR #246 (Linear PLT-68 bug #2 RESOLVED).**
+    > `GET /api/v1/tangible-asset/search?parentHouseholdId={uuid}` now applies
+    > the filter server-side and returns only TangibleAssets whose
+    > `parentHouseholdId` matches the supplied UUID (parity with the other
+    > `/search` endpoints). Verified on the post-deploy smoke test:
+    > server-side filter returned the household-scoped subset directly with
+    > no client-side compensation needed. **The client-side filter
+    > workaround below is OBSOLETE — do NOT apply it on new pushes.** Trust
+    > the server-side filter exactly like the Individual / LegalEntity /
+    > AccountFinancial / Liability / InsurancePolicy `/search` endpoints.
+
+    Current behavior (post-PR #246): the Rule 68 rollup health check can
+    rely on the server-returned count for `/tangible-asset/search?parentHouseholdId={hh_id}`
+    directly, the same way it does for the other entity types. The
+    defense-in-depth client filter from Rule 67 is still recommended as a
+    cheap consistency check, but it is no longer load-bearing for
+    TangibleAsset rollup correctness.
+
+    #### Historical note — pre-PR #246 client-side filter workaround (OBSOLETE)
+
+    > ⚠ **OBSOLETE — backend now honors `parentHouseholdId` on
+    > `/tangible-asset/search` as of PR #246 (2026-04-29).** The procedure
+    > below was mandatory between Hnetinka R-W2 (when the silent-ignore
+    > bug was first caught) and PR #246 (when it was fixed). Do NOT apply
+    > on new pushes. Retained verbatim in case PLT-68 #2 regresses on a
+    > future deploy.
+
+    Pre-PR #246 procedure: `GET /api/v1/tangible-asset/search?parentHouseholdId={uuid}`
+    returned firm-wide results regardless of the filter. The backend
+    accepted the parameter without error but did not apply it server-side.
+    The caller therefore had to client-side filter every result by
+    checking `parentHouseholdId` on each returned record before using the
+    count for the Rule 68 rollup health check. Without the local filter,
+    Rule 68 would under- or over-count the household's TangibleAssets and
+    produce a false "rollup healthy / unhealthy" signal. The same
+    defense-in-depth client filter described in Rule 67 was applied —
+    keep records whose `parentHouseholdId` equals the current household
+    OR is null, drop the rest.
 
 69. **Phase 1.5 — rerun "lookup by prior UUID" pass before re-traversing the graph.**
 
@@ -7545,21 +7773,52 @@ for a reference example (RM handoff format).
     pass would have flagged all 15 for Phase 6 OWNERSHIP wiring.
 
     **⚠ Permission quirk (discovered on Hnetinka rerun) — `?scope=ALL_TENANTS`
-    returns HTTP 403 for firm-admin API keys.** When the calling auth is a
-    firm-admin API key (`X-API-Key: ak_live_...`), `?scope=ALL_TENANTS` returns
-    HTTP 403 — only admin-JWT tokens (`ROLE_ADMIN_TENANT` or higher; see Rule 71)
-    can use this scope. The Rule 69 prior-UUID probe MUST therefore have an
-    explicit fallback branch:
+    returns HTTP 403 for firm-admin API keys.**
+
+    > **✅ Backend fix shipped 2026-04-29 — PR #246 (Linear PLT-68 bug #3 RESOLVED).**
+    > The 403 response body is now structured: `{"message": "scope=ALL_TENANTS
+    > requires ROLE_ADMIN; firm-admin keys must use scope=FIRM (default) or
+    > scope=TENANT with ROLE_ADMIN_TENANT", "code":
+    > "error.security.scope.allTenantsRequiresAdmin"}` rather than the
+    > prior empty-body / generic-403 shape that masked the cause. The
+    > fallback-on-403 logic below is **still correct** (the call still
+    > fails for firm-admin keys, the skill still falls back to plain GET),
+    > but agents can now detect the specific cause programmatically by
+    > inspecting the response body's `code` field
+    > (`error.security.scope.allTenantsRequiresAdmin`) or `message` text
+    > and surface a precise diagnostic in `lookup_failed_403` log entries
+    > rather than a generic "403 with empty body".
+
+    When the calling auth is a firm-admin API key (`X-API-Key: ak_live_...`),
+    `?scope=ALL_TENANTS` returns HTTP 403 — only admin-JWT tokens
+    (`ROLE_ADMIN_TENANT` or higher; see Rule 71) can use this scope. The Rule
+    69 prior-UUID probe MUST therefore have an explicit fallback branch:
 
     1. Try `GET /api/v1/{resource}/{id}?scope=ALL_TENANTS&includeDeleted=true` first.
-    2. On HTTP 403, fall back to plain `GET /api/v1/{resource}/{id}` (firm-tenant
-       scope only) — this still detects live + soft-deleted rows in the firm's
-       own tenant, which is the common case.
+    2. On HTTP 403, **inspect the response body**: a `code` of
+       `error.security.scope.allTenantsRequiresAdmin` confirms the cause is
+       the auth-scope mismatch (post-PR #246 path). Then fall back to plain
+       `GET /api/v1/{resource}/{id}` (firm-tenant scope only) — this still
+       detects live + soft-deleted rows in the firm's own tenant, which is
+       the common case. If the 403 body has a different `code` (e.g.
+       tenant-mismatch, deleted-resource), surface that distinct cause to
+       the diagnostic log instead of conflating it with the auth-scope
+       fallback path.
     3. If both calls fail with non-200 (and the second was not 404), log as
-       `lookup_failed_403` (or `lookup_failed_5xx`) — do NOT classify as
-       `404_genuinely_missing`, which would incorrectly flag the UUID for
+       `lookup_failed_403` (or `lookup_failed_5xx`) with the structured
+       `code` and `message` from the 403 body when present — do NOT classify
+       as `404_genuinely_missing`, which would incorrectly flag the UUID for
        removal from `run_state.entities.*`. A firm-admin run is the default
        posture for the skill, so this fallback is the steady-state path.
+
+    Pre-PR #246 the 403 response body was empty / generic, so step 2 had to
+    treat every 403 identically (always fall back to plain GET) without
+    distinguishing the auth-scope cause from any other 403 mode. Post-PR
+    #246 the structured `code` lets the agent record the precise cause
+    while keeping the fallback behavior unchanged.
+
+    Cross-reference: **PLT-68 #3** was resolved by backend **PR #246**
+    (deployed 2026-04-29).
 
 70. **Phase 5 must produce VALIDATED, READY-TO-POST payload bodies — not scope manifests.**
 
@@ -8214,16 +8473,36 @@ Common causes the rule tells the agent to enumerate in the Q-blocker:
   73 PATCH-in-place that didn't fully retire the prior edge, or by Phase 4.7
   role-replacement that double-counted a continuing owner.
 
-#### ⚠ Backend does NOT enforce — skill is the only line of defense (R-W2 amendment, Linear PLT-68 #6)
+#### Backend now enforces sum ≤ 100 — skill is defense-in-depth (R-W2 amendment, Linear PLT-68 #6)
 
-The backend accepts OWNERSHIP percentage sums above 100 silently — there is
-NO write-time constraint on the sum across edges sharing a target. Filed as
-**Linear PLT-68 bug #6**. The R-W2 rerun confirmed: Barnes' `Carrie + Phineas
-Barnes Trust` and `Capizzi Trust` both sit in production at OWNERSHIP sum =
-**200%** (each has two 100% OWNERSHIP edges from different sources), and the
-backend never raised an error on the second POST. The Phase 3.7 sum check
-defined in this rule is therefore the **only** line of defense against
-percentage-sum violations until PLT-68 #6 lands.
+> **✅ Backend fix shipped 2026-04-29 — PR #246 (Linear PLT-68 bug #6 RESOLVED).**
+> The backend now rejects OWNERSHIP POSTs and PATCHes that would push a
+> target's percentage sum above 100% (excluding the Rule 60 / Rule 80
+> exemptions for HOUSEHOLD-source visibility edges and revocable-trust
+> joint-grantor patterns, which the backend honors symmetrically with
+> the skill). The 400 envelope is structured: `{"message": "OWNERSHIP
+> percentages for target X would sum to 200%, exceeds 100% limit
+> (existing 100% + new 100% = 200%). Use POST
+> /api/v1/entity-relationship/transfer or PATCH existing edges to
+> reduce the total before adding more ownership."}`. The Phase 3.7
+> sum check defined in this rule is now **defense-in-depth alongside
+> backend enforcement**, NOT the only line of defense — but it remains
+> valuable for catching extraction-stage errors *before* they hit the
+> network, surfacing source-document conflicts to the reviewer in
+> Phase 5, and avoiding the round-trip cost of a 400 during Phase 6.
+
+Pre-PR #246, the backend accepted OWNERSHIP percentage sums above 100
+silently — there was NO write-time constraint on the sum across edges
+sharing a target. Filed as **Linear PLT-68 bug #6**. The R-W2 rerun
+confirmed: Barnes' `Carrie + Phineas Barnes Trust` and `Capizzi Trust`
+both sat in production at OWNERSHIP sum = **200%** (each had two 100%
+OWNERSHIP edges from different sources), and the backend never raised
+an error on the second POST. Post-PR #246, those same writes would have
+been rejected at the second POST with the structured 400 above. The
+existing 200%-sum rows from R-W2 are grandfathered in (legacy data is
+not back-validated); they remain detectable retrospectively via the
+Phase 3.7 sum check, with the reviewer choosing remediation per the
+Q-blocker.
 
 When Phase 3.7 detects an `OWNERSHIP_SUM_VIOLATION`, the agent MUST:
 
@@ -8242,12 +8521,28 @@ When Phase 3.7 detects an `OWNERSHIP_SUM_VIOLATION`, the agent MUST:
    trust agreements, K-1s, joint-tenancy registrations) to determine the
    correct percentages. If the source documents are not present in the
    household folder, recommend requesting them from the client/advisor.
+5. **For legitimate ownership redistribution** (one owner's share moves to
+   another — e.g., death + estate distribution, gift, partial sale to a
+   trust), recommend using `POST /api/v1/entity-relationship/transfer`
+   rather than raw OWNERSHIP POST + DELETE. The transfer endpoint is
+   bi-temporal: it ends the prior edge with `effectiveTo = transferDate
+   - 1`, creates the new edge(s) with `effectiveFrom = transferDate`,
+   and preserves the historical valuation view (asset valuations as of
+   dates *before* the transfer correctly attribute to the prior owner).
+   Request schema is `TransferOwnershipRequestDto` in api.json:
+   `existingRelationshipId`, `newOwnerType`, `newOwnerId`,
+   `percentageToTransfer`, `effectiveDate`, optional `newOwnerRole` and
+   `notes`. Using `/transfer` is strictly better than raw POST + DELETE
+   because it (a) cannot exceed 100% (validated by the same constraint
+   as raw POST), (b) preserves the audit trail of the prior owner's
+   tenure, and (c) does not require ROLE_ADMIN for soft-deletion of
+   the prior edge.
 
-Cross-reference: when **Linear PLT-68 #6** lands (backend write-time
-enforcement of OWNERSHIP percentage sum constraints), this skill rule
-downgrades from "only line of defense" to "defense-in-depth pre-write check"
-— still valuable for catching extraction-stage errors before they hit the
-network, but no longer load-bearing for production data integrity.
+Cross-reference: **Linear PLT-68 #6** was resolved by backend **PR #246**
+(deployed 2026-04-29). Backend enforcement at write-time is now the
+load-bearing constraint for production data integrity; the skill's
+Phase 3.7 check is the upstream extraction-stage defense and the
+Phase 5 reviewer-visibility surface.
 
 #### False-positive exemptions (R-W3 amendment, McIntosh rerun)
 
