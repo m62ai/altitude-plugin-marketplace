@@ -1321,7 +1321,7 @@ into one of four buckets that map directly to the `classification` field of
 | (b) | **orphan_since_prior_run** | found AND NOT in current universe | `orphan` (NOT stale in the deletion sense — write under a separate `orphans[]` key for Phase 6 OWNERSHIP wiring) | re-wire via Phase 6 OWNERSHIP edges |
 | (c) | **soft_deleted** | returns row with `deleted: true` only when `?includeDeleted=true&scope=ALL_TENANTS` | `soft_deleted` | record in `run_state.softDeletedAwaitingHardDelete[]` per Rule 66; fleet aggregator schedules admin hard-delete |
 | (d) | **hard_deleted** | 404 even with `?scope=ALL_TENANTS&includeDeleted=true` | `hard_deleted` | remove the UUID from `run_state.entities.*` so the next run does not retry the lookup |
-| (e) | **no_owner_edges** (TangibleAsset, AccountFinancial, Liability) | found via direct GET, has `parentHouseholdId` populated, but `owners[]` is empty OR contains no owner with `ownerType` in {INDIVIDUAL, LEGAL_ENTITY} | `no_owner_edges` (write under `no_owner_edges[]` key — see Rule 79) | Phase 6 attempts to identify the correct owner from source documents; on ambiguity, emit a Q-blocker. **Note (PLT-77 retraction, 2026-04-29)**: an earlier version of this rule classified by `individualId IS NULL && legalEntityId IS NULL` — those columns don't exist on the DTO. The corrected criterion uses `owners[]` length and content. |
+| (e) | **no_owner_edges** (TangibleAsset, AccountFinancial, Liability) | found via direct GET, has `parentHouseholdId` populated, but `owners[]` is empty OR contains no owner with `ownerType` in {INDIVIDUAL, LEGAL_ENTITY} | `no_owner_edges` (write under `no_owner_edges[]` key — see Rule 79). **Exempt: `owners[]` consists solely of `ownerType=HOUSEHOLD` entries** (mirrors Rule 80 Exemption C — household-as-economic-owner is a recognized design pattern, not a missing-owner bug). | Phase 6 attempts to identify the correct owner from source documents; on ambiguity, emit a Q-blocker. **Note (PLT-77 retraction, 2026-04-29)**: an earlier version of this rule classified by `individualId IS NULL && legalEntityId IS NULL` — those columns don't exist on the DTO. The corrected criterion uses `owners[]` length and content. |
 
 If the lookup result is ambiguous (e.g. transient 5xx, network timeout, scope
 mismatch the skill cannot disambiguate), classify as `unknown` and surface in the
@@ -8645,6 +8645,36 @@ or Liability where the direct GET returns 200, perform two checks:
 If both conditions hold, classify as `no_owner_edges` and record under the
 `no_owner_edges[]` key in `stale_prior_uuids.json` with
 `{uuid, type, name, ownersList, reason: "parentHouseholdId populated; no IND/LE owner edge", fleet_aggregator_action}`.
+
+**Exemption — household-as-economic-owner pattern (R-W7 fleet audit, 2026-04-29).**
+If `owners[]` is non-empty and consists **solely** of entries with
+`ownerType=HOUSEHOLD`, the entity is NOT classified as `no_owner_edges`.
+This mirrors Rule 80 Exemption C (Addepar HOUSEHOLD@100% placeholder for
+accounts) and recognizes that some families intentionally model the
+household entity itself as the economic owner of TangibleAssets and
+LegalEntity-style assets — typically when assets sit in a single-family
+LLC, family trust, or holding entity that is functionally the household.
+Discovered on 2026-04-29 fleet audit: of 506 entities scanned across 22
+households, 64 had HH-only ownership (notably Boro-Hamilton's 20/20 TAs);
+only 2 were truly empty `owners[]`. Without this exemption, the rule
+would generate noise on any household using HH-as-owner architecture.
+
+Pseudocode:
+
+```python
+def classify_no_owner_edges(entity):
+    if not entity.get("parentHouseholdId"):
+        return None  # not reachable; outside Rule 79 scope
+    owners = entity.get("owners") or []
+    if not owners:
+        return ("no_owner_edges", "owners[] empty")
+    owner_types = {o.get("ownerType") for o in owners}
+    if owner_types == {"HOUSEHOLD"}:
+        return None  # EXEMPT — household-as-economic-owner pattern
+    if not (owner_types & {"INDIVIDUAL", "LEGAL_ENTITY"}):
+        return ("no_owner_edges", f"owners only of type {sorted(owner_types)}")
+    return None  # has IND or LE owner — normal case
+```
 
 Phase 6 SHOULD attempt to identify the correct owner from source documents
 — deeds for real property, titles/registrations for vehicles, articles of
