@@ -3694,6 +3694,40 @@ the JSON file (with `findings: []`) so the fleet rollup can confirm the check ra
 
 After the user approves and resolves all conflicts:
 
+### Phase 6 entity-create endpoint reference (read this BEFORE Step 6.1)
+
+Cross-reference: **Rule 20** (TangibleAsset uses subtype-specific POST
+endpoints). This callout repeats Rule 20 next to where it is needed —
+agents reading the rules at the top of the skill have not always carried
+the rule into Phase 6 when they get to TangibleAsset creation. A R-W4
+agent (Ryan) tried `POST /api/v1/tangible-asset` directly and hit HTTP
+500 with the message `"use subtype-specific mappers"` on 11 TAs.
+Don't be that agent — use the table below.
+
+| Entity type | POST endpoint | Notes |
+|---|---|---|
+| Household | `POST /api/v1/household` | — |
+| Individual | `POST /api/v1/individual` | — |
+| LegalEntity | `POST /api/v1/legal-entity` | — |
+| AccountFinancial | `POST /api/v1/account-financial` | — |
+| Contact | `POST /api/v1/contact` | — |
+| **TangibleAsset (vehicle)** | `POST /api/v1/tangible-asset/vehicle` | Cars, boats, aircraft. **NEVER** `POST /api/v1/tangible-asset` directly — returns 500. |
+| **TangibleAsset (real-property)** | `POST /api/v1/tangible-asset/real-property` | Homes, condos, land. |
+| **TangibleAsset (luxury)** | `POST /api/v1/tangible-asset/luxury` | Watches, jewelry, handbags. |
+| **TangibleAsset (collectible)** | `POST /api/v1/tangible-asset/collectible` | Art, wine, antiques. |
+| **TangibleAsset (other)** | `POST /api/v1/tangible-asset/other` | Everything else. |
+| InsurancePolicy | `POST /api/v1/insurance-policy` | — |
+| Liability | `POST /api/v1/liability` | — |
+| EntityRelationship | `POST /api/v1/entity-relationship` | — |
+| Notes (per entity) | `POST /api/v1/{entity}/{id}/notes` | Body: `{"noteText": "..."}` — see Step 6.1. NOT supported on Household/Contact. |
+| Attributes (per entity) | `POST /api/v1/{entity}/{id}/attributes` | Household-level metadata canonical place. |
+
+If the desired TangibleAsset subtype is unclear from the source documents,
+default to `/api/v1/tangible-asset/other` rather than guessing —
+re-classifying via PATCH after creation is allowed; recovering from a 500
+on the abstract endpoint is wasted retries. See Rule 20 for the full
+rationale.
+
 ### Step 6.1: Update existing entities (PATCH)
 
 Use PATCH for partial updates — only send the fields that need filling or updating:
@@ -8637,16 +8671,62 @@ def check_ownership_sum(target, inbound_ownership_edges):
     if is_trust and all_indiv_100 and is_n_x_100:
         return ("EXEMPT_B", f"revocable_trust_joint_grantor_pattern n={len(other_edges)}")
 
+    # Exemption C — Addepar HOUSEHOLD@100% placeholder (R-W4, Ryan rerun)
+    is_addepar_synced = any(
+        (x.get("provider") or "").upper() == "ADDEPAR"
+        for x in (target.get("externalIds") or [])
+    )
+    sole_hh_100 = (
+        len(inbound_ownership_edges) == 1 and
+        len(household_edges) == 1 and
+        abs(float(household_edges[0].get("percentage") or 0) - 100) < 1
+    )
+    if is_addepar_synced and sole_hh_100 and target.get("type") == "ACCOUNT_FINANCIAL":
+        return ("EXEMPT_C", "addepar_household_placeholder")
+
     # Default tolerance check on non-HOUSEHOLD edges
     if 99 <= non_hh_sum <= 101:
         return ("PASS", f"sum={non_hh_sum}")
     return ("VIOLATION", f"sum={non_hh_sum} (excluding HOUSEHOLD edges)")
 ```
 
+**Exemption C — Addepar-synced AccountFinancial with sole HOUSEHOLD@100%
+placeholder edge (R-W4 amendment, Ryan rerun).**
+
+Addepar sync creates AccountFinancial rows where the only inbound OWNERSHIP
+edge is `HOUSEHOLD → account OWNERSHIP 100%` — a placeholder used when the
+account is not yet attributable to a specific Individual or LegalEntity.
+After the R-W3 amendment that excludes HOUSEHOLD-source edges from the
+non-HH sum, these accounts compute `non_hh_sum = 0` and would otherwise
+trip a `VIOLATION` even though the data state is "awaiting RM
+attribution", not "broken ownership". Ryan's rerun had two such accounts.
+
+Detection: the target is an `AccountFinancial` AND has exactly one inbound
+OWNERSHIP edge AND that edge is from `HOUSEHOLD` at percentage 100% AND
+the account has at least one `externalIds[]` entry with `provider == "ADDEPAR"`.
+When all four hold, log to `ownership_sum_violations.jsonl` with
+`status: "EXEMPT_C_ADDEPAR_PLACEHOLDER"` (kept in the violations file
+rather than the exemptions file so reviewers see it surfaced as
+informational follow-up, not silently suppressed) and add a reviewer note:
+
+> Account is an Addepar-synced placeholder pending RM attribution. The
+> `HOUSEHOLD → account` edge is the temporary holding line — once the RM
+> identifies the owning Individual or LegalEntity, replace the HH edge
+> with the proper economic-ownership edges.
+
+Suggested follow-up: emit a Q-blocker recommending the RM attribute the
+account to a specific Individual/LegalEntity once known. Does NOT halt;
+surfaces as informational. The Addepar-provider check is required —
+non-Addepar accounts with `HH@100%` as the sole edge are NOT exempt
+(they would indicate either a mis-modeled household-direct holding or a
+genuine Rule 80 gap).
+
 Cross-reference: this exemption block is the operational counterpart to
-Rule 60's grantor amendment (PR #15) and visibility-edge doctrine. When
-either of those rules changes (e.g. revocable-trust ownership semantics
-shift), this exemption logic MUST be revisited in lockstep.
+Rule 60's grantor amendment (PR #15), the HOUSEHOLD visibility-edge
+doctrine, and the Addepar-sync placeholder convention. When any of those
+rules changes (e.g. revocable-trust ownership semantics shift, Addepar
+attribution model changes), this exemption logic MUST be revisited in
+lockstep.
 
 #### Rule 80 — Phase 3.7 OWNERSHIP percentage sum check
 
@@ -8655,17 +8735,23 @@ edges across the merged extraction, sum the `percentage` field across all
 edges **EXCLUDING `sourceEntityType == "HOUSEHOLD"` edges** (Rule 60
 visibility edges are not economic ownership). Tolerance is ±1% (joint
 accounts round to 50/50, partnership K-1s sometimes 33.33/33.33/33.34,
-small rounding is acceptable). Two false-positive exemptions apply BEFORE
-the tolerance check (R-W3 amendment, McIntosh rerun): **Exemption A** —
-if a `LegalEntity` target's only inbound OWNERSHIP is a HOUSEHOLD-source
-visibility edge (irrevocable-trust pattern), log to
-`ownership_sum_exemptions.jsonl` and skip the sum check. **Exemption B** —
-if the target is `LegalEntityType == "TRUST"` AND every non-HOUSEHOLD edge
-is from an Individual at exactly 100%, accept any positive multiple of 100%
+small rounding is acceptable). Three false-positive exemptions apply BEFORE
+the tolerance check: **Exemption A** (R-W3, McIntosh) — if a `LegalEntity`
+target's only inbound OWNERSHIP is a HOUSEHOLD-source visibility edge
+(irrevocable-trust pattern), log to `ownership_sum_exemptions.jsonl` and
+skip the sum check. **Exemption B** (R-W3, McIntosh) — if the target is
+`LegalEntityType == "TRUST"` AND every non-HOUSEHOLD edge is from an
+Individual at exactly 100%, accept any positive multiple of 100%
 (joint-grantor revocable trust pattern per Rule 60 / PR #15 — Dawdy Family
-Trust at 200% with two grantors at 100% each is the canonical case). Only
-outside both exemptions, when the non-HOUSEHOLD sum is < 99% or > 101%,
-flag `OWNERSHIP_SUM_VIOLATION`, log to `ownership_sum_violations.jsonl`
+Trust at 200% with two grantors at 100% each is the canonical case).
+**Exemption C** (R-W4, Ryan) — if the target is an `AccountFinancial`
+with exactly one inbound OWNERSHIP edge from `HOUSEHOLD` at 100% AND the
+account has an `externalIds[]` entry with `provider == "ADDEPAR"`, mark
+as `EXEMPT_C_ADDEPAR_PLACEHOLDER` in `ownership_sum_violations.jsonl`
+(surfaced as informational follow-up, not silently suppressed) with a
+reviewer note recommending RM attribution to a specific
+Individual/LegalEntity. Only outside all three exemptions, when the
+non-HOUSEHOLD sum is < 99% or > 101%, flag `OWNERSHIP_SUM_VIOLATION`, log to `ownership_sum_violations.jsonl`
 with `{target_entity_id, target_entity_name, target_entity_type, actual_sum,
 expected: 100, contributing_edges, ts}`, and emit a Q-blocker enumerating
 the common causes (missing counterparty, partnership minor partner missed,
@@ -8762,6 +8848,35 @@ Rule 82 closes this with an explicit carry-over contract:
    — it's "stuck", and the human needs to actively resolve or actively
    abandon the write rather than passively defer.
 
+4. **Schema migration from legacy keys (R-W4 amendment, Ryan rerun)**: prior
+   `run_state.json` files MAY use legacy custom keys that predate this rule
+   — `skipped_blockers`, `skip_list`, `skipped_writes`, or any
+   `skipped_*`-prefixed key that holds an array of deferred-write entries.
+   On rerun, as part of Step 1.5 / Rule 69's prior-UUID lookup pass, the
+   agent MUST detect and migrate these entries to the new `skipped[]`
+   schema BEFORE Phase 2.
+
+   - **Detection heuristic**: scan `run_state.json` for any key matching
+     the regex `^(skipped|skip)(_.*)?$` other than the canonical `skipped`.
+     If found and the value is an array, treat it as a legacy schema
+     occurrence.
+   - **Migration**: for each entry in the legacy array, copy all original
+     fields verbatim into a new entry under `skipped[]` and add
+     `attemptCount: 0` if not already present. Preserve `uuid_or_path`,
+     `reason`, `blocking_q_blocker_id`, and `attemptedAt` from the legacy
+     entry; if any of those four canonical fields is missing, fill from
+     adjacent fields where possible (e.g., legacy `path` → `uuid_or_path`,
+     legacy `q_id` → `blocking_q_blocker_id`) and otherwise leave null
+     with a Phase 5 reviewer note flagging the incomplete migration.
+   - **Cleanup**: after migrating, remove the legacy key from
+     `run_state.json` so the next rerun does not double-migrate. Log the
+     migration to `run_state.migrations[]` with
+     `{ts, legacy_key, entries_migrated, entries_with_missing_fields}` so
+     the audit trail is preserved.
+   - Ryan's prior `run_state.json` used `skipped_blockers` and the
+     carry-over logic silently no-op'd because the canonical `skipped[]`
+     was empty.
+
 #### Rule 82 — `run_state.skipped[]` carry-over contract on rerun
 
 Every entry in `run_state.skipped[]` MUST contain `{uuid_or_path, reason,
@@ -8776,7 +8891,14 @@ escalate as a recurring-blocker Q in the Phase 5 review (separate section
 from regular open questions) so the human can actively resolve or
 abandon the write rather than passively defer it. Discovered on Hnetinka
 R-W1 where six unposted source files had been carried in `skipped[]`
-across multiple reruns without re-attempt logic.
+across multiple reruns without re-attempt logic. **R-W4 amendment (Ryan)**:
+prior `run_state.json` files using legacy custom keys (`skipped_blockers`,
+`skip_list`, `skipped_writes`, etc. — any `^(skipped|skip)(_.*)?$` key
+other than canonical `skipped`) MUST be migrated to `skipped[]` during
+Step 1.5; preserve original fields, add `attemptCount: 0`, remove the
+legacy key, and log the migration to `run_state.migrations[]`. Without
+the migration, the carry-over logic silently no-ops because canonical
+`skipped[]` is empty.
 
 ### Step 1.6: Out-of-band relationship reconciliation (Rule 83)
 
@@ -8947,6 +9069,94 @@ Barnes R-W2 rerun where `Robert Eaddy` (ADVISOR Contact) and
 recorded as two distinct rows because they were extracted from different
 documents and the match-and-merge pass only deduplicates within an
 extraction batch, not across roles.
+
+### Step 5.4: Phase 5 member-vs-role mismatch detection (Rule 84 extension)
+
+**R-W4 amendment, Ryan rerun.** Phase 5's existing member-classification
+review confirms that every Individual with an `HOUSEHOLD → IND OWNERSHIP`
+edge is correctly modeled as a household member, but it does NOT
+cross-check the documented role(s) extracted from source documents
+against the household-member classification. Ryan had `Greg Ryan` modeled
+as a household member (`HH → IND OWNERSHIP 100%`), but Q6 documents him
+as the "3rd Successor Trustee" — a non-household-member role per Rule 53
+(`LegalEntity = family-controlled ONLY`; trust-role-only individuals are
+Contacts, not members). The mismatch went unflagged because the skill
+treated the OWNERSHIP edge as authoritative without comparing against
+the documented role.
+
+For every Individual with an `HH → IND OWNERSHIP` edge, compare the
+documented role(s) from extraction (`extraction_cache.jsonl` `relationships`
+and `contacts` arrays — successor trustee, beneficiary-only,
+trustee-of-other-family-trust, attorney, advisor, accountant, etc.)
+against the household-member classification. If the documented role is
+non-household-member per Rule 53 — specifically: Successor Trustee
+(any rank), Beneficiary-only (no other member-class role), Trustee of a
+non-family trust, Attorney/Advisor/Accountant/Insurance Agent — flag for
+reclassification review. Output to
+`{household_folder}/altitude_review/phase5_member_vs_role_mismatch.json`:
+
+```json
+{
+  "ts": "2026-04-28T14:32:11Z",
+  "household_id": "<hh-uuid>",
+  "candidates": [
+    {
+      "individualId": "<uuid>",
+      "name": "Greg Ryan",
+      "current_classification": "household_member (HH→IND OWNERSHIP 100%)",
+      "documented_role": "3rd Successor Trustee per Q6",
+      "rule_53_classification": "should be Contact (trust-role only)",
+      "suggested_action": "reclassify_to_Contact_with_TRUSTEE_relationship"
+    }
+  ]
+}
+```
+
+Empty file (`candidates: []`) required on every rerun for fleet-aggregator
+consistency, same convention as Rules 83 / 84-duplicates.
+
+**DO NOT auto-reclassify** — the corrective action requires deleting the
+HH→IND OWNERSHIP edge, soft-deleting (or migrating) the Individual to a
+Contact, and recreating role-specific edges. That is a destructive
+multi-step operation; emit a Q-blocker and let the human authorize.
+Surface in the Phase 5 review markdown as a "Member-vs-role mismatch —
+review" section listing each candidate with the source-document evidence
+for the documented role.
+
+The reverse case (a Contact who's actually a household member — e.g.,
+extracted as ADVISOR but is in fact the spouse) is also possible but
+rarer. When a Contact has a documented role consistent with household
+membership AND matches an existing Individual via the standard
+match-merge hierarchy, flag in the same file with
+`current_classification: "Contact"` and
+`suggested_action: "promote_to_Individual_household_member"`. The same
+no-auto-reclassify rule applies.
+
+Cross-reference Rule 53 (LegalEntity = family-controlled ONLY; trust-role
+contacts are Contacts) and Rule 84 (Phase 5 duplicate-Contact detection)
+— this sub-section closes the inverse case where a person is misclassified
+as a member when they should be a Contact.
+
+#### Rule 84 extension — Phase 5 member-vs-role mismatch
+
+In Phase 5, for every Individual with an `HH → IND OWNERSHIP` edge,
+compare extracted role(s) from `extraction_cache.jsonl` against the
+household-member classification. If the documented role is non-member
+per Rule 53 (Successor Trustee, Beneficiary-only, Trustee of non-family
+trust, Attorney/Advisor/Accountant/Insurance Agent), emit
+`phase5_member_vs_role_mismatch.json` with `{ts, household_id,
+candidates: [{individualId, name, current_classification, documented_role,
+rule_53_classification, suggested_action}]}`. Empty file
+(`candidates: []`) required on every rerun. Surface in the Phase 5
+review as a "Member-vs-role mismatch — review" section. **DO NOT
+auto-reclassify** — emit a Q-blocker; the corrective action is a
+multi-step destructive operation (delete HH→IND edge, migrate
+Individual → Contact, recreate role edges) requiring human authorization.
+Reverse case (Contact who is actually a member) flagged in the same
+file with `suggested_action: "promote_to_Individual_household_member"`.
+Discovered on Ryan R-W4 where `Greg Ryan` was modeled as a household
+member but Q6 documents him as 3rd Successor Trustee — non-member per
+Rule 53.
 
 ---
 
