@@ -50,6 +50,55 @@ def total(resp):
 find linked LEs, accounts, contacts. Name-pattern search is a fallback — account names in
 Altitude are often generic ("Holding", "Custody") and won't match family-surname searches.
 
+### Endpoint pattern catalog — what works vs what silently leaks (R-W8 amendment)
+
+R-W8 clean-pass surfaced multiple agents using endpoint variants that
+return wrong-but-syntactically-valid responses. The two recurring traps:
+
+1. **Wrong query-parameter name** on list endpoints: `?householdId=` instead
+   of `?parentHouseholdId=`. Backend silently ignores unknown parameters
+   and returns the unfiltered firm-wide pool. Boro-Hamilton agent hit this
+   on `tangible-asset/search?householdId=` — got 100 firm-wide TAs
+   instead of the 20 Boro-Hamilton TAs.
+2. **Wrong endpoint variant** for graph traversal: `/by-source/{...}`,
+   `/entity-relationship/search?...`, `?fromEntityId=...` — none of these
+   exist. The working endpoints are `/from/{type}/{id}/active` and
+   `/to/{type}/{id}/active`. Sridhar agent hit several of these
+   non-existent variants and (correctly) flagged them.
+
+**Authoritative pattern catalog**:
+
+| Goal | ✅ Use | ❌ Don't use |
+|---|---|---|
+| Household-scoped entities by type | `?parentHouseholdId={hh}` | `?householdId=`, `/by-household/{hh}` (works for some types only — see compat note below) |
+| All entities owned by an Individual | `/{entity}/by-individual/{ind-id}` | `?ownerId=`, `?individualId=` |
+| All entities owned by an LE | `/{entity}/by-legal-entity/{le-id}` | `?ownerId=`, `?legalEntityId=` |
+| Outbound relationships from an entity | `/entity-relationship/from/{type}/{id}/active` | `/by-source/`, `?fromEntityId=`, `/search?` |
+| Inbound relationships to an entity | `/entity-relationship/to/{type}/{id}/active` | `/by-target/`, `?toEntityId=` |
+| Single entity by id | `/{entity}/{id}` | `?id=` (treats as filter, returns paginated) |
+
+**Compat note on `/by-household/{hh}`**: works on `account-financial`,
+`liability`, `insurance-policy` (returns the household's entities of that
+type). **Does NOT work on `tangible-asset`** as of 2026-04-29 — the path
+exists but returns 0 even when the household has TAs. Use
+`?parentHouseholdId={hh}` for TAs. Boro-Hamilton + Sridhar agents both
+verified this asymmetry by curl.
+
+**The silent-leak danger**: `?householdId=` returning firm-wide is
+particularly dangerous because the response shape looks identical to a
+correctly-scoped response (paginated wrapper with `content[]`). Without
+checking `parentHouseholdId` on each returned entity, the agent can't
+detect the leak. **Defense**: after any list-endpoint query, sample
+`content[0].parentHouseholdId` and assert it matches the intended
+household. If it doesn't, re-query with `?parentHouseholdId=` instead.
+
+**Tangentially related** — wrong DTO field names produce a similar
+silent failure: agents that check `dict.get('individualId')` on
+TangibleAssetDto get `None` for a key that doesn't exist (PLT-77 trap).
+When checking field state on any DTO, use `'key' in d` (Python) or
+`jq 'has("key")'`. See `altitude_api_schema.md` for authoritative DTO
+field names per entity type.
+
 ---
 
 ## 0. AUTHENTICATION
