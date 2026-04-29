@@ -1321,7 +1321,7 @@ into one of four buckets that map directly to the `classification` field of
 | (b) | **orphan_since_prior_run** | found AND NOT in current universe | `orphan` (NOT stale in the deletion sense — write under a separate `orphans[]` key for Phase 6 OWNERSHIP wiring) | re-wire via Phase 6 OWNERSHIP edges |
 | (c) | **soft_deleted** | returns row with `deleted: true` only when `?includeDeleted=true&scope=ALL_TENANTS` | `soft_deleted` | record in `run_state.softDeletedAwaitingHardDelete[]` per Rule 66; fleet aggregator schedules admin hard-delete |
 | (d) | **hard_deleted** | 404 even with `?scope=ALL_TENANTS&includeDeleted=true` | `hard_deleted` | remove the UUID from `run_state.entities.*` so the next run does not retry the lookup |
-| (e) | **fk_orphan** (TangibleAsset, AccountFinancial, Liability — R-W7 expansion) | found via direct GET, but both `individualId IS NULL` AND `legalEntityId IS NULL`, regardless of `parentHouseholdId` | `fk_orphan` (write under `fk_orphans[]` key — see Rule 79) | Backend save-hook backfills on next write that touches the row (PLT-71 forward-only fix). For untouched legacy rows, escalate to RM/ops for one-shot backfill. Source-doc population only needed if no natural write would touch the row. |
+| (e) | **no_owner_edges** (TangibleAsset, AccountFinancial, Liability) | found via direct GET, has `parentHouseholdId` populated, but `owners[]` is empty OR contains no owner with `ownerType` in {INDIVIDUAL, LEGAL_ENTITY} | `no_owner_edges` (write under `no_owner_edges[]` key — see Rule 79) | Phase 6 attempts to identify the correct owner from source documents; on ambiguity, emit a Q-blocker. **Note (PLT-77 retraction, 2026-04-29)**: an earlier version of this rule classified by `individualId IS NULL && legalEntityId IS NULL` — those columns don't exist on the DTO. The corrected criterion uses `owners[]` length and content. |
 
 If the lookup result is ambiguous (e.g. transient 5xx, network timeout, scope
 mismatch the skill cannot disambiguate), classify as `unknown` and surface in the
@@ -1349,10 +1349,10 @@ Schema — one entry per UUID, bucketed by classification:
 
 - **`stale_uuids[]`** — buckets (c) `soft_deleted` and (d) `hard_deleted`
 - **`orphans[]`** — bucket (b) `orphan`
-- **`fk_orphans[]`** — bucket (e) `fk_orphan` (Rule 79; TangibleAsset, AccountFinancial, Liability per R-W7)
+- **`no_owner_edges[]`** — bucket (e) `no_owner_edges` (Rule 79; TangibleAsset, AccountFinancial, Liability — entities reachable by parentHouseholdId but with no INDIVIDUAL/LEGAL_ENTITY ownership edge in `owners[]`). **Renamed from `no_owner_edges[]` 2026-04-29 after PLT-77 retraction** — the prior name implied a non-existent FK column gap.
 - **`details[]`** — bucket (a) `live` audit trail (NEW; see Rule 69 amendment).
   Required even on an all-clean rerun where `stale_uuids[]`, `orphans[]`, and
-  `fk_orphans[]` are all empty. Without it, an empty `stale_prior_uuids.json`
+  `no_owner_edges[]` are all empty. Without it, an empty `stale_prior_uuids.json`
   is indistinguishable from "Step 1.5 ran but found nothing" vs "Step 1.5 was
   silently skipped" — the audit trail in `details[]` resolves the ambiguity.
 
@@ -1380,7 +1380,7 @@ Schema — one entry per UUID, bucketed by classification:
       "fleet_aggregator_action": "schedule_phase6_ownership_wire"
     }
   ],
-  "fk_orphans": [
+  "no_owner_edges": [
     {
       "uuid": "<uuid>",
       "type": "TangibleAsset",
@@ -1407,10 +1407,10 @@ contain one entry per verified-live UUID even when all three stale arrays are
 empty:
 
 ```json
-{"household": "<name>", "household_id": "<uuid>", "stale_uuids": [], "orphans": [], "fk_orphans": [], "details": []}
+{"household": "<name>", "household_id": "<uuid>", "stale_uuids": [], "orphans": [], "no_owner_edges": [], "details": []}
 ```
 
-The all-clean rerun shape is `stale_uuids: []`, `orphans: []`, `fk_orphans: []`,
+The all-clean rerun shape is `stale_uuids: []`, `orphans: []`, `no_owner_edges: []`,
 and `details: [<one entry per verified-live UUID>]` — empty arrays alone are
 NOT sufficient on a rerun.
 
@@ -7930,14 +7930,18 @@ for a reference example (RM handoff format).
       `run_state.softDeletedAwaitingHardDelete[]`
     - **404 even with scope=ALL_TENANTS** → entity was hard-deleted; remove from
       `run_state.json`
-    - **FK_ORPHAN** (TangibleAsset only) → entity is found via direct GET but has
-      both `individualId IS NULL` AND `legalEntityId IS NULL`, regardless of
-      `parentHouseholdId`. The standard universe walk via `/by-individual` and
-      `/by-legal-entity` will miss it because there is no FK to traverse from. Log
-      to `stale_prior_uuids.json` under a new `fk_orphans[]` key (see Step 1.5
-      schema below). Phase 6 SHOULD attempt to populate the missing FK from
-      source documents (deed, title, registration); if the source document is
-      ambiguous, emit a Q-blocker rather than guess. See Rule 79.
+    - **no_owner_edges** (TangibleAsset, AccountFinancial, Liability) → entity
+      is found via direct GET, has `parentHouseholdId` populated, but `owners[]`
+      is empty OR contains no `ownerType` in {INDIVIDUAL, LEGAL_ENTITY}. The
+      household-side `/by-individual` and `/by-legal-entity` traversals miss it
+      because there is no IND/LE OWNERSHIP edge to walk. Log to
+      `stale_prior_uuids.json` under the `no_owner_edges[]` key (see Step 1.5
+      schema below). Phase 6 SHOULD attempt to identify the correct owner from
+      source documents (deed, title, registration); if ambiguous, emit a
+      Q-blocker rather than guess. See Rule 79. **Note**: this rule was
+      originally named "FK_ORPHAN" and classified by `individualId IS NULL && legalEntityId IS NULL`
+      — those columns don't exist on the DTO; the criterion was wrong (PLT-77
+      retraction 2026-04-29). The corrected criterion uses `owners[]`.
 
     This catches the "prior-run-created entities invisible to graph traversal" class
     of bug. On a recent run, 15 TangibleAssets existed in the DB from a prior run but
@@ -8587,101 +8591,83 @@ pair (existing, newly-created, or null-coverage-deferred), required even
 when empty. Discovered on the Comolli rerun where two real-property TAs had
 `isInsured: false` despite each carrying a 1:1 Chubb HOMEOWNERS policy.
 
-### Step 1.5c: Detect FK_ORPHAN entities (Rule 79)
+### Step 1.5c: Detect no-owner-edges entities (Rule 79)
 
-> **✅ Backend fix shipped 2026-04-29 — PLT-71 FORWARD-ONLY FIX**, legacy
-> retrofit pending. The save-hook now backfills graph-derived FK columns
-> on **new POSTs and on PATCHes that touch the row**, but **does NOT
-> retroactively heal pre-existing FK_ORPHAN rows on its own**. Empirical
-> evidence (R-W7, 2026-04-29): Podolsky 5/5 sampled TAs, Hugret-Johnston
-> 1/1 TA, Cummings 3/3 TAs + 7/7 AccountFinancials + 1 Liability all
-> still FK_ORPHAN despite the deploy. See PLT-71 comment for the full
-> sample.
+> **✅ Backend fix shipped 2026-04-29 — PLT-71 RESOLVED.** The
+> `parentHouseholdId` retrofit landed cross-firm; existing rows are
+> healed and new writes self-heal via the save-hook. Verified on prod
+> 2026-04-29 with admin API key — all sampled Podolsky TAs have
+> `parentHouseholdId` correctly populated.
 >
-> **Implication for Rule 79**: detection retains full value (catches
-> the legacy rows that the forward-only fix doesn't heal), but Phase 6
-> remediation falls into one of two paths:
+> **⚠️ Rule 79 criterion correction (PLT-77 retraction, 2026-04-29).**
+> An earlier version of this rule classified entities as "FK_ORPHAN"
+> when `individualId IS NULL && legalEntityId IS NULL`. **Those columns
+> don't exist on `TangibleAssetDto` / `AccountFinancialDto` /
+> `LiabilityDto`** — the DTO exposes ownership only via `parentHouseholdId`
+> (household scalar) and `owners[]` (full ownership-edge expansion).
+> Earlier "FK_ORPHAN" classifications using `dict.get('individualId')`
+> or `jq '.individualId'` were silently returning `null` for missing
+> keys (false positives) — they were not finding real orphans. PLT-72,
+> PLT-75, and PLT-77 were all retracted as the same false-positive
+> shape; PR #34's "forward-only fix" softening was based on this same
+> misread and is being reverted by this PR.
 >
-> 1. If a write naturally touches the row (e.g., new OWNERSHIP edge,
->    field PATCH), the save-hook backfills as a side effect — Phase 6
->    can rely on this for in-flight changes.
-> 2. For pre-existing rows that aren't being touched by any planned
->    write, **the backend doesn't self-heal**. Direct PATCH on FK
->    columns returns HTTP 400 (Rule 75 R-W3 amendment). Self-service
->    cleanup requires either a one-shot backend data migration
->    (recommended, tracked on PLT-71) or laborious OWNERSHIP-edge churn
->    (delete + re-POST per row to retrigger the save-hook).
->
-> **Scope expansion (R-W7)**: PLT-71 was originally scoped to TangibleAsset.
-> Cummings R-W7 found the same FK-NULL-with-OWNERSHIP-edge-intact pattern on
-> AccountFinancial (7/7) and Liability (1) too. Rule 79 detection now
-> covers any entity with FK + edge-graph design, not just TAs.
+> **The corrected concern is real** — Phase 1.5 should still detect
+> entities that are reachable from the household by `parentHouseholdId`
+> but have NO inbound OWNERSHIP edge from an INDIVIDUAL or LEGAL_ENTITY
+> source. Those are genuinely "owner-less" rows that downstream graph
+> traversal won't surface. The corrected detection criterion below uses
+> `owners[]` content rather than phantom FK columns.
 
 The Rule 69 prior-UUID lookup pass classifies entities into `live`, `orphan`,
-`soft_deleted`, and `hard_deleted` buckets — but the Comolli rerun surfaced a
-fifth class that none of those buckets capture. Both real-property
-TangibleAssets had `individualId IS NULL` AND `legalEntityId IS NULL`. They
-were live in the DB. They did NOT 404. They were not soft-deleted. They had a
-populated `parentHouseholdId`. But because the standard universe walk fans out
-from individuals via `/by-individual` and from legal entities via
-`/by-legal-entity`, neither query surfaced them. They were structurally
-unreachable from the household graph until a direct GET on the prior UUID
-proved they existed.
+`soft_deleted`, and `hard_deleted` buckets. Rule 79 adds a fifth class — the
+"no-owner-edges" entity: the row is live, has `parentHouseholdId` populated,
+but `owners[]` is empty (or contains no OWNERSHIP edge from an INDIVIDUAL
+or LEGAL_ENTITY). The household-side graph traversal (e.g., `/by-individual`,
+`/by-legal-entity`) won't surface these rows because there's no IND/LE
+edge to walk; only the direct GET on the prior UUID or the
+`/by-household` traversal sees them.
 
-This is the FK_ORPHAN class: the row exists, the household FK is set, but
-neither the individualId nor legalEntityId FK is populated, so the standard
-graph traversal cannot find it. Distinct from Rule 69's existing `orphan`
-bucket (which is "no inbound OWNERSHIP edge" — graph-edge problem), FK_ORPHAN
-is "no outbound FK" — entity-column problem. Detection requires the prior-UUID
-direct-GET that Rule 69 already does, plus an explicit field check on the
-returned row.
+Distinct from Rule 69's existing `orphan` bucket (which is "no inbound
+OWNERSHIP edge of any kind"), `no_owner_edges` is "has the household
+visibility edge but no economic-owner edge" — the entity is reachable
+from the household but has no IND/LE responsible party recorded.
 
-Rule 79 adds FK_ORPHAN to Rule 69's classification taxonomy and routes
-detected entities to a new `fk_orphans[]` key on `stale_prior_uuids.json` (see
-the Step 1.5 schema above). Phase 6 SHOULD attempt to populate the missing FK
-from source documents — deeds for real property, titles/registrations for
-vehicles, articles of incorporation for entity assets — but if the source
-document is ambiguous (e.g., a real-property deed names "John and Jane Smith
-as joint tenants" and Phase 4 has not yet decided whether the asset is
-attributable to the individual or to a joint LegalEntity), the agent MUST
-emit a Q-blocker rather than guess. Guessing FK populates a 1-of-N path on a
-graph that downstream tools treat as canonical.
+#### Rule 79 — Phase 1.5 classifies entities with parentHouseholdId-populated-but-no-INDIVIDUAL/LEGAL_ENTITY-owners as `no_owner_edges`
 
-#### Rule 79 — Phase 1.5 classifies FK-NULL TangibleAssets as FK_ORPHAN
+In Step 1.5's prior-UUID lookup pass, for each TangibleAsset, AccountFinancial,
+or Liability where the direct GET returns 200, perform two checks:
 
-In Step 1.5's prior-UUID lookup pass, any TangibleAsset where the direct GET
-returns 200 AND the row has both `individualId IS NULL` AND `legalEntityId IS
-NULL` (regardless of `parentHouseholdId`) MUST be classified as `fk_orphan`
-and recorded under the new `fk_orphans[]` key in `stale_prior_uuids.json`
-with `{uuid, type, name, reason: "individualId=null && legalEntityId=null",
-fleet_aggregator_action}`. Distinct from `orphan` (graph-edge missing) —
-FK_ORPHAN is entity-column missing, and the standard `/by-individual` /
-`/by-legal-entity` traversal cannot detect it. Phase 6 retrofit SHOULD
-attempt to populate the missing FK from source documents (deed, title,
-registration); on ambiguity (joint tenants where the IND vs LE attribution
-isn't yet decided) emit a Q-blocker rather than guess. Discovered on the
-Comolli rerun where two real-property TAs ($25M + $5M) had both FKs NULL
-despite a populated `parentHouseholdId`. **Post-PLT-71 (shipped
-2026-04-29) is forward-only**: new POSTs and PATCHes-that-touch-the-row
-trigger backfill, but legacy FK_ORPHAN rows that no write touches stay
-orphaned indefinitely. R-W7 evidence: Podolsky 5/5 TAs, Hugret-Johnston
-1/1 TA, Cummings 3/3 TAs + 7/7 AccountFinancials + 1 Liability all still
-FK_ORPHAN post-deploy.
+1. `parentHouseholdId` is populated (entity is reachable from a household)
+2. `owners[]` is empty OR contains no entry whose `ownerType` is `INDIVIDUAL`
+   or `LEGAL_ENTITY`
 
-**Scope expansion (R-W7)**: detection now covers TangibleAsset,
-AccountFinancial, AND Liability (Cummings finding) — any entity with
-FK + edge-graph design. The classification rule for `fk_orphans[]` is:
-direct GET returns 200 AND `individualId IS NULL` AND
-`legalEntityId IS NULL` (regardless of `parentHouseholdId`),
-**applied across all three entity types**.
+If both conditions hold, classify as `no_owner_edges` and record under the
+`no_owner_edges[]` key in `stale_prior_uuids.json` with
+`{uuid, type, name, ownersList, reason: "parentHouseholdId populated; no IND/LE owner edge", fleet_aggregator_action}`.
 
-The agent SHOULD still log to `fk_orphans[]` for fleet-aggregator
-visibility. Phase 6 remediation: relies on the save-hook for any row
-that naturally gets touched by a planned write (preferred — zero
-extra work). For untouched legacy rows, escalate to RM/ops for the
-one-shot backend backfill job tracked on PLT-71. The Phase-6
-"populate missing FK from source documents" workaround is now optional
-and only useful if no natural write would otherwise touch the row.
+Phase 6 SHOULD attempt to identify the correct owner from source documents
+— deeds for real property, titles/registrations for vehicles, articles of
+incorporation for entity assets — but if the source document is ambiguous
+(e.g., a real-property deed names "John and Jane Smith as joint tenants"
+and Phase 4 has not yet decided whether the asset is attributable to the
+individual or to a joint LegalEntity), the agent MUST emit a Q-blocker
+rather than guess. Adding an OWNERSHIP edge POST against the wrong owner
+poisons downstream rollups in a way that's hard to reverse cleanly.
+
+**Historical note (PLT-77 retraction, 2026-04-29).** This rule was
+originally written to classify entities by `individualId IS NULL && legalEntityId IS NULL`
+on the DTO. Those columns don't exist on `TangibleAssetDto` /
+`AccountFinancialDto` / `LiabilityDto` — they were never part of the DTO
+contract; ownership has always been exposed via `owners[]`. Earlier
+agents using `dict.get('individualId')` were silently getting `None` for
+missing keys and producing 100% false-positive classifications. PLT-77
+retracted the original premise and this rule was rewritten to use the
+`owners[]` check above. PLT-71's `parentHouseholdId` retrofit landed
+cleanly (verified 2026-04-29 — Podolsky's parentHouseholdId is populated
+correctly across all sampled rows); PR #34's "forward-only fix" softening
+of this rule was based on the same false-positive misread and is reverted
+by this PR.
 
 ### Step 3.7: OWNERSHIP percentage sum check (Rule 80)
 
