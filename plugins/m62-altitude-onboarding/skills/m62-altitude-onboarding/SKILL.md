@@ -272,10 +272,42 @@ try:
     socket.gethostbyname("api.m62.live")
 except socket.gaierror:
     missing.append("DNS: cannot resolve api.m62.live (check network or set up hosts override — see Step 0.c)")
+# SSL chain probe (R-W5 amendment, Li-Yang rerun) — macOS Python 3.8
+# bundled certifi can fail to validate the api.m62.live cert chain. Probe
+# with urllib; on CERT failure, fall back to curl-based recipes (curl
+# uses the system keychain) or fix the chain via:
+#   pip install certifi && export SSL_CERT_FILE=$(python3 -m certifi)
+import ssl, urllib.request
+try:
+    urllib.request.urlopen("https://api.m62.live/api/v1/health", timeout=10)
+except ssl.SSLError as e:
+    missing.append(
+        f"SSL: cert chain validation failed ({e}). "
+        "On macOS Python 3.8, run "
+        "'pip install certifi && export SSL_CERT_FILE=$(python3 -m certifi)' "
+        "OR fall back to the curl-based recipes documented below "
+        "(curl uses the system keychain and is unaffected)."
+    )
+except urllib.error.HTTPError:
+    pass  # non-2xx is fine here; we're only probing the SSL handshake
+except urllib.error.URLError as e:
+    if "CERTIFICATE" in str(e).upper() or "SSL" in str(e).upper():
+        missing.append(f"SSL: {e}")
 if missing:
     sys.exit(f"Missing prerequisites: {', '.join(missing)}")
 print("All prerequisites OK")
 ```
+
+**SSL fallback recipes (R-W5 amendment, Li-Yang rerun).** If the SSL
+probe fails on macOS Python 3.8 with a `CERTIFICATE_VERIFY_FAILED` error
+and reinstalling `certifi` does not resolve it, the agent SHOULD use
+`curl` for all API calls instead of `urllib`/`requests`. `curl` reads
+the system keychain on macOS and is not affected by the bundled-certifi
+issue. Replace any recipe of the form
+`requests.get(url, headers={...})` with the equivalent
+`subprocess.run(["curl", "-s", "-H", f"Authorization: Bearer {jwt}", url], ...)`.
+This is a workaround, not a permanent fix — Python ≥3.10 with a
+fresh certifi install resolves the underlying issue.
 
 ### Windows-Specific Notes
 
@@ -6851,6 +6883,78 @@ for a reference example (RM handoff format).
     vs. "investment fund many people subscribe to" (no edge). The former is administered
     under this household's engagement; the latter isn't.
 
+    ### Rule 53 strengthening — firm-as-Contact name heuristic (R-W6 amendment, Rohlen rerun)
+
+    Rohlen R-W6 found 5 firms saved as Contacts with `personName.first/last`
+    populated rather than as LegalEntity (or Contact with firm-name fields):
+    Frank Rimerman + Co. LLP, IEQ Capital LLC, EPIQ Capital Group, Allied
+    Brokers Insurance Agency Inc, Sun Valley Insurance. Root cause: the name
+    parser split "Frank, Rimerman" / "+ Co. LLP" as if `Frank` were a first
+    name and `Rimerman + Co. LLP` were a last name. The downstream Contact
+    POST accepted the malformed personName silently.
+
+    **Pre-extraction firm-name heuristic**: before classifying any extracted
+    name as a Contact-with-personName, scan for firm-suffix tokens. If the
+    name contains any of:
+
+    - `LLC`, `L.L.C.`
+    - `LLP`, `L.L.P.`
+    - `Inc`, `Inc.`, `Incorporated`
+    - `Ltd`, `Ltd.`, `Limited`
+    - `PLLC`, `P.L.L.C.`, `PC`, `P.C.`
+    - `Capital`, `Group`, `Partners`, `Holdings`, `Associates`
+    - `& Co`, `+ Co`, `and Co`
+    - `Trust Company`, `Insurance Agency`, `Insurance Services`
+    - `Advisors`, `Advisory`, `Wealth Management`, `Asset Management`
+    - `Bank`, `Trust`, `N.A.`, `FSB`, `Federal Savings`
+    - `Foundation`, `Endowment`
+
+    classify as **LegalEntity** (if household-controlled per Rule 53
+    doctrine — family-controlled FLP/LLC/trust) or **Contact** with
+    `firmName` populated and `personName` left null (if external/shared per
+    Rule 53). NEVER classify as a Contact-with-personName splitting the
+    firm name into first/last fields.
+
+    ```python
+    # rule_53_firm_name_heuristic.py
+    FIRM_SUFFIX_TOKENS = (
+        # Entity-form suffixes
+        " LLC", " L.L.C.", " LLP", " L.L.P.", " PLLC", " P.L.L.C.",
+        " Inc", " Inc.", " Incorporated", " Ltd", " Ltd.", " Limited",
+        " PC", " P.C.", " N.A.", " FSB",
+        # Firm-name nouns
+        " Capital", " Group", " Partners", " Holdings", " Associates",
+        " Trust Company", " Insurance Agency", " Insurance Services",
+        " Advisors", " Advisory", " Wealth Management", " Asset Management",
+        " Bank", " Foundation", " Endowment",
+        # Conjunction firm patterns
+        " & Co", " + Co", " and Co",
+    )
+
+    def looks_like_firm(name):
+        if not name:
+            return False
+        n = " " + name.strip()  # leading space normalizes the prefix match
+        upper = n.upper()
+        return any(tok.upper() in upper for tok in FIRM_SUFFIX_TOKENS)
+    ```
+
+    When `looks_like_firm(name)` returns True, the extraction agent MUST
+    NOT populate `personName.first/last`. Route to LegalEntity or Contact-
+    with-firmName per the household-controlled-vs-external Rule 53 split.
+    If the source document is ambiguous (e.g., a tax return preparer
+    block where the firm could be a sole-prop with a trade name that
+    happens to contain "Capital"), emit a Q-blocker with the candidate
+    classification rather than guessing — same no-auto-classify discipline
+    as Rule 84 extension.
+
+    Cross-reference Rule 85 (Contact relationship direction validation) —
+    Rohlen's 10/10 inverted-direction Contacts WERE the same 5 firms
+    misclassified by this name-parser bug, plus 5 others. The two rules
+    fire on overlapping but distinct error classes: Rule 53 strengthening
+    catches firm-as-personName at extraction; Rule 85 catches
+    direction inversion at relationship POST.
+
     ### What does NOT count as a Rule 60 gap — external fund vehicle exception
 
     Rule 60's "OWNERSHIP gap" detection (used by retrofit sweeps and Phase 3.7 self-audit)
@@ -8336,40 +8440,72 @@ right outcome is a Q-blocker recommending the reviewer backfill
 a follow-up ask to the client) and then either rerun the Phase 6 link step
 or POST the link manually.
 
-**Step 2 explicit pre-check**:
+**Step 2 explicit pre-check** (expanded by 2026-04-29 cleanup execution
+to cover all three NOT NULL fields, not just `coverageAmount`):
 
 ```python
 # rule_78_step2.py — apply BEFORE attempting the TangibleAssetInsurance POST
+# The TangibleAssetInsurance POST schema has THREE non-null required fields:
+# coverageAmount, effectiveDate, expirationDate. Any null returns 409.
+# Validate all three; emit field-specific Q-blocker so the reviewer knows
+# exactly which field to backfill.
+
+REQUIRED_NON_NULL_FIELDS = ("coverageAmount", "effectiveDate", "expirationDate")
+
 def link_ta_insurance(policy, ta, household_folder):
-    if policy.get("coverageAmount") is None:
-        # Q-blocker exit — NOT a Rule 78 failure
-        emit_q_blocker(
-            blocker_type="TA_INSURANCE_LINK_DEFERRED_NULL_COVERAGE_AMOUNT",
-            policy_id=policy["id"],
-            policy_number=policy.get("policyNumber"),
-            tangible_asset_id=ta["id"],
-            tangible_asset_name=ta.get("nickname") or ta.get("description"),
-            recommended_action="Backfill coverageAmount on the policy from "
-                               "declarations page or carrier portal, then rerun "
-                               "Phase 6 link step.",
-        )
+    missing = [f for f in REQUIRED_NON_NULL_FIELDS if policy.get(f) is None]
+    if missing:
+        # Q-blocker exit — NOT a Rule 78 failure. One blocker per missing
+        # field, so the reviewer's backfill checklist is unambiguous.
+        for field in missing:
+            emit_q_blocker(
+                blocker_type=f"TA_INSURANCE_LINK_DEFERRED_NULL_{field.upper()}",
+                policy_id=policy["id"],
+                policy_number=policy.get("policyNumber"),
+                tangible_asset_id=ta["id"],
+                tangible_asset_name=ta.get("nickname") or ta.get("description"),
+                missing_field=field,
+                recommended_action=f"Backfill {field} on the policy from "
+                                   f"declarations page or carrier portal, then "
+                                   f"rerun Phase 6 link step.",
+            )
         log_link_action(
             policy_id=policy["id"], ta_id=ta["id"],
-            tai_link_action="DEFERRED_NULL_COVERAGE_AMOUNT",
-            note="Q-blocker emitted; not a failure",
+            tai_link_action=f"DEFERRED_NULL_{missing[0].upper()}",
+            note=f"Q-blockers emitted for missing fields: {missing}; not a failure",
         )
         return  # continue with the next pair — do NOT halt Phase 6
     # ... normal POST + Rule 75 verification path ...
 ```
 
-The `tai_link_action` enum on `phase6_ta_insurance_links.jsonl` gains a
-third value alongside `POSTED` and `VERIFIED_EXISTING`:
+**2026-04-29 cleanup execution finding**: the Podolsky cleanup encountered
+the Chubb Collections policy blocking 9/15 jewelry pairs. The blocker was
+NOT `coverageAmount` (which was 425066) — it was `effectiveDate` and
+`expirationDate` both null. The pre-R-W6 single-field check skipped the
+Q-blocker emission because `coverageAmount` was non-null, then the
+subsequent POST returned 409 with a non-actionable error envelope. The
+expanded three-field check above emits a field-specific
+`TA_INSURANCE_LINK_DEFERRED_NULL_EFFECTIVEDATE` and
+`TA_INSURANCE_LINK_DEFERRED_NULL_EXPIRATIONDATE` so the reviewer can
+chase the correct fields.
+
+The `tai_link_action` enum on `phase6_ta_insurance_links.jsonl` gains
+deferral values alongside `POSTED` and `VERIFIED_EXISTING`. The
+`DEFERRED_NULL_*` family is field-specific (2026-04-29 cleanup execution
+amendment):
 
 | `tai_link_action` | Meaning |
 |---|---|
 | `POSTED` | New TangibleAssetInsurance row created during this run |
 | `VERIFIED_EXISTING` | Pre-existing link confirmed via GET |
-| `DEFERRED_NULL_COVERAGE_AMOUNT` | Q-blocker emitted because policy.coverageAmount was null. Step 1 (TA `isInsured` PATCH) still ran successfully; only the link-record POST is deferred until source data is backfilled |
+| `DEFERRED_NULL_COVERAGEAMOUNT` | Q-blocker emitted because policy.coverageAmount was null |
+| `DEFERRED_NULL_EFFECTIVEDATE` | Q-blocker emitted because policy.effectiveDate was null. Common on collection-policy items added mid-cycle without their own coverage-period dates |
+| `DEFERRED_NULL_EXPIRATIONDATE` | Q-blocker emitted because policy.expirationDate was null. Same root cause as effectiveDate — typically co-occur |
+
+In all `DEFERRED_NULL_*` cases, Step 1 (TA `isInsured` PATCH) still ran
+successfully; only the link-record POST is deferred until source data is
+backfilled. When multiple fields are null, log the first missing field
+in the `tai_link_action` cell and emit one Q-blocker per missing field.
 
 Phase 6 does NOT halt or retry on this case. The deferred link is surfaced
 to the Phase 5 review with the policy + TA UUIDs so the human reviewer can
@@ -8391,15 +8527,24 @@ the Rule 28 summary fields (`primaryInsurancePolicyNumber`, `insuredValue`,
 record exists between them via `GET /api/v1/tangible-asset/{assetId}/insurance`,
 POSTing one through `POST /api/v1/tangible-asset/{assetId}/insurance` if not.
 Both writes apply Rule 75 verification (status assert, id assert, GET-back).
-**Step 2 pre-check (R-W3 amendment)**: before attempting the
-`TangibleAssetInsurance` POST, verify `policy.coverageAmount != null` — if
-null, emit a `TA_INSURANCE_LINK_DEFERRED_NULL_COVERAGE_AMOUNT` Q-blocker
-recommending backfill, log the link action as `DEFERRED_NULL_COVERAGE_AMOUNT`
-on `phase6_ta_insurance_links.jsonl`, and continue to the next pair. This is
-NOT a Rule 78 failure — Step 1 still captured the summary-level insurance
-attribution; only the per-coverage line-item is deferred. McIntosh R-W3
-hit this on Mercury policy BQ0000792488 covering Robin McIntosh's BMW X5
-(coverageAmount missing in source data).
+**Step 2 pre-check (R-W3 amendment, expanded by 2026-04-29 cleanup
+execution)**: before attempting the `TangibleAssetInsurance` POST,
+verify ALL THREE of `coverageAmount`, `effectiveDate`, AND
+`expirationDate` are non-null on the source InsurancePolicy. The
+`TangibleAssetInsurance` POST schema has NOT NULL constraints on all
+three (returns 409 if any null). For each missing field, emit a
+field-specific Q-blocker (`TA_INSURANCE_LINK_DEFERRED_NULL_<FIELDNAME>`
+with FIELDNAME in {`COVERAGEAMOUNT`, `EFFECTIVEDATE`, `EXPIRATIONDATE`})
+recommending backfill, log the link action as `DEFERRED_NULL_<FIELDNAME>`
+on `phase6_ta_insurance_links.jsonl` (using the first missing field), and
+continue to the next pair. This is NOT a Rule 78 failure — Step 1 still
+captured the summary-level insurance attribution; only the per-coverage
+line-item is deferred. McIntosh R-W3 hit `coverageAmount` null on Mercury
+policy BQ0000792488 covering Robin McIntosh's BMW X5. The 2026-04-29
+Podolsky cleanup hit `effectiveDate` AND `expirationDate` both null on
+the Chubb Collections policy blocking 9/15 jewelry pairs (coverageAmount
+was 425066 — fine — but the pre-R-W6 single-field check missed the
+deferral and the POST returned 409 with a non-actionable envelope).
 The cross-link MUST NOT be deferred to Phase 5 review — by then the household
 ships with `isInsured: false` on policies whose 1:1 TA was already in the
 household. Output is `phase6_ta_insurance_links.jsonl`, one entry per linked
@@ -8408,6 +8553,22 @@ when empty. Discovered on the Comolli rerun where two real-property TAs had
 `isInsured: false` despite each carrying a 1:1 Chubb HOMEOWNERS policy.
 
 ### Step 1.5c: Detect FK_ORPHAN TangibleAssets (Rule 79)
+
+> **✅ Backend fix shipped 2026-04-29 — PLT-71 RESOLVED.** The backend
+> now retroactively backfills `parentHouseholdId` (and the relevant
+> graph-derived FK columns) on existing FK_ORPHAN rows on the next write
+> that touches the row, and rejects new writes that would create a fresh
+> FK_ORPHAN. The previously-documented Phase 6 workaround ("attempts to
+> populate missing FK from source documents") is **no longer required for
+> remediation** — the backend self-heals on next write. **Rule 79's
+> purpose narrows from detection-plus-remediation to detection-only**:
+> the rule remains valuable as a Phase 1.5 audit step (catches legacy
+> rows still in the FK_ORPHAN state, surfaces them in
+> `stale_prior_uuids.json` for fleet-aggregator visibility), but Phase 6
+> no longer needs to chase deeds/titles/registrations to populate FKs
+> manually. The first OWNERSHIP edge POST or PATCH that touches the row
+> triggers the backend backfill. Cross-reference the analogous PLT-67 /
+> PLT-68 fix markers in commit e523c0e (PR #30).
 
 The Rule 69 prior-UUID lookup pass classifies entities into `live`, `orphan`,
 `soft_deleted`, and `hard_deleted` buckets — but the Comolli rerun surfaced a
@@ -8453,7 +8614,14 @@ attempt to populate the missing FK from source documents (deed, title,
 registration); on ambiguity (joint tenants where the IND vs LE attribution
 isn't yet decided) emit a Q-blocker rather than guess. Discovered on the
 Comolli rerun where two real-property TAs ($25M + $5M) had both FKs NULL
-despite a populated `parentHouseholdId`.
+despite a populated `parentHouseholdId`. **Post-PLT-71 (shipped
+2026-04-29)**: the backend now retroactively backfills the missing FK
+columns on the next write that touches the row, so Phase 6 no longer
+needs to chase deeds/titles for remediation — the rule's purpose narrows
+to detection/audit. The first OWNERSHIP edge POST or PATCH triggers the
+backend backfill; the agent SHOULD still log to `fk_orphans[]` for
+fleet-aggregator visibility, but the workaround "Phase 6 attempts to
+populate missing FK from source docs" is de-emphasized and now optional.
 
 ### Step 3.7: OWNERSHIP percentage sum check (Rule 80)
 
@@ -8652,6 +8820,23 @@ def check_ownership_sum(target, inbound_ownership_edges):
                    if e.get("sourceEntityType") != "HOUSEHOLD"]
     non_hh_sum = sum(float(e.get("percentage") or 0) for e in other_edges)
 
+    # Pre-check VIOLATION_HH_AND_NON_HH_BOTH_100 — concurrent double-claim
+    # (R-W5 amendment, Li-Yang rerun). Fires BEFORE the exemptions below
+    # because this pattern looks "fine" to the non-HH sum check (sum=100,
+    # PASS) but the HH→target@100% edge is a redundant ghost edge that
+    # double-claims the target. Distinct from Exemption C (sole HH inbound,
+    # placeholder pending RM attribution) — here the non-HH owner already
+    # exists at 100%, so the HH edge is not a placeholder, it is leftover.
+    hh_at_100 = [e for e in household_edges
+                 if abs(float(e.get("percentage") or 0) - 100) < 1]
+    non_hh_at_100 = [e for e in other_edges
+                     if abs(float(e.get("percentage") or 0) - 100) < 1]
+    if hh_at_100 and non_hh_at_100:
+        return ("VIOLATION_HH_AND_NON_HH_BOTH_100",
+                f"hh_edges_at_100={len(hh_at_100)} "
+                f"non_hh_edges_at_100={len(non_hh_at_100)} "
+                f"redundant_hh_ghost_edge")
+
     # Exemption A — visibility-only on irrevocable trust
     if not other_edges and household_edges and target.get("type") == "LEGAL_ENTITY":
         return ("EXEMPT_A", "irrevocable_trust_visibility_only")
@@ -8721,6 +8906,39 @@ non-Addepar accounts with `HH@100%` as the sole edge are NOT exempt
 (they would indicate either a mis-modeled household-direct holding or a
 genuine Rule 80 gap).
 
+**`VIOLATION_HH_AND_NON_HH_BOTH_100` — concurrent HH+non-HH double-claim
+(R-W5 amendment, Li-Yang rerun).**
+
+Detection gap closed: the R-W3 amendment that excludes HOUSEHOLD-source
+edges from the non-HH sum is silent on the case where BOTH a
+`HOUSEHOLD → target OWNERSHIP 100%` edge AND a non-HH (`INDIVIDUAL` or
+`LEGAL_ENTITY`) `→ target OWNERSHIP 100%` edge exist concurrently. The
+non-HH sum computes to 100% (PASS) and the HH edge is excluded from the
+sum, so the existing logic returns `PASS` even though the target is
+double-claimed. Li-Yang's R-W5 surfaced this on accounts where a stale
+HH→ACCT edge from an earlier Addepar-placeholder phase had not been
+retired after the RM later attributed the account to a specific
+Individual at 100%.
+
+Detection: at least one HH-source OWNERSHIP edge at percentage 100% AND
+at least one non-HH-source OWNERSHIP edge at percentage 100% inbound to
+the same target. Fires as a **VIOLATION** (not an exemption), distinct
+status `VIOLATION_HH_AND_NON_HH_BOTH_100`, logged to
+`ownership_sum_violations.jsonl` with the same schema plus
+`pattern: "concurrent_hh_and_non_hh_100"` and `hh_edge_ids: [...]`,
+`non_hh_edge_ids: [...]`. **Distinguished from Exemption C**: Exemption
+C requires the HH edge to be the SOLE inbound OWNERSHIP edge (placeholder
+pending RM attribution); here a non-HH owner already exists at 100%, so
+the HH edge is redundant ghost data — not a placeholder.
+
+Remediation: emit a Q-blocker recommending Phase 6 soft-delete the HH
+edge (the redundant ghost), preserving the non-HH economic-ownership
+edge. Phase 6 SHOULD soft-delete (not hard-delete) to keep the
+audit-history trail of the prior placeholder. Cross-reference Rule 60
+(HH visibility-edge doctrine) — visibility edges are 0% by convention;
+a HH→target at 100% concurrent with a non-HH 100% is not a visibility
+edge, it is a stale claim.
+
 Cross-reference: this exemption block is the operational counterpart to
 Rule 60's grantor amendment (PR #15), the HOUSEHOLD visibility-edge
 doctrine, and the Addepar-sync placeholder convention. When any of those
@@ -8750,7 +8968,15 @@ account has an `externalIds[]` entry with `provider == "ADDEPAR"`, mark
 as `EXEMPT_C_ADDEPAR_PLACEHOLDER` in `ownership_sum_violations.jsonl`
 (surfaced as informational follow-up, not silently suppressed) with a
 reviewer note recommending RM attribution to a specific
-Individual/LegalEntity. Only outside all three exemptions, when the
+Individual/LegalEntity. **Pre-check**
+`VIOLATION_HH_AND_NON_HH_BOTH_100` (R-W5 amendment, Li-Yang) — runs
+BEFORE the exemptions. If the target has at least one HH-source
+OWNERSHIP edge at 100% AND at least one non-HH-source OWNERSHIP edge at
+100%, fire VIOLATION immediately. The non-HH sum would otherwise PASS
+(since HH edges are excluded), but the HH 100% edge is a redundant
+ghost — Phase 6 soft-deletes the HH edge during remediation. Distinct
+from Exemption C (which requires the HH edge to be the SOLE inbound
+edge). Only outside all three exemptions and the pre-check, when the
 non-HOUSEHOLD sum is < 99% or > 101%, flag `OWNERSHIP_SUM_VIOLATION`, log to `ownership_sum_violations.jsonl`
 with `{target_entity_id, target_entity_name, target_entity_type, actual_sum,
 expected: 100, contributing_edges, ts}`, and emit a Q-blocker enumerating
@@ -9157,6 +9383,97 @@ file with `suggested_action: "promote_to_Individual_household_member"`.
 Discovered on Ryan R-W4 where `Greg Ryan` was modeled as a household
 member but Q6 documents him as 3rd Successor Trustee — non-member per
 Rule 53.
+
+### Step 4.4b: Contact relationship direction validation (Rule 85)
+
+**R-W6 amendment, Rohlen rerun.** Step 4.4's relationship matrix
+documents that role-type relationships (ADVISOR, ATTORNEY, ACCOUNTANT,
+TRUSTEE, AUDITOR, INSURANCE_AGENT, etc.) point FROM the household
+entity (HH/IND/LE) TO the Contact — `entity points TO the advisor`.
+Rohlen's R-W6 audit found 10/10 Contact relationships posted with the
+direction inverted: `CONTACT → IND ADVISOR`, `CONTACT → IND ATTORNEY`,
+etc. The backend silently accepted every inverted POST (HTTP 201, valid
+UUID returned), but the resulting edges were unreachable from the
+household graph traversal because `/individual/{id}/relationships/from`
+returns role-type edges expecting the household entity as source. Net
+effect: the Contact records existed, the relationship rows existed, the
+Phase 5 review showed the relationships, but the household dashboard
+showed no advisors/attorneys/accountants. A backend ticket is queued for
+the silent-accept bug; until it lands, the skill enforces direction at
+the agent.
+
+**Pre-POST direction validation** (apply BEFORE every Phase 6
+`POST /api/v1/entity-relationship` whose `relationshipType` is a
+role-type per the matrix):
+
+```python
+# rule_85_direction_check.py — apply before every entity-relationship POST
+ROLE_TYPES_REQUIRING_CONTACT_TARGET = {
+    "ADVISOR", "ATTORNEY", "ACCOUNTANT", "TRUSTEE", "AUDITOR",
+    "INSURANCE_AGENT", "INVESTMENT_ADVISOR", "BOOKKEEPER",
+    "FINANCIAL_PLANNER", "TAX_PREPARER",
+}
+HOUSEHOLD_SIDE_TYPES = {"INDIVIDUAL", "LEGAL_ENTITY", "HOUSEHOLD"}
+
+def validate_contact_direction(rel, household_folder):
+    rt = rel.get("relationshipType")
+    if rt not in ROLE_TYPES_REQUIRING_CONTACT_TARGET:
+        return True  # not a role-type relationship; direction unconstrained here
+    src_type = rel.get("sourceEntityType")
+    tgt_type = rel.get("targetEntityType")
+    direction_ok = (
+        src_type in HOUSEHOLD_SIDE_TYPES and
+        tgt_type == "CONTACT"
+    )
+    if not direction_ok:
+        # Refuse to POST. Log to phase6_inverted_relationship_direction.json
+        log_inverted_direction(
+            household_folder=household_folder,
+            relationship=rel,
+            reason=f"role_type={rt} requires "
+                   f"source in {HOUSEHOLD_SIDE_TYPES} and target=CONTACT; "
+                   f"got source={src_type}, target={tgt_type}",
+        )
+        return False
+    return True
+```
+
+The output file `phase6_inverted_relationship_direction.json` captures
+every refused POST with `{ts, relationship, reason}` and is surfaced in
+the Phase 5 review as a "Contact direction inverted — refused" section.
+Empty file (`refused: []`) required on every rerun for fleet-aggregator
+consistency, same convention as Rules 83 / 84 / 84-extension.
+
+**Why refuse rather than auto-flip**: the agent does not always know
+whether the inversion is an extraction error (the role flowed in as
+Contact-as-source from the source document) or a genuine
+non-role-type relationship that happens to share the
+`ADVISOR`/`ATTORNEY` enum value. Surfacing to the human reviewer for
+authorization is the safe path. If the reviewer confirms the intent is
+the documented direction, the skill flips and POSTs in a Phase 5
+follow-up step.
+
+#### Rule 85 — Contact relationship direction validation
+
+For every Phase 6 `POST /api/v1/entity-relationship` whose
+`relationshipType` is a role-type per Step 4.4 (ADVISOR, ATTORNEY,
+ACCOUNTANT, TRUSTEE, AUDITOR, INSURANCE_AGENT, INVESTMENT_ADVISOR,
+BOOKKEEPER, FINANCIAL_PLANNER, TAX_PREPARER), assert
+`sourceEntityType in {INDIVIDUAL, LEGAL_ENTITY, HOUSEHOLD}` AND
+`targetEntityType == CONTACT`. If the assertion fails, REFUSE to POST
+and log to `phase6_inverted_relationship_direction.json` with
+`{ts, relationship, reason}` for Phase 5 review. The backend silently
+accepts inverted-direction POSTs (HTTP 201) but the resulting edges are
+unreachable from household graph traversal — Rohlen's R-W6 audit found
+10/10 Contact relationships had inverted direction, all silently
+accepted. Cross-reference the Step 4.4 matrix where role-types are
+documented as `entity points TO the advisor`. A backend ticket is
+queued to make the silent-accept reject inverted directions at the API
+boundary; until it lands, this rule is the only line of defense.
+Discovered on Rohlen R-W6 (10/10 inverted Contact relationships; the
+Contacts were Frank Rimerman + Co. LLP, IEQ Capital LLC, EPIQ Capital
+Group, Allied Brokers Insurance Agency Inc, Sun Valley Insurance — see
+also Rule 53 strengthening for the orthogonal firm-as-Contact issue).
 
 ---
 
