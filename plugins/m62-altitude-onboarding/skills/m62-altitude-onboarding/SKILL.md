@@ -8711,6 +8711,28 @@ sum is materially different from 100, there is almost certainly a missing
 counterparty edge — but the OWNERSHIP graph "looks ok" entity-by-entity,
 because each individual edge is well-formed.
 
+**Scope (R-W7 fleet audit, 2026-04-29).** Rule 80 applies to OWNERSHIP edges
+targeting ANY of these entity types: **AccountFinancial, TangibleAsset,
+LegalEntity, InsurancePolicy, Liability**. Not just accounts. The 2026-04-29
+fleet-wide audit on AccountFinancial alone surfaced 1 violation across 335
+accounts in 22 households (Emmett's "Holding 2" with two LE owners both at
+100%); extending the audit to TA + LE is recommended for completeness, since
+the same retire-and-replace partial-push pattern that caused the Emmett
+account violation likely produced LE-as-target violations too (Emmett's prior
+agent run flagged 4 LE-as-target Rule 80 sum=200% cases on Casa Rincon, Lot
+72, RMP, RMM — same mechanism, different target type).
+
+When auditing a household's OWNERSHIP graph, iterate inbound OWNERSHIP edges
+on every entity type in the scope above, not just accounts. The
+classification function (`check_ownership_sum`) is target-type-agnostic in
+its core logic; the only target-type-specific branch is **Exemption C**
+(Addepar HOUSEHOLD@100% placeholder), which currently applies only when
+`target.type == ACCOUNT_FINANCIAL` AND the target has an Addepar `externalId`.
+Whether Exemption C should also apply to Addepar-synced TAs (e.g., real
+property fed via Addepar with HH-only ownership pre-attribution) is a TODO
+worth verifying empirically next time an Addepar TA placeholder appears in a
+fleet rerun.
+
 Comolli's two real-property TangibleAssets each had Hannah Comolli at 50%
 OWNERSHIP — and no edge at all from Kevin Comolli, even though pre-divorce
 the property was held jointly. The 50%-only edge was internally consistent;
