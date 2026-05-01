@@ -49,6 +49,38 @@ audit pipelines treat `OTHER` as an unclassified backlog to revisit. As of 2026-
 fleet-wide there were ~860 docs still tagged `OTHER` that needed reclassification; this
 is the avoidable case.
 
+### Always POST `/associations` after a typed upload
+
+The typed upload endpoints (`POST /api/v1/individual/{id}/document`,
+`/account-financial/{id}/document`, `/legal-entity/{id}/document`,
+`/insurance-policy/{id}/document`, `/liability/{id}/document`,
+`/tangible-asset/{id}/document`, `/fund/{id}/document`) populate the legacy FK field
+(`individualId`, `accountFinancialId`, etc.) on the document — but they do NOT
+populate the `entityAssociations` array. The Altitude UI's entity-associations panel
+reads from `entityAssociations`, not from the FK, so docs uploaded via typed endpoints
+without a follow-up association call appear "unassociated" in the UI.
+
+**Always follow every typed upload with a POST to the associations endpoint:**
+
+```
+POST /api/v1/document/{docId}/associations
+  ?entityType={ENTITY_TYPE}        ← match the typed upload (e.g., ACCOUNT_FINANCIAL)
+  &entityId={ENTITY_UUID}          ← same id used in the typed upload path
+  &associationType=OWNER           ← OWNER for primary attachment; SUBJECT/RELATED for additional
+  &entityDisplayName={NAME}        ← optional but useful for the UI label
+```
+
+The endpoint is **idempotent** — resubmitting the same `(documentId, entityType, entityId, associationType)` tuple returns the existing association without error. Safe to call defensively.
+
+For multi-entity documents (e.g., a trust agreement that mentions both the trust and
+the trustees), POST one association per entity. The first POST should be `OWNER` (the
+primary attachment); subsequent ones for related entities use `SUBJECT` or `RELATED_PARTY`.
+
+**Why this matters**: without the follow-up POST, docs are invisible in the UI's
+associations panel, household-rollup views, and any downstream consumer that reads
+`entityAssociations` instead of the legacy FK. Fleet audit on 2026-05-01 found 320 docs
+that needed entityAssociations backfilled because earlier upload paths skipped this step.
+
 ## Individual Documents
 
 Upload via: `POST /api/v1/individual/{individualId}/document`
