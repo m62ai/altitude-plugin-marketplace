@@ -18,6 +18,37 @@ Legal Entity, not the Individual.
 > hierarchy diagrams, etc.) should be associated with the **primary individual** or the
 > **primary legal entity** in the household, using `documentSubType: "OTHER"`.
 
+### Tie-breaker: prefer the specific entity type when a matching record exists
+
+Some documents are valid against multiple `documentType` enums (e.g., `MORTGAGE_STATEMENT`
+appears as a valid subtype on both `INDIVIDUAL` and `LIABILITY`; `PROPERTY_DEED` appears on
+`INDIVIDUAL` and `TANGIBLE_ASSET` has `DEED`). When a more specific entity record exists
+in the household, **always prefer the specific entity type over the generic individual
+attachment.** Specific record wins because it keeps the rollup graph clean and lets
+account/liability/asset balance reconciliation pick up the document.
+
+| Document subject | Use this `documentType` (with subtype) | Don't use this even if valid |
+|---|---|---|
+| Mortgage statement, HELOC statement, loan statement | `LIABILITY` / `ACCOUNT_STATEMENT` | `INDIVIDUAL` / `MORTGAGE_STATEMENT` |
+| Form 1098 (mortgage interest) | `LIABILITY` / `FORM_1098` | `INDIVIDUAL` / any 1099 subtype |
+| Real estate deed (Grant Deed, Quitclaim, Deed of Gift, Interspousal Transfer) | `TANGIBLE_ASSET` / `DEED` | `INDIVIDUAL` / `PROPERTY_DEED` or `LEGAL_ENTITY` (even if deed grants TO a trust) |
+| Vehicle / vessel / aircraft title | `TANGIBLE_ASSET` / `TITLE` | `INDIVIDUAL` |
+| EIN confirmation letter (e.g., `EIN - {EntityName}.pdf`) | `LEGAL_ENTITY` / `EIN_CONFIRMATION` | `LIABILITY` (even if the LE holds debt) |
+| Property tax bill | `TANGIBLE_ASSET` / `PROPERTY_TAX` | `INDIVIDUAL` / `PROPERTY_TAX_DOCUMENTS` |
+| K-1 (partnership/fund issuing the K-1) | Either the issuing `LEGAL_ENTITY` or the recipient `INDIVIDUAL` based on context — recipient is fine when the partnership isn't onboarded as an LE; otherwise prefer LE. |  |
+
+The `INDIVIDUAL` subtypes `MORTGAGE_STATEMENT`, `PROPERTY_DEED`, `LEASE_AGREEMENT`,
+`PROPERTY_TAX_DOCUMENTS` exist in the enum for cases where no specific liability/asset
+record was created — they're the fallback, not the primary.
+
+### `documentSubType: OTHER` is a flag, not an end state
+
+`OTHER` should be a last-resort fallback only when no specific subtype fits. If you can
+classify the document into a specific subtype from the entity-type's enum, do so —
+audit pipelines treat `OTHER` as an unclassified backlog to revisit. As of 2026-05-01,
+fleet-wide there were ~860 docs still tagged `OTHER` that needed reclassification; this
+is the avoidable case.
+
 ## Individual Documents
 
 Upload via: `POST /api/v1/individual/{individualId}/document`
@@ -670,7 +701,10 @@ data for all mentioned entities.
 
 ## contentType Mapping
 
-Map file extensions to `contentType` enum values:
+Map file extensions to `contentType` enum values. Always set `contentType` based on the
+actual file extension; don't fall back to `TXT` for unknown formats — use the right value
+or leave the upload to backend mime-detection.
+
 | Extension | contentType |
 |---|---|
 | .pdf | `PDF` |
@@ -691,6 +725,15 @@ Map file extensions to `contentType` enum values:
 | .zip | `ZIP` |
 | .mp4 | `MP4` |
 | .mp3 | `MP3` |
+| .eml | `EML` |
+| .msg | `MSG` |
+| .heic | `HEIC` |
+| .tiff, .tif | `TIFF` |
+
+> **`.eml` files**: Email exports (`.eml`) belong to `INDIVIDUAL` with subtype `CORRESPONDENCE`
+> by default. If the email is about a specific liability (e.g., loan correspondence) attach
+> to that `LIABILITY` with subtype `CORRESPONDENCE`. Don't set `contentType` to `TXT` for
+> emails — use `EML` (added to the enum 2026-05-01).
 
 ---
 
