@@ -356,6 +356,71 @@ HH membership edge (i.e., they are a primary household member who *also* serves 
 healthcare agent), do NOT add a second visibility edge — just add the role-specific
 HEALTHCARE_AGENT edge alone. One person, one HH-membership edge.
 
+## Keep flat fields in sync with the OWNERSHIP graph (especially ILIT flags)
+
+Several entity fields are duplicates of information already expressed in the relationship
+graph. Today the platform does NOT auto-derive these flat fields from edges (planned
+backend fix per PLT-88), so the skill must keep them consistent at creation time. Drift
+silently misrepresents the data; the most impactful case is `isIlitOwned` on
+InsurancePolicy because it changes estate-tax modeling.
+
+**Rule for life-insurance policies**: when the policy's owner is an ILIT (Irrevocable Life
+Insurance Trust), set BOTH:
+
+```json
+{
+  "isIlitOwned": true,
+  "ilitLegalEntityId": "<le-id-of-the-ILIT>"
+}
+```
+
+…on the InsurancePolicy POST/PATCH body, AND create the OWNERSHIP edge from the ILIT to
+the policy.
+
+**ILIT detection criteria** (a LegalEntity is an ILIT when ALL hold):
+1. `entityType: TRUST`
+2. Either `trust.isIrrevocable: true` (canonical signal), OR the trust name matches the
+   case-insensitive regex `\b(ILIT|irrevocable|insurance trust|life insurance trust)\b`
+3. The name does NOT match `\brevocable trust\b` as a *whole* token — beware that
+   `"revocable"` is a substring of `"irrevocable"` and a naive contains-check will
+   false-match. Use word-boundary regex: `(?:^|[^a-z])revocable\s+trust`.
+
+**Common ILIT name patterns** (from Verita 2026-05-05 cleanup):
+- `<Name> Family <Year> Irrevocable Trust` (e.g., "AL Family 2020 Irrevocable Trust")
+- `<Insured Name> Irrevocable Trust` (e.g., "Kevin Dawdy Irrevocable Trust")
+- `The <Insured> Irrevocable Trust` (e.g., "The Roger A McIntosh Irrevocable Trust")
+- `<Name> ILIT` (literal acronym usage)
+- `<Name> Insurance Trust` / `<Name> Life Insurance Trust`
+
+**The reverse case** (don't set the flag wrongly): if the policy is owned by an Individual
+or by a revocable trust (e.g., "John Smith Revocable Living Trust"), `isIlitOwned` MUST be
+`false` and `ilitLegalEntityId` must be `null`. A revocable trust is part of the grantor's
+estate for tax purposes, so it does NOT confer ILIT treatment.
+
+**Why this matters**: the whole point of an ILIT is to keep death benefit *outside* the
+insured's taxable estate. A misflagged policy:
+- Distorts UI views ("Estate-Tax Exposure" panel reads from the flat field)
+- Distorts MCP responses (`get_insurance_info` exposes the flag to LLM consumers)
+- Causes wrong estate-tax projections — advisor may over-buy ILIT-replacement coverage
+  thinking the policy is in-estate when it's actually out, or under-prepare for tax when
+  the platform shows ILIT-owned but it's actually in-estate.
+
+**Same pattern applies to other flat-field-vs-graph duplicates** (audit and keep in sync
+at creation):
+- `InsurancePolicy.isInsuredByOwner` (when insured = a person who's also one of the
+  owners) — set `true`, otherwise `false`/`null`
+- `TangibleAsset.isInsured` — set `true` if there's an active OWNERSHIP edge from an
+  InsurancePolicy or if `primaryInsurancePolicyId` is populated
+- `TangibleAsset.totalLiabilityBalance` — should reflect sum of LIABILITY records linked
+  to this asset; do not invent a number, leave null if no liabilities are linked
+- Trust subtype booleans on LegalEntity (`isRevocable`, `isGrantor`,
+  `isIntentionallyDefective`) — set from the trust agreement document; if not
+  determinable, leave null and add open-question
+
+When in doubt about whether a flat field is auto-derived or skill-maintained, check by
+querying a recently-created entity: does the field match the graph state? If it matches,
+the platform derives it; if not, the skill must set it.
+
 ## Vendor firms and institutions are Contacts, NOT LegalEntities
 
 **Rule**: A `LegalEntity` in Altitude represents an entity the household has an **ownership,
