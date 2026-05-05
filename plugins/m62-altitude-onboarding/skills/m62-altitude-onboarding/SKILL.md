@@ -15,6 +15,47 @@ This skill extracts entity data from household document folders and updates the 
 platform. It follows a query-first, match-and-merge approach — never blindly creating
 entities. Every change is reviewed before pushing.
 
+> **⛔ CRITICAL RULE: NEVER INVENT VALUES. If a field is not stated in the source documents,
+> set it to `null`/omit it — do NOT default, estimate, round, or substitute a placeholder.**
+>
+> This is non-negotiable. A `null` field correctly signals "data missing — needs RM
+> follow-up". An invented value (`$1,000,000`, `"UNKNOWN"`, `2024-01-01`, `"Anytown, USA"`)
+> masquerades as authoritative data and silently corrupts every downstream report,
+> valuation rollup, risk analysis, and MCP query that consumes it.
+>
+> Verita 2026-05-04 audit found 3 Levine real-property TAs with `insuredValue: 1000000.0`
+> on assets worth $7.7M to $17M — placeholder values invented when the source PDFs didn't
+> include actual coverage amounts. The MCP downstream consumer treated them as real and
+> built risk analysis on top. Same root pattern: `primaryInsurancePolicyNumber: "UNKNOWN"`
+> as a literal string instead of `null`.
+>
+> **The mandate, applied to every entity field on every POST/PATCH the skill emits:**
+>
+> | Source-document state | Field value to send | Do NOT do |
+> |---|---|---|
+> | Field stated explicitly | The exact stated value | — |
+> | Field stated as range / approx | Lower bound + a note explaining the range | Don't pick the midpoint |
+> | Field implied but not stated | `null` + add an open-question | Don't infer from context |
+> | Field absent from source | `null`/omit from POST | Don't default to $0, $1M, "UNKNOWN", "N/A", today's date, etc. |
+> | Field unreadable (cloud-stub, OCR fail) | `null` + flag in `file_tracker` | Don't guess |
+>
+> Particularly forbidden placeholder patterns (these are all real bugs we've cleaned up):
+> - `1000000` / `1000` / `100000` as round-number fallbacks for `insuredValue`,
+>   `coverageAmount`, `currentValue`
+> - `"UNKNOWN"`, `"N/A"`, `"TBD"`, `"Pending"` as literal string values (use `null`)
+> - `2024-01-01` / `2025-01-01` / today's date as fallback for `effectiveDate`,
+>   `purchaseDate`, `valuationDate`, `dateOfBirth`
+> - VINs ending in `123456` or other obviously-synthetic patterns
+> - SSN `000-00-0000` / `111-11-1111`
+> - `"Anytown, USA"` / `"123 Main St"` style address placeholders
+> - `0.0` for `percentage` on an OWNERSHIP edge when the real percentage is unknown
+>   (omit the edge entirely or use `economicOwnership: false`)
+>
+> **When in doubt, leave it null and add an entry to `altitude_review/open_questions.json`**
+> so the RM has a tracked follow-up. A field with `null` and a documented question is
+> recoverable. A field with an invented value is a silent data-poisoning event that may go
+> undetected for months.
+
 ## Life-event modes (detect early, branch appropriately)
 
 Before anything else, sniff the folder for **life-event signals** that change how this flow
@@ -169,6 +210,117 @@ SPOUSE, THEN create PARENT edges from BOTH parents to each child.
 **Inverse CHILD edges**: the `EntityRelationshipType` enum maps `PARENT ↔ CHILD` as inverse
 reciprocals (see `getInverseType()`). Depending on the backend version, creating PARENT may
 or may not auto-create CHILD. Verify after creation; if missing, create CHILD explicitly.
+
+## Always wire estate-plan / fiduciary-role parties to the household (visibility-only)
+
+When an estate-plan document — a will, revocable/irrevocable trust, durable POA, advance
+healthcare directive (AHCD), HIPAA authorization, guardian nomination, beneficiary
+designation form, or trustee certification — references an individual in a fiduciary or
+designee role, that person MUST be created AND wired to the household, even if they have
+no economic ownership.
+
+**Common roles seen in trust/estate documents** (all of these trigger the rule):
+- `HEALTHCARE_AGENT` (primary or alternate, per AHCD)
+- `GUARDIAN` (of person or estate of a minor — incl. nomination committee members)
+- `BENEFICIARY` / `SPECIFIC_GIFT_BENEFICIARY` (contingent or remainder)
+- `EXECUTOR` (of a will)
+- `TRUSTEE` / `SUCCESSOR_TRUSTEE` / `SUCCESSOR_SPECIAL_TRUSTEE`
+- `TRUST_PROTECTOR`
+- `POWER_OF_ATTORNEY` (financial agent — could be primary or springing)
+- `GRANTOR` (when not the household principal)
+- `INSURED` (of a policy) — when a non-household-principal individual is insured
+
+**Why**: These individuals get extracted during Phase 3 (the document references them by
+name with a fiduciary role), but they are NOT economic owners of any account, asset, or
+LE — so the skill's default OWNERSHIP-edge logic skips them and they end up as
+`parentHouseholdId=null` orphans. Verita 2026-05-04 cleanup found 4 such orphans in the
+Comolli household alone (Bret Comolli, Marney Jurey, Toby Broke-Smith, Jennifer Connolly —
+all named as healthcare agents or guardian-committee members in Hannah's Feb 2026 estate
+plan but never wired to the HH).
+
+**The rule**: For every individual extracted from an estate-plan or trust document, create
+a Household→Individual visibility-only OWNERSHIP edge IN ADDITION to any role-specific
+edges from the document:
+
+```json
+{
+  "relationshipType": "OWNERSHIP",
+  "sourceEntityType": "HOUSEHOLD",
+  "sourceEntityId": "<household-id>",
+  "targetEntityType": "INDIVIDUAL",
+  "targetEntityId": "<individual-id>",
+  "percentage": 100,
+  "economicOwnership": false,
+  "role": "Estate-plan party (visibility-only, see role-specific edges)"
+}
+```
+
+`economicOwnership: false` makes the edge invisible to the 100%-sum validator on
+ownership totals — it's purely a graph-membership signal so the individual rolls up under
+the household for UI display, family-tree traversal, and search results.
+
+**Then ALSO create the role-specific edges** per the source document:
+
+```json
+// Toby Broke-Smith is Hannah's primary healthcare agent
+{ "relationshipType": "HEALTHCARE_AGENT", "sourceEntityType": "INDIVIDUAL",
+  "sourceEntityId": "<toby-id>", "targetEntityType": "INDIVIDUAL",
+  "targetEntityId": "<hannah-id>", "isPrimary": true,
+  "role": "Primary healthcare agent per AHCD dated YYYY-MM-DD" }
+
+// Jennifer Connolly is the alternate
+{ "relationshipType": "HEALTHCARE_AGENT", "sourceEntityType": "INDIVIDUAL",
+  "sourceEntityId": "<jennifer-id>", "targetEntityType": "INDIVIDUAL",
+  "targetEntityId": "<hannah-id>", "isPrimary": false,
+  "role": "Alternate healthcare agent per same AHCD" }
+
+// All 5 committee members for Celeste's guardian-of-person nomination
+{ "relationshipType": "GUARDIAN", "sourceEntityType": "INDIVIDUAL",
+  "sourceEntityId": "<committee-member-id>", "targetEntityType": "INDIVIDUAL",
+  "targetEntityId": "<minor-child-id>",
+  "role": "Guardian-of-person nomination committee member (majority nominates)" }
+```
+
+**Edge-cardinality + Ind→Ind type-restriction reminders** (validated against live API 2026-05-04):
+- `GUARDIAN`: `maxCardinality: 1` per target. Only the active primary guardian gets a
+  GUARDIAN edge. Backup-committee members CANNOT use `RELATED_PARTY` or `ASSOCIATED_WITH`
+  Ind→Ind — the backend rejects both with HTTP 400 *"Individual cannot have Related Party
+  / Associated With relationship with Individual"*. Capture committee membership instead
+  in:
+   1. The primary guardian's `notes` field (free text describing the committee), OR
+   2. A document-level note on the will/estate plan PDF, OR
+   3. The minor child's individual `description` / `notes` field (e.g.,
+      "Guardian-of-person nomination committee: Marney Jurey, Toby Broke-Smith, Carter
+      Comolli, Bret Comolli, Jennifer Connolly").
+   Don't try to force per-member edges — the backend will reject every retry.
+- `HEALTHCARE_AGENT`: Ind→Ind is allowed. No max-cardinality. Use `isPrimary: true`
+  on exactly one and `isPrimary: false` on alternates.
+- `EXECUTOR`: see `cardinality` rules in the API spec; typically primary + alternates.
+- `BENEFICIARY`: Ind→LE is allowed (e.g., contingent remainder beneficiary of a trust);
+  Ind→Account/Insurance/etc. is allowed. Use `isPrimary: true/false` to distinguish
+  primary vs contingent.
+
+**Soft-delete uniqueness gotcha (known platform bug)**: If an HH→Individual OWNERSHIP
+edge fails with HTTP 409 *"A record with this information already exists"* but no live
+edge is visible via `/individual/{id}/relationships/to`, that's the documented uniqueness
+constraint including soft-deleted records (open backend ticket as of 2026-05-04). The
+HH→Individual visibility edge cannot be re-created until engineering DB-direct-deletes the
+soft-deleted ghost. Workaround: rely on the role-specific edges (HEALTHCARE_AGENT,
+BENEFICIARY, etc.) for graph connection — the individual will appear in the household's
+relationships graph even though `parentHouseholdId` won't auto-derive without the
+OWNERSHIP edge.
+
+**Distinguish "household member" from "estate-plan party"**:
+- A primary household individual (spouse, child, parent of household principal) →
+  HH→Ind OWNERSHIP at 100% with `economicOwnership: true`. They are HH members.
+- A fiduciary designee or non-resident relative referenced only in estate planning →
+  HH→Ind OWNERSHIP at 100% with `economicOwnership: false`. They are visibility-only
+  graph members so the household's estate-plan flowchart resolves correctly.
+
+**When NOT to apply this rule**: If the same person already has an `economicOwnership: true`
+HH membership edge (i.e., they are a primary household member who *also* serves as
+healthcare agent), do NOT add a second visibility edge — just add the role-specific
+HEALTHCARE_AGENT edge alone. One person, one HH-membership edge.
 
 ## Vendor firms and institutions are Contacts, NOT LegalEntities
 
