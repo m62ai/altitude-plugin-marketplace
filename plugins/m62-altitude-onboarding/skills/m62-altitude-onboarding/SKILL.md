@@ -421,6 +421,84 @@ When in doubt about whether a flat field is auto-derived or skill-maintained, ch
 querying a recently-created entity: does the field match the graph state? If it matches,
 the platform derives it; if not, the skill must set it.
 
+## Trust agreement PDFs require structured extraction (with OCR fallback)
+
+Trust agreement PDFs are the canonical source for `LegalEntity.trust.*` fields
+(`isRevocable`, `isGrantor`, `governingLaw`, `situs`, `hasPourOverProvision`,
+`hasSpendthriftProvision`, `isRestatement`, etc.). They are MANDATORY reads when present.
+
+**Phase-3 extraction must capture these fields from any document with `documentSubType` in
+the trust-document family**:
+
+```
+TRUST_AGREEMENT, TRUST_CERTIFICATION, TRUST_AMENDMENTS, REVOCABLE_TRUST_DOCUMENT,
+IRREVOCABLE_TRUST_DOCUMENT, TRUSTEE_CERTIFICATION, RESTATEMENT
+```
+
+**Critical lesson — restatements ARE trust agreements**: A document titled "Second Amendment
+and Restatement of the X Trust" or "Second Restatement of the Y Trust" contains the FULL
+current trust agreement. These are often classified as `TRUST_AMENDMENTS` but should be
+treated as `TRUST_AGREEMENT` for extraction purposes — the restatement supersedes the
+original. Verita 2026-05-05 audit found 4 trusts where the restatement was the only
+agreement-content doc and was classified as `TRUST_AMENDMENTS` or `OTHER`, causing the
+skill to skip it.
+
+**Reclassification pass**: During Phase 2 doc scan, if you find a doc with
+`documentSubType=OTHER` or `documentSubType=TRUST_AMENDMENTS` whose filename contains
+`(Restatement|Amendment.*Restatement|Trust Agreement|Trust Agt)`, RECLASSIFY it to
+`TRUST_AGREEMENT` via `PATCH /document/{id}/metadata` before Phase 3 extraction.
+
+### Required extraction fields per trust agreement
+
+| Field | How to detect |
+|---|---|
+| `isRevocable` | Title declares `IRREVOCABLE TRUST` → false. Body has "this trust is irrevocable" → false. Body has `we reserved the right to amend/revoke` / `Revocable Trust` declared in body → true. Document title literally `<Name> Revocable Trust` → true (sanity-check against body). |
+| `isGrantor` | Body references "Grantor Trust Provisions" article, IRC §671/§672/§673/§674/§675/§676/§677/§678, or "intentionally defective grantor trust" → true. Otherwise null. |
+| `governingLaw` | Search for `governed by the laws of the State of <X>` / `construed in accordance with the laws of <X>` / notary block `STATE OF <X>` (which often shows the situs state if no explicit clause). |
+| `situs` | Look for `situs of this trust shall be <X>` / `principal place of administration shall be in <X>`. Falls back to `governingLaw` for many trusts. |
+| `hasPourOverProvision` | Body mentions `pour-over will/provision/trust` → true. |
+| `hasSpendthriftProvision` | Body mentions `spendthrift provision/clause/trust` → true. |
+| `isRestatement` | Title or first page contains `Amendment and Restatement` / `Restatement of` → true. |
+
+### When the PDF can't be text-extracted (font-encoding or scanned)
+
+Many trust agreements use embedded fonts with custom CID maps (common from Kirkland &
+Ellis, Loeb & Loeb, etc.) — `pdftotext` returns garbled output or zero chars. Fallback to
+**OCR via tesseract**:
+
+```bash
+# Convert pages 1-12 to PNG (most trust provisions land in first 12 pages)
+pdftoppm -png -r 200 -f 1 -l 12 trust.pdf trust_page
+
+# Run tesseract on each page (use relative path — tesseract has macOS quirks with
+# absolute paths under sandbox)
+cd /tmp/trust_ocr
+for p in trust_page-*.png; do
+    tesseract "$p" "${p%.png}" -l eng --psm 1
+done
+```
+
+OCR'd pages 1-5 typically give title + table of contents (not enough to determine
+revocable/irrevocable). Pages 6-12 typically include the substantive provisions where the
+revocable/irrevocable declaration appears. Always OCR at least pages 1-12, longer if
+needed.
+
+### When the trust agreement is NOT in Discovery
+
+If a trust LE exists in Altitude (often from CRM/balance-sheet onboarding) but no trust
+agreement document is in the family's Discovery folder:
+- Do NOT invent values for any trust subtype field
+- Add an entry to `altitude_review/open_questions.json`:
+  ```json
+  {
+    "category": "missing_data", "blocking": false,
+    "entity": "<Trust Name>", "entityId": "<le_id>",
+    "question": "Trust agreement document for '<Trust Name>' not in Discovery — request from family attorney to populate isRevocable / isGrantor / governingLaw / situs / GST exemption status",
+    "rationale": "Trust LE was created without a source document. Trust subtype fields will remain null until agreement is uploaded."
+  }
+  ```
+- Once RM uploads the missing agreement, re-run the skill to fill the fields.
+
 ## Vendor firms and institutions are Contacts, NOT LegalEntities
 
 **Rule**: A `LegalEntity` in Altitude represents an entity the household has an **ownership,
