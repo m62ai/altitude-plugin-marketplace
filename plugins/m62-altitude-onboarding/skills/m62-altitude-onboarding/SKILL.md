@@ -56,6 +56,40 @@ entities. Every change is reviewed before pushing.
 > recoverable. A field with an invented value is a silent data-poisoning event that may go
 > undetected for months.
 
+> **⛔ COROLLARY: NEVER COPY VALUES BETWEEN FIELDS WITH DIFFERENT SEMANTICS.**
+>
+> A value that's correct on entity X with field A may be *wrong* on entity Y with field B
+> even though the number is the same. The schema's field names and units are part of the
+> contract — respect them. When unsure, leave the target field null and document.
+>
+> Real bugs we've cleaned up:
+>
+> | Source | Wrong target | Why it's wrong |
+> |---|---|---|
+> | Auto policy `coverageAmount` ($500K combined-single-limit liability) | each covered vehicle's `insuredValue` | `insuredValue` = per-asset stated/replacement cost. Liability cap is policy-level, not asset-level. Putting $500K on a Cadillac Escalade ($87K market value) implies absurd over-insurance. |
+> | Trust `marketValue` of underlying assets | Trust LE's `currentValue` | Trust value rolls up from owned assets via the OWNERSHIP graph, not via a flat field on the trust itself. |
+> | Insurance policy `effectiveDate` | Asset's `purchaseDate` | "When did coverage start" ≠ "when did you buy this". |
+> | Mortgage `originationDate` | Property's `acquisitionDate` | A property can be re-mortgaged or have multiple mortgages over its life. |
+>
+> **Decision test before assigning a number to a field**: Read the field's description in
+> the schema. State out loud what the field means. State what the source value means. If
+> the two definitions don't match exactly — including units, scope (per-asset vs
+> per-policy), and timing — leave the target null and add an open-question.
+>
+> **Decision test for "the doc has a number near this entity"**: Just because a number
+> appears in a document attached to entity X does NOT mean that number belongs in any of
+> entity X's fields. The number may be:
+>
+> - A line-item detail from a related but distinct entity
+> - A historical value (closing price 5 years ago, not current value)
+> - A net-of-something calculation (NAV after debt) that doesn't match the requested field
+>   (gross asset value)
+> - A scope-level value (policy-wide premium ÷ N covered items ≠ per-item premium)
+>
+> When the doc has the right entity but wrong field, capture it in the related entity's
+> correct field and leave the requested field null. **Never coerce a known wrong-field
+> value into the right-field slot.**
+
 ## Life-event modes (detect early, branch appropriately)
 
 Before anything else, sniff the folder for **life-event signals** that change how this flow
