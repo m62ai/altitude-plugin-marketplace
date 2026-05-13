@@ -247,6 +247,18 @@ or may not auto-create CHILD. Verify after creation; if missing, create CHILD ex
 
 ## Always wire estate-plan / fiduciary-role parties to the household (visibility-only)
 
+**See first**: `references/match_merge_rules.md` → "Entity Tier Classification —
+Individual vs Contact-only". That section is the authoritative routing decision
+for whether a person becomes Tier 1 (Individual + economic HH edge), Tier 2
+(Individual + visibility HH edge + Contact), or Tier 3 (Contact only). This
+section covers the *wire-up mechanics* for Tier 2 fiduciary parties.
+
+**Tier-2 invariant**: `economicOwnership: false`. Verita 2026-05-13 cleanup
+found 4 fiduciaries (Marney, Jennifer, Toby, Bret) wired with
+`economicOwnership: true` — they appeared as full HH members in the UI and
+inflated rollup counts. The visibility-only edge requires `economicOwnership: false`
+explicitly; do not omit the field (the default may be true).
+
 When an estate-plan document — a will, revocable/irrevocable trust, durable POA, advance
 healthcare directive (AHCD), HIPAA authorization, guardian nomination, beneficiary
 designation form, or trustee certification — references an individual in a fiduciary or
@@ -355,6 +367,30 @@ OWNERSHIP edge.
 HH membership edge (i.e., they are a primary household member who *also* serves as
 healthcare agent), do NOT add a second visibility edge — just add the role-specific
 HEALTHCARE_AGENT edge alone. One person, one HH-membership edge.
+
+**Empty-Individual downgrade (Bret rule)**: After all role-specific edges have
+been written, scan the new Individual records. If any have ZERO outbound
+fiduciary edges AND zero economic ownership AND no DOB/SSN/address, the
+Individual is an empty husk — delete it and the visibility HH edge, then
+ensure a Contact exists for the relationship label (e.g.
+`jobTitle: "Brother (Kevin's)"`). See `references/match_merge_rules.md` →
+"Empty-Individual detection (Bret pattern, 2026-05-13)". Verita 2026-05-13
+case: Bret Comolli landed here because the guardian-committee edge was
+blocked by backend cardinality rules, leaving the Individual with nothing
+to host.
+
+**Post-create verification gate**: Before declaring the household
+onboarding-complete, query
+`GET /entity-relationship/from/HOUSEHOLD/{hh_id}` and confirm:
+- Every Tier-1 Individual has `economicOwnership: true` on its HH edge
+- Every Tier-2 Individual has `economicOwnership: false`
+- Every Tier-2 Individual has ≥1 outbound role edge
+  (BENEFICIARY, HEALTHCARE_AGENT, TRUSTEE, etc.)
+- No edge `targetEntityName == "Unknown Individual"` (dangling — flag the
+  cascade-delete bug per Linear PLT-97 if seen)
+
+This three-line check catches all 4 of the Comolli 2026-05-13 bugs at the
+end of the onboarding pass instead of during the next audit.
 
 ## Keep flat fields in sync with the OWNERSHIP graph (especially ILIT flags)
 
