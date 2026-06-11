@@ -228,13 +228,22 @@ For each minor-or-adult child in the household with at least one identified pare
   "sourceEntityType": "INDIVIDUAL", "sourceEntityId": "<parent-individual>",
   "targetEntityType": "INDIVIDUAL", "targetEntityId": "<child-individual>",
   "effectiveFrom": "<child's DOB>",
-  "role": "Biological parent"  // or "Adoptive parent", "Step-parent"
+  "role": "Biological parent"  // or "Adoptive parent" ONLY — see step-parent rule below
 }
 ```
 
+**A `PARENT` edge means biological or legal (adoptive) parent — NEVER a step-parent.**
+The frontend now derives **full-vs-half sibling** status by counting how many `PARENT`
+edges two children *share* (see the SIBLING rule below). Wiring a step-parent as a
+`PARENT` edge silently inflates that count and mislabels half-siblings as full (and a
+step-mother as "Mother"). Step-parents are handled separately — see "Step-parents" below.
+
 **Cardinality**: PARENT has `maxCardinality: 2` on the target — a child can have max 2
 PARENT edges. Create one per identified biological/legal parent. If only one parent is
-identified (e.g. the non-client parent is unknown or deceased), create just the one edge.
+identified (e.g. the non-client parent is unknown, deceased, or simply not named in any
+document), create **just the one edge** — do NOT invent or guess the second parent to
+"complete the pair." A child legitimately having only one known parent is the correct
+representation of a half-sibling or single-documented-parent case.
 
 **Include the ex-spouse as a parent**: In post-divorce cases where the ex-spouse is the
 children's other parent, the ex-spouse needs to be an Individual (not just a Contact) to
@@ -244,6 +253,65 @@ SPOUSE, THEN create PARENT edges from BOTH parents to each child.
 **Inverse CHILD edges**: the `EntityRelationshipType` enum maps `PARENT ↔ CHILD` as inverse
 reciprocals (see `getInverseType()`). Depending on the backend version, creating PARENT may
 or may not auto-create CHILD. Verify after creation; if missing, create CHILD explicitly.
+
+### SIBLING edges — full vs half (do NOT fabricate shared parents)
+
+Create a `SIBLING` edge (symmetric) between two household members who are siblings. The
+concrete enum is `SIBLING`; use the `role` field for the human label:
+
+```json
+{
+  "relationshipType": "SIBLING",
+  "sourceEntityType": "INDIVIDUAL", "sourceEntityId": "<sibling-a>",
+  "targetEntityType": "INDIVIDUAL", "targetEntityId": "<sibling-b>",
+  "role": "Brother"   // or "Sister" / "Half-brother" / "Half-sister"
+}
+```
+
+**Full vs half is determined by shared biological parents, and the frontend computes it
+automatically from the `PARENT` edges** — it counts how many parents the two children
+share:
+- shares **both** parents → full sibling (`Brother` / `Sister`)
+- shares **exactly one** parent → half sibling (`Half-brother` / `Half-sister`)
+
+Because the FE derives this from `PARENT` edges, **the integrity of the half/full
+distinction depends entirely on PARENT edges being accurate**. Therefore:
+
+- **NEVER add a `PARENT` edge to a parent that a document does not actually attest** just
+  to make two children look like full siblings. If the documents only establish that Sam
+  and Liza are children of the father (and never name a shared mother with the principal),
+  they are **half-siblings** — leave them with the single `PARENT` edge.
+- Set the `SIBLING` `role` to match the documented reality (`Half-brother`/`Half-sister`
+  when only one parent is shared). If unsure whether full or half, set `role: "Sibling"`
+  and file an Open Question rather than guessing "Brother/Sister".
+- Watch for **near-homograph name traps** when siblings and step-parents coexist (e.g.
+  "Liza" the half-sister vs "Lisa" the step-mother). Confirm by ID, not by name string.
+
+### Step-parents — SPOUSE-of-parent, never a PARENT edge
+
+A step-parent is the **current spouse of one of the child's biological parents** who is
+NOT themselves a biological/adoptive parent of that child. Represent them as:
+
+1. A `SPOUSE` edge between the step-parent and the biological parent they are married to
+   (this is what the FE reads to label them "Step-mother"/"Step-father" relative to the
+   household principal), and
+2. *(optional, if useful for search)* a `FAMILY` edge from the step-parent to the child
+   with `role: "Step-parent"`.
+
+Do **NOT** create a `PARENT` edge from a step-parent to a step-child unless there is a
+legal **adoption** on record (then it is an `Adoptive parent` PARENT edge, and the child
+genuinely has that person as a counted parent). A step-parent wired as `PARENT` will make
+the FE render them as a biological parent and will corrupt every full/half-sibling label
+among that parent's children.
+
+> **Worked example (the canonical remarried-parent shape):** Principal P's father F
+> remarried SM (step-mother) after divorcing P's mother M. P and full-sibling have
+> `PARENT` edges to **both** M and F. P's paternal half-siblings have a `PARENT` edge to
+> **F only** (their mother is not M and is typically not in the dataset). SM gets a
+> `SPOUSE` edge to F and **no** `PARENT` edge to anyone. Result the FE renders from P's
+> perspective: F = Father, M = Mother, SM = Step-mother, full-sib = Brother/Sister,
+> paternal sibs = Half-brother/Half-sister. Do not "fix" the half-siblings' missing
+> second parent — it is correct.
 
 ## Always wire estate-plan / fiduciary-role parties to the household (visibility-only)
 
@@ -6703,11 +6771,21 @@ for a reference example (RM handoff format).
     without at minimum an account number or custodian — but DO list them as "accounts to be
     created once client provides statements."
 
-27. **Professional relationships flow OUTWARD from the client entity.** For ADVISOR, ATTORNEY,
-    ACCOUNTANT, and INSURANCE_AGENT: the client entity (Household, Individual, or LegalEntity) is
-    the SOURCE, and the Contact is the TARGET. Example: `Operating LLC X1 → Registered Agent (ATTORNEY)`,
-    NOT `Registered Agent → Operating LLC X1`. The API accepts both directions, but outgoing from the
-    entity is the correct data model pattern used by the demo data and the UI.
+27. **Professional/role-type relationships: the CONTACT is the SOURCE, the served entity is the
+    TARGET.** ⚠ **CORRECTED 2026-06-11 (Zimmer prod push) — this REVERSES the prior guidance and
+    supersedes Rule 85's original direction.** For ADVISOR, ACCOUNTANT, ATTORNEY, INSURANCE_AGENT,
+    TRUSTEE, SUCCESSOR_TRUSTEE (and the other role/professional/fiduciary types), the backend now
+    enforces a validator that requires:
+    - `ADVISOR` / `ACCOUNTANT` / `INSURANCE_AGENT`: `CONTACT → {HOUSEHOLD | INDIVIDUAL | LEGAL_ENTITY}`
+    - `ATTORNEY` / `TRUSTEE` / `SUCCESSOR_TRUSTEE`: `CONTACT → LEGAL_ENTITY`
+
+    The **entity→Contact** direction (the old rule) now returns **HTTP 400** with explicit messages:
+    `"Household cannot have Advisor relationship"`, `"Legal Entity cannot have Trustee relationship
+    with Contact"`, `"Individual cannot have Advisor relationship with Contact"`. The CONTACT→entity
+    direction returns 201. Verified by direct production probe on the Zimmer push (2026-06-11) — the
+    backend validator changed since the R-W6 Rohlen observation (when it silently accepted the
+    inverse). **Always POST role-type edges with `sourceEntityType=CONTACT`.** Example:
+    `Rick Schenkel (CONTACT) → AZ 2023 Trust (LEGAL_ENTITY)  TRUSTEE`, NOT the reverse.
 
 28. **Always cross-link insurance policies to tangible assets.** After creating both the
     insurance policy and the tangible asset: (a) PATCH the tangible asset with `isInsured: true`,
@@ -7207,6 +7285,19 @@ for a reference example (RM handoff format).
     target-slug OWNERSHIP entry. If missing, FAIL the push and add the edge before
     retrying.
 60. **⛔ REVOCABLE TRUST → grantor MUST also get an OWNERSHIP 100% edge, not just GRANTOR.**
+
+    > ⚠ **JOINT/MULTI-GRANTOR CAP — CORRECTED 2026-06-11 (Zimmer prod push).** The backend now
+    > **hard-enforces OWNERSHIP sum ≤ 100% per target on POST** (PLT-68 #6). A joint revocable trust
+    > therefore **cannot** take an economic OWNERSHIP 100% edge from *each* grantor — the second POST
+    > returns HTTP 400 (`"OWNERSHIP percentages for target … would sum to 200% … exceeds 100% limit"`).
+    > For a joint/community revocable trust, do ONE of: **(a)** one grantor at OWNERSHIP 100% (full
+    > rollup) + the co-grantor(s) get GRANTOR + TRUSTEE only (no economic edge — the trust already
+    > rolls up fully via the one 100% edge and both spouses' household membership), or **(b)** split
+    > the economic edges so they sum to ≤100 (e.g. 50/50). Both are correct; (a) is simplest. The
+    > single-grantor 100% case below is unaffected. **This supersedes the "both grantors 100%"
+    > pattern in the worked example / retrofit auto-approve below, and makes Rule 80 Exemption B
+    > (which accepted N×100%) applicable to *legacy grandfathered rows only* — new N×100% writes are
+    > now rejected at POST time.**
 
     Altitude's household/valuation rollup traversals walk **only OWNERSHIP edges**.
     GRANTOR/TRUSTEE/BENEFICIARY edges are NOT considered ownership. If a revocable
@@ -10014,7 +10105,17 @@ Rule 53.
 
 ### Step 4.4b: Contact relationship direction validation (Rule 85)
 
-**R-W6 amendment, Rohlen rerun.** Step 4.4's relationship matrix
+> ⚠ **DIRECTION REVERSED — CORRECTED 2026-06-11 (Zimmer prod push).** The backend validator
+> changed since the R-W6 Rohlen observation below. It now **enforces `CONTACT → entity`** for
+> role-types and **rejects `entity → CONTACT` with HTTP 400** (explicit messages: "Household cannot
+> have Advisor relationship", "Legal Entity cannot have Trustee relationship with Contact"). So the
+> correct, verified direction is the OPPOSITE of what the original R-W6 text and the code block below
+> assert: **`sourceEntityType == CONTACT`** and **`targetEntityType in {HOUSEHOLD, INDIVIDUAL,
+> LEGAL_ENTITY}`** (ATTORNEY/TRUSTEE/SUCCESSOR_TRUSTEE → target=LEGAL_ENTITY specifically). The
+> validation below is inverted to match: refuse a POST whose source is NOT a CONTACT. The historical
+> R-W6 narrative is retained for provenance, but its "correct direction" conclusion is obsolete.
+
+**R-W6 amendment, Rohlen rerun (historical — direction since reversed, see banner above).** Step 4.4's relationship matrix
 documents that role-type relationships (ADVISOR, ATTORNEY, ACCOUNTANT,
 TRUSTEE, AUDITOR, INSURANCE_AGENT, etc.) point FROM the household
 entity (HH/IND/LE) TO the Contact — `entity points TO the advisor`.
@@ -10036,22 +10137,26 @@ role-type per the matrix):
 
 ```python
 # rule_85_direction_check.py — apply before every entity-relationship POST
-ROLE_TYPES_REQUIRING_CONTACT_TARGET = {
-    "ADVISOR", "ATTORNEY", "ACCOUNTANT", "TRUSTEE", "AUDITOR",
+# CORRECTED 2026-06-11: role-types require the CONTACT to be the SOURCE.
+ROLE_TYPES_REQUIRING_CONTACT_SOURCE = {
+    "ADVISOR", "ATTORNEY", "ACCOUNTANT", "TRUSTEE", "SUCCESSOR_TRUSTEE", "AUDITOR",
     "INSURANCE_AGENT", "INVESTMENT_ADVISOR", "BOOKKEEPER",
     "FINANCIAL_PLANNER", "TAX_PREPARER",
 }
-HOUSEHOLD_SIDE_TYPES = {"INDIVIDUAL", "LEGAL_ENTITY", "HOUSEHOLD"}
+SERVED_ENTITY_TYPES = {"INDIVIDUAL", "LEGAL_ENTITY", "HOUSEHOLD"}
 
 def validate_contact_direction(rel, household_folder):
     rt = rel.get("relationshipType")
-    if rt not in ROLE_TYPES_REQUIRING_CONTACT_TARGET:
+    if rt not in ROLE_TYPES_REQUIRING_CONTACT_SOURCE:
         return True  # not a role-type relationship; direction unconstrained here
     src_type = rel.get("sourceEntityType")
     tgt_type = rel.get("targetEntityType")
+    # CONTANT is the source; the served entity (HH/IND/LE) is the target.
+    # ATTORNEY/TRUSTEE/SUCCESSOR_TRUSTEE specifically require target == LEGAL_ENTITY.
     direction_ok = (
-        src_type in HOUSEHOLD_SIDE_TYPES and
-        tgt_type == "CONTACT"
+        src_type == "CONTACT" and
+        tgt_type in SERVED_ENTITY_TYPES and
+        (tgt_type == "LEGAL_ENTITY" if rt in {"ATTORNEY", "TRUSTEE", "SUCCESSOR_TRUSTEE"} else True)
     )
     if not direction_ok:
         # Refuse to POST. Log to phase6_inverted_relationship_direction.json
@@ -10059,7 +10164,7 @@ def validate_contact_direction(rel, household_folder):
             household_folder=household_folder,
             relationship=rel,
             reason=f"role_type={rt} requires "
-                   f"source in {HOUSEHOLD_SIDE_TYPES} and target=CONTACT; "
+                   f"source must be CONTACT and target in {SERVED_ENTITY_TYPES}; "
                    f"got source={src_type}, target={tgt_type}",
         )
         return False
@@ -10086,16 +10191,19 @@ follow-up step.
 For every Phase 6 `POST /api/v1/entity-relationship` whose
 `relationshipType` is a role-type per Step 4.4 (ADVISOR, ATTORNEY,
 ACCOUNTANT, TRUSTEE, AUDITOR, INSURANCE_AGENT, INVESTMENT_ADVISOR,
-BOOKKEEPER, FINANCIAL_PLANNER, TAX_PREPARER), assert
-`sourceEntityType in {INDIVIDUAL, LEGAL_ENTITY, HOUSEHOLD}` AND
-`targetEntityType == CONTACT`. If the assertion fails, REFUSE to POST
+BOOKKEEPER, FINANCIAL_PLANNER, TAX_PREPARER, SUCCESSOR_TRUSTEE), assert
+`sourceEntityType == CONTACT` AND
+`targetEntityType in {INDIVIDUAL, LEGAL_ENTITY, HOUSEHOLD}` (ATTORNEY /
+TRUSTEE / SUCCESSOR_TRUSTEE require target == LEGAL_ENTITY). ⚠ **This is
+the CORRECTED 2026-06-11 direction — the backend now REJECTS the inverse
+(`entity → CONTACT`) with HTTP 400** ("Household cannot have Advisor
+relationship" / "Legal Entity cannot have Trustee relationship with
+Contact"), verified on the Zimmer prod push. If the assertion fails, REFUSE to POST
 and log to `phase6_inverted_relationship_direction.json` with
-`{ts, relationship, reason}` for Phase 5 review. The backend silently
-accepts inverted-direction POSTs (HTTP 201) but the resulting edges are
-unreachable from household graph traversal — Rohlen's R-W6 audit found
-10/10 Contact relationships had inverted direction, all silently
-accepted. Cross-reference the Step 4.4 matrix where role-types are
-documented as `entity points TO the advisor`. A backend ticket is
+`{ts, relationship, reason}` for Phase 5 review. (Historical: Rohlen's R-W6
+audit found the backend *silently accepted* inverted edges and concluded
+`entity → CONTACT` was correct; the validator has since changed to enforce
+`CONTACT → entity`, reversing that conclusion.) A backend ticket is
 queued to make the silent-accept reject inverted directions at the API
 boundary; until it lands, this rule is the only line of defense.
 Discovered on Rohlen R-W6 (10/10 inverted Contact relationships; the
