@@ -1,5 +1,118 @@
 # Entity Matching and Field Merge Rules
 
+## Entity Tier Classification — Individual vs Contact-only
+
+Before matching or creating any person extracted from a document, classify them
+into one of three tiers. The tier determines which record type(s) to create and
+how to wire them to the household. **This is the routing decision; matching
+(below) happens within whatever tier the person ends up in.**
+
+### Tier 1 — Economic principal → Individual + HH-OWNERSHIP (`economicOwnership: true`)
+
+The person holds, or is a future principal of, economic value that rolls up to
+the household. Examples:
+
+- Grantor of the household's primary revocable trust
+- Spouse / domestic partner of the principal (joint or community-property states)
+- Dependent children of the principal
+- Anyone whose own account ownership, LE membership, TA ownership, or insurance
+  policy ownership shows up in the source documents
+
+**Wire**: `HH → Individual OWNERSHIP @100% economicOwnership=true` per SKILL.md
+"Always wire estate-plan / fiduciary-role parties to the household" rule.
+
+### Tier 2 — Fiduciary or named non-principal → Individual + HH-OWNERSHIP (`economicOwnership: false`) + Contact
+
+The person is named in a trust, will, AHCD, beneficiary form, POA, or guardian
+nomination in a fiduciary or specific-gift capacity, but is not an economic
+principal of the household. They need an Individual record to **carry their
+outbound role edges** (HEALTHCARE_AGENT, BENEFICIARY, GUARDIAN, EXECUTOR,
+TRUSTEE, etc.) — the edges need a real Individual target.
+
+Tier-2 examples seen in production:
+- Hannah's brother Toby Broke-Smith — healthcare agent + contingent remainder
+  beneficiary on Hannah's Living Trust
+- Jennifer Connolly — alternate healthcare agent (family friend, not blood
+  relation)
+- Marney Jurey — guardian-of-person nomination committee member for Celeste
+
+**Wire**:
+1. `HH → Individual OWNERSHIP @100% economicOwnership=false` (visibility-only,
+   doesn't count toward 100%-sum validator)
+2. The role-specific outbound edge from this Individual
+   (e.g. `Toby → Hannah HEALTHCARE_AGENT isPrimary=true`)
+3. ALSO create a Contact record with the relationship label
+   (e.g. firstName="Toby" lastName="Broke-Smith" jobTitle="Brother (Hannah's)")
+   for human-readable family-tree display
+
+### Tier 3 — Relation mentioned for context only → Contact only
+
+The person is named in a document only to identify a family relationship
+("Hannah's mother Johanna") without any role, ownership, or beneficial interest.
+They don't need an Individual record — no edges will originate from them and no
+edges target them. A Contact with a descriptive `jobTitle` is the complete
+representation.
+
+Tier-3 examples:
+- Hannah's parents (Anthony + Johanna Broke-Smith) — mentioned as family of
+  origin in the trust narrative, but neither is named as trustee, beneficiary,
+  agent, or otherwise
+- A grandparent or in-law mentioned in passing in an estate plan summary
+- Children of a side branch mentioned in a family-tree narrative who have no
+  beneficial or fiduciary tie
+
+**Wire**: Contact only, with `jobTitle` capturing the relationship
+(e.g. "Mother (Hannah's)", "Father-in-law (Kevin's)"). No Individual record. No
+HH edge.
+
+### Empty-Individual detection (Bret pattern, 2026-05-13)
+
+After Tier 2 evaluation, if a person would get an Individual record but:
+- has NO DOB / SSN / address / demographic data, AND
+- carries ZERO outbound role edges after the document is fully processed
+  (i.e. their fiduciary role turned out to be ambiguous or unsupported by the
+  rest of the document's content)
+
+then **downgrade to Tier 3** — skip Individual creation, create Contact only.
+The empty Individual record adds no value (no economic data, no fiduciary
+edges to host) and only inflates HH member counts.
+
+Verita 2026-05-13 case: Bret Comolli was extracted from an Estate Plan Chart
+with rationale "Kevin's brother — member of guardian nomination committee."
+But the guardian committee edges are blocked by backend constraints (see
+SKILL.md "Edge-cardinality reminders"), so Bret's Individual ended up with
+zero outbound edges, just an inflating HH-membership claim. Correct
+representation: Contact alone with `jobTitle: "Brother (Kevin's)"`.
+
+### Decision flowchart
+
+```
+Person extracted from a document
+├─ Has own account/LE/TA/policy ownership in any doc? ─── YES → Tier 1
+└─ NO
+   ├─ Named with a fiduciary/beneficiary/POA role? ─── YES
+   │   ├─ Will the role-specific edge actually be created
+   │   │   (i.e. not blocked by cardinality / type restrictions)?
+   │   │   ├─ YES → Tier 2 (Individual + visibility HH edge + Contact)
+   │   │   └─ NO  → Tier 3 (Contact only — empty-Individual rule)
+   │   └─
+   └─ Only named as a family relation, no role? ─── YES → Tier 3
+```
+
+### Why this matters (audit history)
+
+The Comolli 2026-05-13 cleanup removed 4 phantom Individuals + 1 dangling edge
+that arose from inconsistent application of these tiers:
+- Marney, Jennifer, Toby — got Tier 2 treatment but with `economicOwnership=true`
+  (wrong; should have been `false`). Resulted in falsely claiming HH membership.
+- Bret — should have been Tier 3 (no outbound edges), got Tier 2 anyway.
+- Plus 1 deleted-target dangling HH→Individual edge (separate backend bug,
+  see Linear PLT-97).
+
+Anthony Broke-Smith was the model of correct Tier-3 handling: Hannah's father,
+no fiduciary role, Contact-only. (Created retroactively in this same cleanup
+to match wife Johanna's existing Contact-only representation.)
+
 ## Entity Matching
 
 ### Matching Priority (ALL entity types)
